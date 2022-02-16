@@ -1,4 +1,4 @@
-%global _release 2021122701
+%global _release 2022021602
 
 Name:           lxc
 Version:        4.0.3
@@ -43,11 +43,17 @@ Patch0032:	0032-disable-lxc_keep-with-oci-image.patch
 Patch0033:	0033-conf-ensure-that-the-idmap-pointer-itself-is-freed.patch
 Patch0034:	0034-cgfsng-fix-cgroup-attach-cgroup-creation.patch
 Patch0035:	0035-adapt-upstream-compiler-settings.patch
+%ifarch riscv64
+Patch0036:	0036-add-riscv-support.patch
+%endif
 
 BuildRequires:  systemd-units git libtool graphviz docbook2X doxygen chrpath
 BuildRequires:  pkgconfig(libseccomp)
 BuildRequires:  libcap libcap-devel libselinux-devel yajl yajl-devel
 BuildRequires:  pkgconfig(bash-completion)
+%ifarch riscv64
+BuildRequires:  libatomic_ops
+%endif
 
 Requires:       lxc-libs = 4.0.3-%{release}
 
@@ -100,6 +106,9 @@ This package contains documentation for lxc for creating containers.
 %autosetup -n lxc-4.0.3 -Sgit -p1
 
 %build
+%ifarch riscv64
+export LDFLAGS="-pthread"
+%endif
 %configure --enable-doc --enable-api-docs \
            --disable-silent-rules --docdir=%{_pkgdocdir} --disable-rpath \
            --disable-static --disable-apparmor --enable-selinux \
@@ -214,6 +223,9 @@ make check
 %{_mandir}/*/man7/%{name}*
 
 %changelog
+* Wed Feb 16 2022 YukariChiba <i@0x7f.cc> - 4.0.3-2022021602
+- Fix RISC-V build errors.
+
 * Mon Dec 27 2021 haozi007 <liuhao27@huawei.com> - 4.0.3-2021122701
 - Type:improve
 - ID:NA
