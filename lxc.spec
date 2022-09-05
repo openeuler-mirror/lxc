@@ -1,4 +1,4 @@
-%global _release 2022081201
+%global _release 2022082701
 
 Name:           lxc
 Version:        4.0.3
@@ -53,11 +53,17 @@ Patch0042:	0042-add-x-permission-when-create-directory.patch
 Patch0043:	0043-do-not-operate-playload-and-attach-cgroup-if-no-cont.patch
 Patch0044:	0044-fix-HOME-env-unset-error.patch
 Patch0045:	0045-only-set-user-or-image-set-non-empty-HOME.patch
+%ifarch riscv64
+Patch0046:	0046-signalfd-not-defined.patch
+%endif
 
 BuildRequires:  systemd-units git libtool graphviz docbook2X doxygen chrpath
 BuildRequires:  pkgconfig(libseccomp)
 BuildRequires:  libcap libcap-devel libselinux-devel yajl yajl-devel
 BuildRequires:  pkgconfig(bash-completion)
+%ifarch riscv64
+BuildRequires:  libatomic_ops
+%endif
 
 Requires:       lxc-libs = 4.0.3-%{release}
 
@@ -110,6 +116,9 @@ This package contains documentation for lxc for creating containers.
 %autosetup -n lxc-4.0.3 -Sgit -p1
 
 %build
+%ifarch riscv64
+export LDFLAGS="-pthread"
+%endif
 %configure --enable-doc --enable-api-docs \
            --disable-silent-rules --docdir=%{_pkgdocdir} --disable-rpath \
            --disable-static --disable-apparmor --enable-selinux \
@@ -224,6 +233,9 @@ make check
 %{_mandir}/*/man7/%{name}*
 
 %changelog
+* Sat Aug 27 2022 YukariChiba<i@0x7f.cc> - 4.0.3-2022082701
+- Fix RISC-V build errors
+
 * Fri Aug 12 2022 haozi007<liuhao27@huawei.com> - 4.0.3-2022081201
 - Type:bugfix
 - ID:NA
