@@ -1,0 +1,36 @@
+From 2aa9204b74c96413944a715408cfd5d2f3a34d66 Mon Sep 17 00:00:00 2001
+From: isuladci <isulad@ci.com>
+Date: Thu, 22 Sep 2022 10:44:26 +0800
+Subject: [PATCH] skip kill cgroup processes if no hierarchies
+
+Signed-off-by: isuladci <isulad@ci.com>
+---
+ src/lxc/cgroups/isulad_cgfsng.c | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/src/lxc/cgroups/isulad_cgfsng.c b/src/lxc/cgroups/isulad_cgfsng.c
+index 8a9656a..f5cf81c 100644
+--- a/src/lxc/cgroups/isulad_cgfsng.c
++++ b/src/lxc/cgroups/isulad_cgfsng.c
+@@ -677,15 +677,14 @@ __cgfsng_ops static bool isulad_cgfsng_payload_destroy(struct cgroup_ops *ops,
+ 		return false;
+ 	}
+ 
+-#ifdef HAVE_ISULAD
+ 	if (ops->no_controller) {
+-		DEBUG("no controller found, isgnore isulad_cgfsng_payload_destroy");
++		DEBUG("no controller found, ignore isulad_cgfsng_payload_destroy");
+ 		return true;
+ 	}
+-#endif
+ 
+ 	if (!ops->hierarchies) {
+-		return false;
++		DEBUG("no hierarchies found, ignore isulad_cgfsng_payload_destroy");
++		return true;
+ 	}
+ 
+ 	if (!handler) {
+-- 
+2.25.1
+

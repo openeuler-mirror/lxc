@@ -1,0 +1,1243 @@
+From 44dd71a4d76eb464b81890ea3cfa2ac9c6c3d990 Mon Sep 17 00:00:00 2001
+From: haozi007 <liuhao27@huawei.com>
+Date: Tue, 19 Jul 2022 14:40:59 +0800
+Subject: [PATCH] refactor patch code of isulad for selinux/attach
+
+Signed-off-by: haozi007 <liuhao27@huawei.com>
+---
+ src/lxc/exec_commands.c    | 471 +++++++++++++++++++++++++++++++++++++
+ src/lxc/lsm/selinux.c      | 258 ++++++++++++++++++++
+ src/lxc/tools/lxc_attach.c | 413 +++++++++++++++++++++++++++++++-
+ 3 files changed, 1141 insertions(+), 1 deletion(-)
+ create mode 100644 src/lxc/exec_commands.c
+
+diff --git a/src/lxc/exec_commands.c b/src/lxc/exec_commands.c
+new file mode 100644
+index 0000000..50246fa
+--- /dev/null
++++ b/src/lxc/exec_commands.c
+@@ -0,0 +1,471 @@
++/******************************************************************************
++ * Copyright (c) Huawei Technologies Co., Ltd. 2019. All rights reserved.
++ * Author: lifeng
++ * Create: 2019-12-08
++ * Description: provide container definition
++ * lxc: linux Container library
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++  ******************************************************************************/
++
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE 1
++#endif
++#include <caps.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <malloc.h>
++#include <poll.h>
++#include <signal.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/param.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++#include "af_unix.h"
++#include "cgroup.h"
++#include "exec_commands.h"
++#include "commands_utils.h"
++#include "conf.h"
++#include "config.h"
++#include "confile.h"
++#include "log.h"
++#include "lxc.h"
++#include "lxclock.h"
++#include "mainloop.h"
++#include "monitor.h"
++#include "terminal.h"
++#include "utils.h"
++
++lxc_log_define(commands_exec, lxc);
++
++static const char *lxc_exec_cmd_str(lxc_exec_cmd_t cmd)
++{
++	static const char *const cmdname[LXC_EXEC_CMD_MAX] = {
++		[LXC_EXEC_CMD_SET_TERMINAL_WINCH]  = "set_exec_terminal_winch",
++	};
++
++	if (cmd >= LXC_EXEC_CMD_MAX)
++		return "Invalid request";
++
++	return cmdname[cmd];
++}
++
++static int lxc_exec_cmd_rsp_recv(int sock, struct lxc_exec_cmd_rr *cmd)
++{
++	int ret, rspfd;
++	struct lxc_exec_cmd_rsp *rsp = &cmd->rsp;
++
++	ret = lxc_abstract_unix_recv_fds_timeout(sock, &rspfd, 1, rsp, sizeof(*rsp), 1000 * 1000);
++	if (ret < 0) {
++		SYSERROR("Failed to receive response for command \"%s\"",
++		        lxc_exec_cmd_str(cmd->req.cmd));
++
++		if (errno == ECONNRESET || errno == EAGAIN || errno == EWOULDBLOCK) {
++			errno = ECONNRESET; /*isulad set errno ECONNRESET when timeout */
++			return -1;
++		}
++
++		return -1;
++	}
++	TRACE("Command \"%s\" received response", lxc_exec_cmd_str(cmd->req.cmd));
++
++	if (rsp->datalen == 0) {
++		DEBUG("Response data length for command \"%s\" is 0",
++		      lxc_exec_cmd_str(cmd->req.cmd));
++		return ret;
++	}
++
++	if (rsp->datalen > LXC_CMD_DATA_MAX) {
++		ERROR("Response data for command \"%s\" is too long: %d bytes > %d",
++		      lxc_exec_cmd_str(cmd->req.cmd), rsp->datalen, LXC_CMD_DATA_MAX);
++		return -1;
++	}
++
++	rsp->data = malloc(rsp->datalen);
++	if (!rsp->data) {
++		errno = ENOMEM;
++		ERROR("Failed to allocate response buffer for command \"%s\"",
++		      lxc_exec_cmd_str(cmd->req.cmd));
++		return -1;
++	}
++
++	ret = lxc_recv_nointr(sock, rsp->data, rsp->datalen, 0);
++	if (ret != rsp->datalen) {
++		SYSERROR("Failed to receive response data for command \"%s\"",
++		         lxc_exec_cmd_str(cmd->req.cmd));
++		return -1;
++	}
++
++	return ret;
++}
++
++static int lxc_exec_cmd_rsp_send(int fd, struct lxc_exec_cmd_rsp *rsp)
++{
++	ssize_t ret;
++
++	errno = EMSGSIZE;
++	ret = lxc_send_nointr(fd, rsp, sizeof(*rsp), MSG_NOSIGNAL);
++	if (ret < 0 || (size_t)ret != sizeof(*rsp)) {
++		SYSERROR("Failed to send command response %zd", ret);
++		return -1;
++	}
++
++	if (!rsp->data || rsp->datalen <= 0)
++		return 0;
++
++	errno = EMSGSIZE;
++	ret = lxc_send_nointr(fd, rsp->data, rsp->datalen, MSG_NOSIGNAL);
++	if (ret < 0 || ret != (ssize_t)rsp->datalen) {
++		SYSWARN("Failed to send command response data %zd", ret);
++		return -1;
++	}
++
++	return 0;
++}
++
++static int lxc_exec_cmd_send(const char *name, struct lxc_exec_cmd_rr *cmd,
++			const char *lxcpath, const char *hashed_sock_name, const char *suffix)
++{
++	int client_fd, saved_errno;
++	ssize_t ret = -1;
++
++	client_fd = lxc_cmd_connect(name, lxcpath, hashed_sock_name, suffix);
++	if (client_fd < 0)
++		return -1;
++
++	ret = lxc_abstract_unix_send_credential(client_fd, &cmd->req,
++						sizeof(cmd->req));
++	if (ret < 0 || (size_t)ret != sizeof(cmd->req))
++		goto on_error;
++
++	if (cmd->req.datalen <= 0)
++		return client_fd;
++
++	errno = EMSGSIZE;
++	ret = lxc_send_nointr(client_fd, (void *)cmd->req.data,
++			      cmd->req.datalen, MSG_NOSIGNAL);
++	if (ret < 0 || ret != (ssize_t)cmd->req.datalen)
++		goto on_error;
++
++	return client_fd;
++
++on_error:
++	saved_errno = errno;
++	close(client_fd);
++	errno = saved_errno;
++
++	return -1;
++}
++
++static int lxc_exec_cmd(const char *name, struct lxc_exec_cmd_rr *cmd, const char *lxcpath, const char *hashed_sock_name, const char *suffix)
++{
++	int client_fd = -1;
++	int saved_errno;
++	int ret = -1;
++
++	client_fd = lxc_exec_cmd_send(name, cmd, lxcpath, hashed_sock_name, suffix);
++	if (client_fd < 0) {
++		SYSTRACE("Command \"%s\" failed to connect command socket",
++		         lxc_exec_cmd_str(cmd->req.cmd));
++		return -1;
++	}
++
++	ret = lxc_exec_cmd_rsp_recv(client_fd, cmd);
++
++	saved_errno = errno;
++	close(client_fd);
++	errno = saved_errno;
++	return ret;
++}
++
++int lxc_exec_cmd_set_terminal_winch(const char *name, const char *lxcpath, const char *suffix, unsigned int height, unsigned int width)
++{
++	int ret = 0;
++	struct lxc_exec_cmd_set_terminal_winch_request data = { 0 };
++
++	data.height = height;
++	data.width = width;
++
++	struct lxc_exec_cmd_rr cmd = {
++		.req = {
++			.cmd = LXC_EXEC_CMD_SET_TERMINAL_WINCH,
++			.datalen = sizeof(struct lxc_exec_cmd_set_terminal_winch_request),
++			.data = &data,
++		},
++	};
++
++	ret = lxc_exec_cmd(name, &cmd, lxcpath, NULL, suffix);
++	if (ret < 0) {
++		ERROR("Failed to send command to container");
++		return -1;
++	}
++
++	if (cmd.rsp.ret != 0) {
++		ERROR("Command response error:%d", cmd.rsp.ret);
++		return -1;
++	}
++	return 0;
++}
++
++static int lxc_exec_cmd_set_terminal_winch_callback(int fd, struct lxc_exec_cmd_req *req,
++					struct lxc_exec_command_handler *handler)
++{
++	struct lxc_exec_cmd_rsp rsp;
++	struct lxc_exec_cmd_set_terminal_winch_request *data = (struct lxc_exec_cmd_set_terminal_winch_request *)(req->data);
++	memset(&rsp, 0, sizeof(rsp));
++
++	rsp.ret = lxc_set_terminal_winsz(handler->terminal, data->height, data->width);;
++
++	return lxc_exec_cmd_rsp_send(fd, &rsp);
++
++}
++
++static int lxc_exec_cmd_process(int fd, struct lxc_exec_cmd_req *req,
++			   struct lxc_exec_command_handler *handler)
++{
++	typedef int (*callback)(int, struct lxc_exec_cmd_req *, struct lxc_exec_command_handler *);
++
++	callback cb[LXC_EXEC_CMD_MAX] = {
++		[LXC_EXEC_CMD_SET_TERMINAL_WINCH]  = lxc_exec_cmd_set_terminal_winch_callback,
++	};
++
++	if (req->cmd >= LXC_EXEC_CMD_MAX) {
++		ERROR("Undefined command id %d", req->cmd);
++		return -1;
++	}
++	return cb[req->cmd](fd, req, handler);
++}
++
++static void lxc_exec_cmd_fd_cleanup(int fd, struct lxc_epoll_descr *descr)
++{
++	lxc_mainloop_del_handler(descr, fd);
++	close(fd);
++	return;
++}
++
++static int lxc_exec_cmd_handler(int fd, uint32_t events, void *data,
++			   struct lxc_epoll_descr *descr)
++{
++	int ret;
++	struct lxc_exec_cmd_req req;
++	void *reqdata = NULL;
++	struct lxc_exec_command_handler *handler = data;
++
++	ret = lxc_abstract_unix_rcv_credential(fd, &req, sizeof(req));
++	if (ret < 0) {
++		SYSERROR("Failed to receive data on command socket for command "
++		         "\"%s\"", lxc_exec_cmd_str(req.cmd));
++
++		if (errno == EACCES) {
++			/* We don't care for the peer, just send and close. */
++			struct lxc_exec_cmd_rsp rsp = {.ret = ret};
++
++			lxc_exec_cmd_rsp_send(fd, &rsp);
++		}
++
++		goto out_close;
++	}
++
++	if (ret == 0)
++		goto out_close;
++
++	if (ret != sizeof(req)) {
++		WARN("Failed to receive full command request. Ignoring request "
++		     "for \"%s\"", lxc_exec_cmd_str(req.cmd));
++		ret = -1;
++		goto out_close;
++	}
++
++	if (req.datalen > LXC_CMD_DATA_MAX) {
++		ERROR("Received command data length %d is too large for "
++		      "command \"%s\"", req.datalen, lxc_exec_cmd_str(req.cmd));
++		errno = EFBIG;
++		ret = -EFBIG;
++		goto out_close;
++	}
++
++	if (req.datalen > 0) {
++		reqdata = alloca(req.datalen);
++		if (!reqdata) {
++			ERROR("Failed to allocate memory for \"%s\" command",
++			      lxc_exec_cmd_str(req.cmd));
++			errno = ENOMEM;
++			ret = -ENOMEM;
++			goto out_close;
++		}
++
++		ret = lxc_recv_nointr(fd, reqdata, req.datalen, 0);
++		if (ret != req.datalen) {
++			WARN("Failed to receive full command request. Ignoring "
++			     "request for \"%s\"", lxc_exec_cmd_str(req.cmd));
++			ret = LXC_MAINLOOP_ERROR;
++			goto out_close;
++		}
++
++		req.data = reqdata;
++	}
++
++	ret = lxc_exec_cmd_process(fd, &req, handler);
++	if (ret) {
++		/* This is not an error, but only a request to close fd. */
++		ret = LXC_MAINLOOP_CONTINUE;
++		goto out_close;
++	}
++
++out:
++	return ret;
++
++out_close:
++	lxc_exec_cmd_fd_cleanup(fd, descr);
++	goto out;
++}
++
++static int lxc_exec_cmd_accept(int fd, uint32_t events, void *data,
++			  struct lxc_epoll_descr *descr)
++{
++	int connection = -1;
++	int opt = 1, ret = -1;
++
++	connection = accept(fd, NULL, 0);
++	if (connection < 0) {
++		SYSERROR("Failed to accept connection to run command");
++		return LXC_MAINLOOP_ERROR;
++	}
++
++	ret = fcntl(connection, F_SETFD, FD_CLOEXEC);
++	if (ret < 0) {
++		SYSERROR("Failed to set close-on-exec on incoming command connection");
++		goto out_close;
++	}
++
++	ret = setsockopt(connection, SOL_SOCKET, SO_PASSCRED, &opt, sizeof(opt));
++	if (ret < 0) {
++		SYSERROR("Failed to enable necessary credentials on command socket");
++		goto out_close;
++	}
++
++	ret = lxc_mainloop_add_handler(descr, connection, lxc_exec_cmd_handler, data);
++	if (ret) {
++		ERROR("Failed to add command handler");
++		goto out_close;
++	}
++
++out:
++	return ret;
++
++out_close:
++	close(connection);
++	goto out;
++}
++#ifdef HAVE_ISULAD
++int lxc_exec_unix_sock_delete(const char *name, const char *suffix)
++{
++	char path[LXC_AUDS_ADDR_LEN] = {0};
++
++	if (name == NULL || suffix == NULL)
++		return -1;
++
++	if (generate_named_unix_sock_path(name, suffix, path, sizeof(path)) != 0)
++		return -1;
++
++	(void)unlink(path);
++
++	return 0;
++}
++
++int lxc_exec_cmd_init(const char *name, const char *lxcpath, const char *suffix)
++{
++	__do_close int fd = -EBADF;
++	int ret;
++	char path[LXC_AUDS_ADDR_LEN] = {0};
++	__do_free char *exec_sock_dir = NULL;
++
++	exec_sock_dir = generate_named_unix_sock_dir(name);
++	if (exec_sock_dir == NULL)
++		return -1;
++
++	if (mkdir_p(exec_sock_dir, 0600) < 0)
++		return log_error_errno(-1, errno, "Failed to create exec sock directory %s", path);
++
++	if (generate_named_unix_sock_path(name, suffix, path, sizeof(path)) != 0)
++		return -1;
++
++	TRACE("Creating unix socket \"%s\"", path);
++
++	fd = lxc_named_unix_open(path, SOCK_STREAM, 0);
++	if (fd < 0) {
++		if (errno == EADDRINUSE) {
++			WARN("Container \"%s\" exec unix sock is occupied", name);
++			(void)unlink(path);
++			fd = lxc_named_unix_open(path, SOCK_STREAM, 0);
++			if (fd < 0)
++				return log_error_errno(-1, errno, "Failed to create command socket %s", path);
++		} else {
++			return log_error_errno(-1, errno, "Failed to create command socket %s", path);
++		}
++	}
++
++	ret = fcntl(fd, F_SETFD, FD_CLOEXEC);
++	if (ret < 0)
++		return log_error_errno(-1, errno, "Failed to set FD_CLOEXEC on command socket file descriptor");
++
++	return log_trace(move_fd(fd), "Created unix socket \"%s\"", path);
++}
++#else
++int lxc_exec_cmd_init(const char *name, const char *lxcpath, const char *suffix)
++{
++	int fd, ret;
++	char path[LXC_AUDS_ADDR_LEN] = {0};
++
++	ret = lxc_make_abstract_socket_name(path, sizeof(path), name, lxcpath, NULL, suffix);
++	if (ret < 0)
++		return -1;
++	TRACE("Creating abstract unix socket \"%s\"", &path[1]);
++
++	fd = lxc_abstract_unix_open(path, SOCK_STREAM, 0);
++	if (fd < 0) {
++		SYSERROR("Failed to create command socket %s", &path[1]);
++		if (errno == EADDRINUSE)
++			ERROR("Container \"%s\" appears to be already running", name);
++
++		return -1;
++	}
++
++	ret = fcntl(fd, F_SETFD, FD_CLOEXEC);
++	if (ret < 0) {
++		SYSERROR("Failed to set FD_CLOEXEC on command socket file descriptor");
++		close(fd);
++		return -1;
++	}
++
++	return fd;
++}
++#endif
++
++int lxc_exec_cmd_mainloop_add(struct lxc_epoll_descr *descr, struct lxc_exec_command_handler *handler)
++{
++	int ret;
++	int fd = handler->maincmd_fd;
++
++	ret = lxc_mainloop_add_handler(descr, fd, lxc_exec_cmd_accept, handler);
++	if (ret < 0) {
++		ERROR("Failed to add handler for command socket");
++		close(fd);
++	}
++
++	return ret;
++}
+diff --git a/src/lxc/lsm/selinux.c b/src/lxc/lsm/selinux.c
+index dba0ab5..bd4f449 100644
+--- a/src/lxc/lsm/selinux.c
++++ b/src/lxc/lsm/selinux.c
+@@ -16,6 +16,10 @@
+ #include "log.h"
+ #include "lsm.h"
+ 
++#ifdef HAVE_ISULAD
++#include <selinux/context.h>
++#endif
++
+ #define DEFAULT_LABEL "unconfined_t"
+ 
+ lxc_log_define(selinux, lsm);
+@@ -85,6 +89,256 @@ static int selinux_process_label_set(const char *inlabel, struct lxc_conf *conf,
+ 	return 0;
+ }
+ 
++#ifdef HAVE_ISULAD
++/*
++ * selinux_file_label_set: Set SELinux context of a file
++ *
++ * @path    : a file
++ * @label   : label string
++ *
++ * Returns 0 on success, < 0 on failure
++ */
++static int selinux_file_label_set(const char *path, const char *label)
++{
++	if (path == NULL || label == NULL || strcmp(label, "unconfined_t") == 0) {
++		return 0;
++	}
++
++	if (!is_selinux_enabled()) {
++		return 0;
++	}
++
++	if (lsetfilecon(path, label) != 0) {
++		SYSERROR("Failed to setSELinux context to \"%s\": %s", label, path);
++		return -1;
++	}
++
++	INFO("Changed SELinux context to \"%s\": %s", label, path);
++	return 0;
++}
++
++/*
++ * is_exclude_relabel_path: Determine whether it is a excluded path to label
++ *
++ * @path    : a file or directory
++ *
++ * Returns 0 on success, < 0 on failure
++ */
++static bool is_exclude_relabel_path(const char *path)
++{
++	const char *exclude_path[] = { "/", "/usr", "/etc", "/tmp", "/home", "/run", "/var", "/root" };
++	size_t i;
++
++	for (i = 0; i < sizeof(exclude_path) / sizeof(char *); i++) {
++		if (strcmp(path, exclude_path[i]) == 0) {
++			return true;
++		}
++	}
++
++	return false;
++}
++
++/*
++ * bad_prefix: Prevent users from relabing system files
++ *
++ * @path    : a file or directory
++ *
++ * Returns 0 on success, < 0 on failure
++ */
++static int bad_prefix(const char *fpath)
++{
++	const char *bad_prefixes = "/usr";
++
++	if (fpath == NULL) {
++		ERROR("Empty file path");
++		return -1;
++	}
++
++	if (strncmp(fpath, bad_prefixes, strlen(bad_prefixes)) == 0) {
++		ERROR("relabeling content in %s is not allowed", bad_prefixes);
++		return -1;
++	}
++
++	return 0;
++}
++
++/*
++ * recurse_set_file_label: Recursively label files or folders
++ *
++ * @path    : a file or directory
++ * @label   : label string
++ *
++ * Returns 0 on success, < 0 on failure
++ */
++static int recurse_set_file_label(const char *basePath, const char *label)
++{
++	int ret = 0;
++	__do_closedir DIR *dir = NULL;
++	struct dirent *ptr = NULL;
++	char base[PATH_MAX] = { 0 };
++
++	if ((dir = opendir(basePath)) == NULL) {
++		ERROR("Failed to Open dir: %s", basePath);
++		return -1;
++	}
++
++	ret = lsetfilecon(basePath, label);
++	if (ret != 0) {
++		ERROR("Failed to set file label");
++		return ret;
++	}
++
++	while ((ptr = readdir(dir)) != NULL) {
++		if (strcmp(ptr->d_name, ".") == 0 || strcmp(ptr->d_name, "..") == 0) {
++			continue;
++		} else {
++			int nret = snprintf(base, sizeof(base), "%s/%s", basePath, ptr->d_name);
++			if (nret < 0 || nret >= sizeof(base)) {
++				ERROR("Failed to get path");
++				return -1;
++			}
++			if (ptr->d_type == DT_DIR) {
++				ret = recurse_set_file_label(base, label);
++				if (ret != 0) {
++					ERROR("Failed to set dir label");
++					return ret;
++				}
++			} else {
++				ret = lsetfilecon(base, label);
++				if (ret != 0) {
++					ERROR("Failed to set file label");
++					return ret;
++				}
++			}
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * selinux_chcon: Chcon changes the `fpath` file object to the SELinux label `label`.
++ * If `fpath` is a directory and `recurse`` is true, Chcon will walk the
++ * directory tree setting the label.
++ *
++ * @fpath   : a file or directory
++ * @label   : label string
++ * @recurse : whether to recurse
++ *
++ * Returns 0 on success, < 0 on failure
++ */
++static int selinux_chcon(const char *fpath, const char *label, bool recurse)
++{
++	struct stat s_buf;
++
++	if (fpath == NULL || label == NULL) {
++		ERROR("Invalid parameters!");
++		return -1;
++	}
++
++	if (bad_prefix(fpath) != 0) {
++		return -1;
++	}
++	if (stat(fpath, &s_buf) != 0) {
++		return -1;
++	}
++	if (recurse && S_ISDIR(s_buf.st_mode)) {
++		return recurse_set_file_label(fpath, label);
++	}
++
++	if (lsetfilecon(fpath, label) != 0) {
++		ERROR("Failed to set file label");
++		return -1;
++	}
++
++	return 0;
++}
++
++/*
++ * convert_context_to_share_mode: set sensitivity to s0 and remove categories
++ * user:role:type:sensitivity[:categories] => user:role:type:s0
++ *
++ * @label   : label string
++ *
++ * Returns label with share mode on success, NULL on failure
++ */
++static char *convert_context_to_share_mode(const char *label) {
++	__do_free char *converted_label = strdup(label);
++	char *s = converted_label;
++	const char *shared_level = "s0";
++	int cnt = 0;
++
++	// selinux label format: user:role:type:sensitivity[:categories]
++	// locates the ":" position in front of the sensitivity
++	while (cnt++ < 3 && (s = strchr(s, ':')) != NULL) {
++		s++;
++	}
++
++	// make sure sensitivity can set s0 value
++	if (s == NULL || strlen(s) < strlen(shared_level)) {
++		ERROR("Invalid selinux file context: %s", label);
++		return NULL;
++	}
++
++	if (strcmp(s, shared_level) == 0) {
++		return move_ptr(converted_label);
++	}
++
++	*s = '\0';
++	strcat(converted_label, shared_level);
++
++	return move_ptr(converted_label);
++}
++
++/*
++ * selinux_relabel: Relabel changes the label of path to the filelabel string.
++ * It changes the MCS label to s0 if shared is true.
++ * This will allow all containers to share the content.
++ *
++ * @path    : a file or directory
++ * @label   : label string
++ * @shared  : whether to use share mode
++ *
++ * Returns 0 on success, < 0 on failure
++ */
++static int selinux_relabel(const char *path, const char *label, bool shared)
++{
++	__do_free char *tmp_file_label = NULL;
++
++	if (path == NULL || label == NULL) {
++		return 0;
++	}
++
++	if (!is_selinux_enabled()) {
++		return 0;
++	}
++
++	if (is_exclude_relabel_path(path)) {
++		ERROR("SELinux relabeling of %s is not allowed", path);
++		return -1;
++	}
++
++	if (shared) {
++		tmp_file_label = convert_context_to_share_mode(label);
++		if (tmp_file_label == NULL) {
++			ERROR("Failed to convert context to share mode: %s", label);
++			return -1;
++		}
++	} else {
++		tmp_file_label = strdup(label);
++	}
++
++
++	if (selinux_chcon(path, tmp_file_label, true) != 0) {
++		ERROR("Failed to modify %s's selinux context: %s", path, tmp_file_label);
++		return -1;
++	}
++
++	return 0;
++}
++
++#endif
++
+ /*
+  * selinux_keyring_label_set: Set SELinux context that will be assigned to the keyring
+  *
+@@ -103,6 +357,10 @@ static struct lsm_drv selinux_drv = {
+ 	.process_label_get = selinux_process_label_get,
+ 	.process_label_set = selinux_process_label_set,
+ 	.keyring_label_set = selinux_keyring_label_set,
++#ifdef HAVE_ISULAD
++	.file_label_set    = selinux_file_label_set,
++	.relabel           = selinux_relabel,
++#endif
+ };
+ 
+ struct lsm_drv *lsm_selinux_drv_init(void)
+diff --git a/src/lxc/tools/lxc_attach.c b/src/lxc/tools/lxc_attach.c
+index a8f493a..1a5a241 100644
+--- a/src/lxc/tools/lxc_attach.c
++++ b/src/lxc/tools/lxc_attach.c
+@@ -72,8 +72,20 @@ static const struct option my_longopts[] = {
+ 	{"set-var", required_argument, 0, 'v'},
+ 	{"pty-log", required_argument, 0, 'L'},
+ 	{"rcfile", required_argument, 0, 'f'},
++#ifndef HAVE_ISULAD
+ 	{"uid", required_argument, 0, 'u'},
+ 	{"gid", required_argument, 0, 'g'},
++#else
++	{"workdir", required_argument, 0, 'w'},
++	{"user", required_argument, 0, 'u'},
++	{"in-fifo", required_argument, 0, OPT_INPUT_FIFO}, /* isulad add terminal fifos*/
++	{"out-fifo", required_argument, 0, OPT_OUTPUT_FIFO},
++	{"err-fifo", required_argument, 0, OPT_STDERR_FIFO},
++	{"suffix", required_argument, 0, OPT_ATTACH_SUFFIX},
++	{"timeout", required_argument, 0, OPT_ATTACH_TIMEOUT},
++	{"disable-pty", no_argument, 0, OPT_DISABLE_PTY},
++	{"open-stdin", no_argument, 0, OPT_OPEN_STDIN},
++#endif
+ 	LXC_COMMON_OPTIONS
+ };
+ 
+@@ -124,9 +136,26 @@ Options :\n\
+                     multiple times.\n\
+   -f, --rcfile=FILE\n\
+                     Load configuration file FILE\n\
++"
++#ifndef HAVE_ISULAD
++"\
+   -u, --uid=UID     Execute COMMAND with UID inside the container\n\
+   -g, --gid=GID     Execute COMMAND with GID inside the container\n\
+-",
++"
++#else
++"\
++  -w, --workdir     Working directory inside the container.\n\
++  -u, --user        User ID (format: UID[:GID])\n\
++      --in-fifo     Stdin fifo path\n\
++      --out-fifo    Stdout fifo path\n\
++      --err-fifo    Stderr fifo path\n\
++      --suffi       ID for mutli-attach on one container\n\
++      --timeout     Timeout in seconds (default: 0)\n\
++      --disable-pty Disable pty for attach\n\
++      --open-stdin  Open stdin for attach\n\
++"
++#endif
++,
+ 	.options      = my_longopts,
+ 	.parser       = my_parser,
+ 	.checker      = NULL,
+@@ -136,6 +165,71 @@ Options :\n\
+ 	.gid          = LXC_INVALID_GID,
+ };
+ 
++#ifdef HAVE_ISULAD
++static int parse_user_id(const char *username, char **uid, char **gid, char **tmp_dup)
++{
++	char *tmp = NULL;
++	char *pdot = NULL;
++
++	if (uid == NULL || gid == NULL || tmp_dup == NULL) {
++		return -1;
++	}
++
++	if (username != NULL) {
++		tmp = strdup(username);
++		if (tmp == NULL) {
++			ERROR("Failed to duplicate user name");
++			return -1;
++		}
++
++		// for free tmp in caller
++		*tmp_dup = tmp;
++		pdot = strstr(tmp, ":");
++		if (pdot != NULL) {
++			*pdot = '\0';
++			if (pdot != tmp) {
++				// uid found
++				*uid = tmp;
++			}
++
++			if (*(pdot + 1) != '\0') {
++				// gid found
++				*gid = pdot + 1;
++			}
++		} else {
++			// No : found
++			if (*tmp != '\0') {
++				*uid = tmp;
++			}
++		}
++	}
++
++	return 0;
++}
++
++static int get_attach_uid_gid(const char *username, uid_t *user_id, gid_t *group_id)
++{
++	char *tmp = NULL;
++	char *uid = NULL;
++	char *gid = NULL;
++
++	// parse uid and gid by username
++	if (parse_user_id(username, &uid, &gid, &tmp) != 0) {
++		return -1;
++	}
++
++	if (uid != NULL) {
++		*user_id = (unsigned int)atoll(uid);
++	}
++	if (gid != NULL) {
++		*group_id = (unsigned int)atoll(gid);
++	}
++
++	free(tmp);
++	return 0;
++}
++#endif
++
+ static int my_parser(struct lxc_arguments *args, int c, char *arg)
+ {
+ 	int ret;
+@@ -193,6 +287,7 @@ static int my_parser(struct lxc_arguments *args, int c, char *arg)
+ 	case 'f':
+ 		args->rcfile = arg;
+ 		break;
++#ifndef HAVE_ISULAD
+ 	case 'u':
+ 		if (lxc_safe_uint(arg, &args->uid) < 0)
+ 			return -1;
+@@ -201,6 +296,42 @@ static int my_parser(struct lxc_arguments *args, int c, char *arg)
+ 		if (lxc_safe_uint(arg, &args->gid) < 0)
+ 			return -1;
+ 		break;
++#else
++	case 'u':
++		if (get_attach_uid_gid(arg, &args->uid, &args->gid) != 0) {
++			ERROR("Failed to get attach user U/GID");
++			return -1;
++		}
++		break;
++	case 'w':
++		args->workdir=arg;
++		break;
++	case OPT_INPUT_FIFO:
++		args->terminal_fifos[0] = arg;
++		break;
++	case OPT_OUTPUT_FIFO:
++		args->terminal_fifos[1] = arg;
++		break;
++	case OPT_STDERR_FIFO:
++		args->terminal_fifos[2] = arg;
++		break;
++	case OPT_ATTACH_SUFFIX:
++		args->suffix = arg;
++		break;
++	case OPT_ATTACH_TIMEOUT:
++		if(!is_non_negative_num(arg)) {
++			ERROR("Error attach timeout parameter:%s.\n", arg);
++			return -1;
++		}
++		args->attach_timeout = (unsigned int)atoll(arg);
++		break;
++	case OPT_DISABLE_PTY:
++		args->disable_pty = 1;
++		break;
++	case OPT_OPEN_STDIN:
++		args->open_stdin = 1;
++		break;
++#endif
+ 	}
+ 
+ 	return 0;
+@@ -264,6 +395,285 @@ static int lxc_attach_create_log_file(const char *log_file)
+ 	return fd;
+ }
+ 
++#ifdef HAVE_ISULAD
++// isulad: send '128 + signal' if container is killed by signal.
++#define EXIT_SIGNAL_OFFSET 128
++
++/*isulad: attach with terminal*/
++static int do_attach_foreground(struct lxc_container *c, lxc_attach_command_t *command,
++				lxc_attach_options_t *attach_options,
++				char **errmsg)
++{
++	int ret = 0;
++	pid_t pid;
++	int wexit = -1;
++	int signal;
++
++	if (command->program)
++		ret = c->attach(c, lxc_attach_run_command, command, attach_options, &pid);
++	else
++		ret = c->attach(c, lxc_attach_run_shell, NULL, attach_options, &pid);
++	if (ret < 0) {
++		*errmsg = safe_strdup("Internal error, failed to call attach");
++		goto out;
++	}
++
++	ret = lxc_wait_for_pid_status(pid);
++	if (ret < 0) {
++		free(*errmsg);
++		*errmsg = safe_strdup("Internal error, failed to wait attached process");
++		goto out;
++	}
++
++	if (WIFEXITED(ret))
++		wexit = WEXITSTATUS(ret);
++	else
++		wexit = -1;
++
++	if (WIFSIGNALED(ret)) {
++		signal = WTERMSIG(ret);
++		wexit = EXIT_SIGNAL_OFFSET + signal;
++	}
++
++	WARN("Execd pid %d exit with %d", pid, wexit);
++
++out:
++	if (c->lxc_conf->errmsg) {
++		free(*errmsg);
++		*errmsg = safe_strdup(c->lxc_conf->errmsg);
++	}
++	return wexit;
++}
++
++static void close_msg_pipe(int *errpipe)
++{
++	if (errpipe[0] >= 0) {
++		close(errpipe[0]);
++		errpipe[0] = -1;
++	}
++	if (errpipe[1] >= 0) {
++		close(errpipe[1]);
++		errpipe[1] = -1;
++	}
++}
++
++/*isulad: attach without terminal in background */
++static int do_attach_background(struct lxc_container *c, lxc_attach_command_t *command,
++				lxc_attach_options_t *attach_options,
++				char **errmsg)
++{
++	int ret = 0;
++	int msgpipe[2];
++	pid_t pid = 0;
++	ssize_t size_read;
++	char msgbuf[BUFSIZ + 1] = {0};
++
++	//pipdfd for get error message of child or grandchild process.
++	if (pipe2(msgpipe, O_CLOEXEC) != 0) {
++		SYSERROR("Failed to init msgpipe");
++		return -1;
++	}
++
++	pid = fork();
++	if (pid < 0) {
++		close_msg_pipe(msgpipe);
++		return -1;
++	}
++
++	if (pid != 0) {
++		close(msgpipe[1]);
++		msgpipe[1] = -1;
++		size_read = read(msgpipe[0], msgbuf, BUFSIZ);
++		if (size_read > 0) {
++			*errmsg = safe_strdup(msgbuf);
++			ret = -1;
++		}
++
++		close(msgpipe[0]);
++		msgpipe[0] = -1;
++
++		return ret;
++	}
++
++	/* second fork to be reparented by init */
++	pid = fork();
++	if (pid < 0) {
++		SYSERROR("Error doing dual-fork");
++		close_msg_pipe(msgpipe);
++		exit(1);
++	}
++	if (pid != 0) {
++		close_msg_pipe(msgpipe);
++		exit(0);
++	}
++
++	close(msgpipe[0]);
++	msgpipe[0] = -1;
++
++	if (null_stdfds() < 0) {
++		ERROR("failed to close fds");
++		exit(1);
++	}
++	setsid();
++
++	if (command->program)
++		ret = c->attach(c, lxc_attach_run_command, command, attach_options, &pid);
++	else
++		ret = c->attach(c, lxc_attach_run_shell, NULL, attach_options, &pid);
++	if (ret < 0) {
++		if (c->lxc_conf->errmsg)
++			lxc_write_error_message(msgpipe[1], "%s", c->lxc_conf->errmsg);
++		else
++			lxc_write_error_message(msgpipe[1], "Failed to attach container");
++		close(msgpipe[1]);
++		msgpipe[1] = -1;
++		ret = -1;
++		goto out;
++	}
++
++	close(msgpipe[1]);
++	msgpipe[1] = -1;
++
++	ret = wait_for_pid(pid);
++out:
++	lxc_container_put(c);
++	if (ret)
++		exit(EXIT_FAILURE);
++	else
++		exit(0);
++}
++
++int main(int argc, char *argv[])
++{
++	int wexit = 0;
++	struct lxc_log log;
++	char *errmsg = NULL;
++	lxc_attach_options_t attach_options = LXC_ATTACH_OPTIONS_DEFAULT;
++	lxc_attach_command_t command = (lxc_attach_command_t){.program = NULL};
++
++	if (lxc_caps_init())
++		exit(EXIT_FAILURE);
++
++	if (lxc_arguments_parse(&my_args, argc, argv))
++		exit(EXIT_FAILURE);
++
++	log.name = my_args.name;
++	log.file = my_args.log_file;
++	log.level = my_args.log_priority;
++	log.prefix = my_args.progname;
++	log.quiet = my_args.quiet;
++	log.lxcpath = my_args.lxcpath[0];
++
++	if (lxc_log_init(&log))
++		exit(EXIT_FAILURE);
++
++	if (geteuid())
++		if (access(my_args.lxcpath[0], O_RDONLY) < 0) {
++			ERROR("You lack access to %s", my_args.lxcpath[0]);
++			exit(EXIT_FAILURE);
++		}
++
++	struct lxc_container *c = lxc_container_new(my_args.name, my_args.lxcpath[0]);
++	if (!c)
++		exit(EXIT_FAILURE);
++
++	if (my_args.rcfile) {
++		c->clear_config(c);
++		if (!c->load_config(c, my_args.rcfile)) {
++			ERROR("Failed to load rcfile");
++			lxc_container_put(c);
++			exit(EXIT_FAILURE);
++		}
++
++		c->configfile = strdup(my_args.rcfile);
++		if (!c->configfile) {
++			ERROR("Out of memory setting new config filename");
++			lxc_container_put(c);
++			exit(EXIT_FAILURE);
++		}
++	}
++
++	if (!c->may_control(c)) {
++		ERROR("Insufficent privileges to control %s", c->name);
++		lxc_container_put(c);
++		exit(EXIT_FAILURE);
++	}
++
++	if (remount_sys_proc)
++		attach_options.attach_flags |= LXC_ATTACH_REMOUNT_PROC_SYS;
++
++	if (elevated_privileges)
++		attach_options.attach_flags &= ~(elevated_privileges);
++
++	if (my_args.terminal_fifos[0] || my_args.terminal_fifos[1] || my_args.terminal_fifos[2]) {
++		attach_options.init_fifo[0] = my_args.terminal_fifos[0];
++		attach_options.init_fifo[1] = my_args.terminal_fifos[1];
++		attach_options.init_fifo[2] = my_args.terminal_fifos[2];
++		attach_options.attach_flags |= LXC_ATTACH_TERMINAL;
++	} else if (stdfd_is_pty()) {
++		attach_options.attach_flags |= LXC_ATTACH_TERMINAL;
++	}
++
++	attach_options.namespaces = namespace_flags;
++	attach_options.personality = new_personality;
++	attach_options.env_policy = env_policy;
++	attach_options.extra_env_vars = extra_env;
++	attach_options.extra_keep_env = extra_keep;
++	attach_options.timeout = my_args.attach_timeout;
++
++	if (my_args.argc > 0) {
++		command.program = my_args.argv[0];
++		command.argv = (char**)my_args.argv;
++	}
++
++	if (my_args.console_log) {
++		attach_options.log_fd = lxc_attach_create_log_file(my_args.console_log);
++		if (attach_options.log_fd < 0) {
++			ERROR("Failed to create log file for %s", c->name);
++			lxc_container_put(c);
++			exit(EXIT_FAILURE);
++		}
++	}
++
++	if (my_args.uid != LXC_INVALID_UID)
++		attach_options.uid = my_args.uid;
++
++	if (my_args.gid != LXC_INVALID_GID)
++		attach_options.gid = my_args.gid;
++
++	attach_options.suffix = my_args.suffix;
++
++	if (my_args.disable_pty) {
++		attach_options.disable_pty = true;
++	}
++
++	if (my_args.open_stdin) {
++		attach_options.open_stdin = true;
++	}
++
++	if (my_args.workdir) {
++		attach_options.initial_cwd = my_args.workdir;
++	}
++
++	/* isulad: add do attach background */
++	if (attach_options.attach_flags & LXC_ATTACH_TERMINAL)
++		wexit = do_attach_foreground(c, &command, &attach_options, &errmsg);
++	else
++		wexit = do_attach_background(c, &command, &attach_options, &errmsg);
++
++	if (errmsg) {
++		fprintf(stderr, "%s:%s:%s:%d starting container process caused \"%s\"", c->name,
++		__FILE__, __func__, __LINE__, errmsg);
++		free(errmsg);
++	}
++
++	lxc_container_put(c);
++	if (wexit >= 0)
++		exit(wexit);
++
++	exit(EXIT_FAILURE);
++}
++#else
+ int main(int argc, char *argv[])
+ {
+ 	int ret = -1;
+@@ -377,3 +787,4 @@ out:
+ 
+ 	exit(EXIT_FAILURE);
+ }
++#endif
+-- 
+2.25.1
+

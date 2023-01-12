@@ -1,0 +1,2947 @@
+From 281d09f2dcd4dfd105b41d8da558d4a126ca190b Mon Sep 17 00:00:00 2001
+From: WangFengTu <wangfengtu@huawei.com>
+Date: Mon, 18 Jul 2022 14:14:14 +0800
+Subject: [PATCH] refactor patch code of lxccontianer and so on
+
+Signed-off-by: WangFengTu <wangfengtu@huawei.com>
+---
+ src/lxc/af_unix.h         |   6 +
+ src/lxc/cgroups/cgroup.h  |  13 +
+ src/lxc/confile.c         | 639 +++++++++++++++++++++++++++
+ src/lxc/lxccontainer.c    | 898 +++++++++++++++++++++++++++++++++++++-
+ src/lxc/lxclock.c         |  31 ++
+ src/lxc/mainloop.c        |  16 +
+ src/lxc/path.c            | 655 +++++++++++++++++++++++++++
+ src/lxc/storage/dir.c     |  34 ++
+ src/lxc/storage/loop.c    |  48 +-
+ src/lxc/storage/storage.c |  31 +-
+ 10 files changed, 2367 insertions(+), 4 deletions(-)
+ create mode 100644 src/lxc/path.c
+
+diff --git a/src/lxc/af_unix.h b/src/lxc/af_unix.h
+index 5a1482c..be26ff0 100644
+--- a/src/lxc/af_unix.h
++++ b/src/lxc/af_unix.h
+@@ -41,4 +41,10 @@ extern int lxc_unix_connect(struct sockaddr_un *addr);
+ extern int lxc_unix_connect_type(struct sockaddr_un *addr, int type);
+ extern int lxc_socket_set_timeout(int fd, int rcv_timeout, int snd_timeout);
+ 
++#ifdef HAVE_ISULAD
++extern int lxc_abstract_unix_recv_fds_timeout(int fd, int *recvfds, int num_recvfds,
++                                       void *data, size_t size, unsigned int timeout);
++extern int lxc_named_unix_open(const char *path, int type, int flags);
++extern int lxc_named_unix_connect(const char *path);
++#endif
+ #endif /* __LXC_AF_UNIX_H */
+diff --git a/src/lxc/cgroups/cgroup.h b/src/lxc/cgroups/cgroup.h
+index c5bf794..4791112 100644
+--- a/src/lxc/cgroups/cgroup.h
++++ b/src/lxc/cgroups/cgroup.h
+@@ -109,6 +109,11 @@ struct cgroup_ops {
+ 	char *container_cgroup;
+ 	char *monitor_cgroup;
+ 
++#ifdef HAVE_ISULAD
++	int errfd;
++	bool no_controller;
++#endif
++
+ 	/* @hierarchies
+ 	 * - A NULL-terminated array of struct hierarchy, one per legacy
+ 	 *   hierarchy. No duplicates. First sufficient, writeable mounted
+@@ -146,14 +151,22 @@ struct cgroup_ops {
+ 	 */
+ 	cgroup_layout_t cgroup_layout;
+ 
++#ifdef HAVE_ISULAD
++	int (*data_init)(struct cgroup_ops *ops, struct lxc_conf *conf);
++	bool (*payload_destroy)(struct cgroup_ops *ops, struct lxc_handler *handler);
++#else
+ 	int (*data_init)(struct cgroup_ops *ops);
+ 	void (*payload_destroy)(struct cgroup_ops *ops, struct lxc_handler *handler);
++#endif
+ 	void (*monitor_destroy)(struct cgroup_ops *ops, struct lxc_handler *handler);
+ 	bool (*monitor_create)(struct cgroup_ops *ops, struct lxc_handler *handler);
+ 	bool (*monitor_enter)(struct cgroup_ops *ops, struct lxc_handler *handler);
+ 	bool (*payload_create)(struct cgroup_ops *ops, struct lxc_handler *handler);
+ 	bool (*payload_enter)(struct cgroup_ops *ops, struct lxc_handler *handler);
+ 	const char *(*get_cgroup)(struct cgroup_ops *ops, const char *controller);
++#ifdef HAVE_ISULAD
++	const char *(*get_cgroup_full_path)(struct cgroup_ops *ops, const char *controller);
++#endif
+ 	bool (*escape)(const struct cgroup_ops *ops, struct lxc_conf *conf);
+ 	int (*num_hierarchies)(struct cgroup_ops *ops);
+ 	bool (*get_hierarchies)(struct cgroup_ops *ops, int n, char ***out);
+diff --git a/src/lxc/confile.c b/src/lxc/confile.c
+index 4c27e7d..22d7255 100644
+--- a/src/lxc/confile.c
++++ b/src/lxc/confile.c
+@@ -147,6 +147,19 @@ lxc_config_define(tty_dir);
+ lxc_config_define(uts_name);
+ lxc_config_define(sysctl);
+ lxc_config_define(proc);
++#ifdef HAVE_ISULAD
++lxc_config_define(init_args);
++lxc_config_define(init_groups);
++lxc_config_define(populate_device);
++lxc_config_define(umask);
++lxc_config_define(rootfs_masked_paths);
++lxc_config_define(rootfs_ro_paths);
++lxc_config_define(systemd);
++lxc_config_define(console_log_driver);
++lxc_config_define(console_syslog_tag);
++lxc_config_define(console_syslog_facility);
++lxc_config_define(selinux_mount_context);
++#endif
+ 
+ /*
+  * Important Note:
+@@ -259,6 +272,19 @@ static struct lxc_config_t config_jump_table[] = {
+ 	{ "lxc.uts.name",                  set_config_uts_name,                    get_config_uts_name,                    clr_config_uts_name,                  },
+ 	{ "lxc.sysctl",                    set_config_sysctl,                      get_config_sysctl,                      clr_config_sysctl,                    },
+ 	{ "lxc.proc",                      set_config_proc,                        get_config_proc,                        clr_config_proc,                      },
++#ifdef HAVE_ISULAD
++	{ "lxc.isulad.init.args",          set_config_init_args,                   get_config_init_args,                   clr_config_init_args,                 },
++	{ "lxc.isulad.init.groups",        set_config_init_groups,                 get_config_init_groups,                 clr_config_init_groups,               },
++	{ "lxc.isulad.populate.device",    set_config_populate_device,             get_config_populate_device,             clr_config_populate_device,           },
++	{ "lxc.isulad.umask",              set_config_umask,                       get_config_umask,                       clr_config_umask,                     },
++	{ "lxc.isulad.rootfs.maskedpaths", set_config_rootfs_masked_paths,         get_config_rootfs_masked_paths,         clr_config_rootfs_masked_paths,       },
++	{ "lxc.isulad.rootfs.ropaths",     set_config_rootfs_ro_paths,             get_config_rootfs_ro_paths,             clr_config_rootfs_ro_paths,           },
++	{ "lxc.isulad.systemd",            set_config_systemd,                     get_config_systemd,                     clr_config_systemd,                   },
++	{ "lxc.console.logdriver",         set_config_console_log_driver,          get_config_console_log_driver,          clr_config_console_log_driver,        },
++	{ "lxc.console.syslog_tag",        set_config_console_syslog_tag,          get_config_console_syslog_tag,          clr_config_console_syslog_tag,        },
++	{ "lxc.console.syslog_facility",   set_config_console_syslog_facility,     get_config_console_syslog_facility,     clr_config_console_syslog_facility,   },
++	{ "lxc.selinux.mount_context",     set_config_selinux_mount_context,       get_config_selinux_mount_context,       clr_config_selinux_mount_context,     },
++#endif
+ };
+ 
+ static const size_t config_jump_table_size = sizeof(config_jump_table) / sizeof(struct lxc_config_t);
+@@ -1348,6 +1374,10 @@ static int set_config_environment(const char *key, const char *value,
+ {
+ 	struct lxc_list *list_item = NULL;
+ 
++#ifdef HAVE_ISULAD
++	char *replaced = NULL;
++#endif
++
+ 	if (lxc_config_value_empty(value))
+ 		return lxc_clear_environment(lxc_conf);
+ 
+@@ -1368,7 +1398,16 @@ static int set_config_environment(const char *key, const char *value,
+ 		env_var[1] = env_val;
+ 		list_item->elem = lxc_string_join("=", env_var, false);
+ 	} else {
++#ifdef HAVE_ISULAD
++		/* isulad: recover space replaced by SPACE_MAGIC_STR */
++		replaced = lxc_string_replace(SPACE_MAGIC_STR, " ", value);
++		if(!replaced)
++			goto on_error;
++
++		list_item->elem = replaced;
++#else
+ 		list_item->elem = strdup(value);
++#endif
+ 	}
+ 
+ 	if (!list_item->elem)
+@@ -2291,11 +2330,14 @@ static int set_config_console_rotate(const char *key, const char *value,
+ 	if (lxc_safe_uint(value, &lxc_conf->console.log_rotate) < 0)
+ 		return -1;
+ 
++#ifndef HAVE_ISULAD
++	/* isulad: support rotate muti-files */
+ 	if (lxc_conf->console.log_rotate > 1) {
+ 		ERROR("The \"lxc.console.rotate\" config key can only be set "
+ 		      "to 0 or 1");
+ 		return -1;
+ 	}
++#endif
+ 
+ 	return 0;
+ }
+@@ -2581,6 +2623,11 @@ static int set_config_rootfs_options(const char *key, const char *value,
+ 	int ret;
+ 	struct lxc_rootfs *rootfs = &lxc_conf->rootfs;
+ 
++#ifdef HAVE_ISULAD
++	ret = parse_mntopts(value, &mflags, &pflags, &mdata);
++	if (ret < 0)
++		return -EINVAL;
++#else
+ 	ret = parse_mntopts(value, &mflags, &mdata);
+ 	if (ret < 0)
+ 		return -EINVAL;
+@@ -2590,6 +2637,7 @@ static int set_config_rootfs_options(const char *key, const char *value,
+ 		free(mdata);
+ 		return -EINVAL;
+ 	}
++#endif
+ 
+ 	ret = set_config_string_item(&opts, value);
+ 	if (ret < 0) {
+@@ -2722,6 +2770,54 @@ struct parse_line_conf {
+ 	bool from_include;
+ };
+ 
++#ifdef HAVE_ISULAD
++// escape_string_decode compress some escape characters
++static char *escape_string_decode(const char *src)
++{
++	size_t src_end = 0;
++	size_t dst_end = 0;
++	size_t len = 0;
++	char *dst = NULL;
++
++	if (src == NULL) {
++		return NULL;
++	}
++
++	len = strlen(src);
++	if (len == 0) {
++		return NULL;
++	}
++
++	dst = calloc(1, len + 1);
++	if (dst == NULL) {
++		ERROR("Out of memory");
++		return NULL;
++	}
++
++	while(src_end < len) {
++		if (src[src_end] == '\\') {
++			switch (src[++src_end])
++			{
++				case 'r': dst[dst_end] = '\r'; break;
++				case 'n': dst[dst_end] = '\n'; break;
++				case 'f': dst[dst_end] = '\f'; break;
++				case 'b': dst[dst_end] = '\b'; break;
++				case 't': dst[dst_end] = '\t'; break;
++				case '\\': dst[dst_end] = '\\'; break;
++				// default do not decode
++				default: dst[dst_end++] = '\\'; dst[dst_end] = src[src_end]; break;
++			}
++		} else {
++			dst[dst_end] = src[src_end];
++		}
++		dst_end++;
++		src_end++;
++	}
++
++	return dst;
++}
++#endif
++
+ static int parse_line(char *buffer, void *data)
+ {
+ 	char *dot, *key, *line, *linep, *value;
+@@ -2730,6 +2826,9 @@ static int parse_line(char *buffer, void *data)
+ 	int ret = 0;
+ 	char *dup = buffer;
+ 	struct parse_line_conf *plc = data;
++#ifdef HAVE_ISULAD
++	char *value_decode = NULL;
++#endif
+ 
+ 	/* If there are newlines in the config file we should keep them. */
+ 	empty_line = lxc_is_line_empty(dup);
+@@ -2796,10 +2895,21 @@ static int parse_line(char *buffer, void *data)
+ 		goto on_error;
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	value_decode = escape_string_decode(value);
++	if (value_decode == NULL) {
++		ERROR("Value %s decode failed", value);
++	}
++	ret = config->set(key, value_decode ? value_decode: value, plc->conf, NULL);
++#else
+ 	ret = config->set(key, value, plc->conf, NULL);
++#endif
+ 
+ on_error:
+ 	free(linep);
++#ifdef HAVE_ISULAD
++	free(value_decode);
++#endif
+ 
+ 	return ret;
+ }
+@@ -2912,6 +3022,12 @@ bool lxc_config_define_load(struct lxc_list *defines, struct lxc_container *c)
+ 
+ 	lxc_list_for_each(it, defines) {
+ 		struct new_config_item *new_item = it->elem;
++#ifdef HAVE_ISULAD
++		if (strcmp(new_item->key, LXC_IMAGE_OCI_KEY) == 0) {
++			c->set_oci_type(c, true);
++			continue;
++		}
++#endif
+ 		bret = c->set_config_item(c, new_item->key, new_item->val);
+ 		if (!bret)
+ 			break;
+@@ -6098,3 +6214,526 @@ int lxc_list_net(struct lxc_conf *c, const char *key, char *retv, int inlen)
+ 
+ 	return fulllen;
+ }
++
++#ifdef HAVE_ISULAD
++/* isulad: set config for init args */
++static int set_config_init_args(const char *key, const char *value,
++				 struct lxc_conf *lxc_conf, void *data)
++{
++	int ret = 0;
++	char **tmp = NULL;
++	char *new_value = NULL;
++
++	ret = set_config_string_item(&new_value, value);
++	if (ret || !new_value)
++		return ret;
++
++	tmp = (char **)realloc(lxc_conf->init_argv, (lxc_conf->init_argc + 1) * sizeof(char *));
++	if (!tmp) {
++		ERROR("Out of memory");
++		free(new_value);
++		return -1;
++	}
++
++	lxc_conf->init_argv = tmp;
++
++	lxc_conf->init_argv[lxc_conf->init_argc] = new_value;
++	lxc_conf->init_argc++;
++
++	return 0;
++}
++
++/* isulad: get config init args */
++static int get_config_init_args(const char *key, char *retv, int inlen,
++				  struct lxc_conf *c, void *data)
++{
++	int i, len, fulllen = 0;
++
++	if (!retv)
++		inlen = 0;
++	else
++		memset(retv, 0, inlen);
++
++	for (i = 0; i < c->init_argc; i++) {
++           strprint(retv, inlen, "%s", c->init_argv[i]);
++    }
++
++	return fulllen;
++}
++
++/* isulad: clr config init args*/
++static inline int clr_config_init_args(const char *key, struct lxc_conf *c,
++				   void *data)
++{
++	return lxc_clear_init_args(c);
++}
++
++/* isulad: set config for init groups */
++static int set_config_init_groups(const char *key, const char *value,
++                                  struct lxc_conf *lxc_conf, void *data)
++{
++	char *groups = NULL;
++	char *token = NULL;
++	int ret = -1;
++
++	if (lxc_config_value_empty(value))
++		return lxc_clear_init_groups(lxc_conf);
++
++	groups = strdup(value);
++	if (!groups)
++		return -1;
++
++	/* In case several capability keep is specified in a single line
++	 * split these caps in a single element for the list.
++	 */
++	lxc_iterate_parts(token, groups, " \t") {
++		gid_t *tmp = NULL;
++		if (lxc_mem_realloc((void **)&tmp, (lxc_conf->init_groups_len + 1) * sizeof(gid_t), lxc_conf->init_groups,
++		                    (lxc_conf->init_groups_len) * sizeof(gid_t)) != 0) {
++			ERROR("Out of memory");
++			goto on_error;
++		}
++		lxc_conf->init_groups = tmp;
++		tmp[lxc_conf->init_groups_len] = atoll(token);
++		lxc_conf->init_groups_len++;
++	}
++
++	ret = 0;
++
++on_error:
++	free(groups);
++
++	return ret;
++}
++
++/* isulad: get config init groups */
++static int get_config_init_groups(const char *key, char *retv, int inlen,
++                                  struct lxc_conf *c, void *data)
++{
++	int i, len, fulllen = 0;
++
++	if (!retv)
++		inlen = 0;
++	else
++		memset(retv, 0, inlen);
++
++	for (i = 0; i < c->init_groups_len; i++) {
++		strprint(retv, inlen, "%u\n", c->init_groups[i]);
++	}
++
++	return fulllen;
++}
++
++/* isulad: clr config init args*/
++static inline int clr_config_init_groups(const char *key, struct lxc_conf *c,
++                void *data)
++{
++	return lxc_clear_init_groups(c);
++}
++
++/* isulad: set config for populate device */
++static int set_config_populate_device(const char *key, const char *value,
++                                      struct lxc_conf *lxc_conf, void *data)
++{
++	int ret = 0, major = 0, minor = 0;
++	uid_t uid = (uid_t)-1;
++	gid_t gid = (gid_t)-1;
++	char name[4096] = {0}; /* MAX dev path name */
++	char type[3] = {0};
++	char *replace_value = NULL;
++	mode_t filemode = 0;
++	struct lxc_list *iter = NULL;
++	struct lxc_list *dev_list = NULL;
++	struct lxc_populate_devs *dev_elem = NULL;
++
++	if (lxc_config_value_empty(value))
++		return lxc_clear_populate_devices(lxc_conf);
++
++	/* lxc.populate.device = PATH_IN_CONTAINER:DEVICETYPE:MAJOR:MINOR:MODE:UID:GID
++	 * For e.g. lxc.populate.device = /dev/sda:b:8:0:0666:0:0
++	 */
++	ret = sscanf(value, "%4095[^:]:%2[^:]:%i:%i:%i:%u:%u", name, type, &major, &minor, &filemode, &uid, &gid);
++	if (ret != 7)
++		return -1;
++
++	/* find existing list element */
++	lxc_list_for_each(iter, &lxc_conf->populate_devs) {
++		dev_elem = iter->elem;
++
++		if (strcmp(name, dev_elem->name) != 0)
++			continue;
++
++		replace_value = safe_strdup(type);
++
++		free(dev_elem->type);
++		dev_elem->type = replace_value;
++		dev_elem->file_mode = filemode;
++		dev_elem->maj = major;
++		dev_elem->min = minor;
++		dev_elem->uid = (uid_t)uid;
++		dev_elem->gid = (gid_t)gid;
++		return 0;
++	}
++
++	/* allocate list element */
++	dev_list = malloc(sizeof(*dev_list));
++	if (dev_list == NULL)
++		goto on_error;
++
++	lxc_list_init(dev_list);
++
++	dev_elem = malloc(sizeof(*dev_elem));
++	if (dev_elem == NULL)
++		goto on_error;
++	memset(dev_elem, 0, sizeof(*dev_elem));
++
++	dev_elem->name = safe_strdup(name);
++
++	dev_elem->type = safe_strdup(type);
++
++	dev_elem->file_mode = filemode;
++	dev_elem->maj = major;
++	dev_elem->min = minor;
++	dev_elem->uid = (uid_t)uid;
++	dev_elem->gid = (gid_t)gid;
++
++	lxc_list_add_elem(dev_list, dev_elem);
++
++	lxc_list_add_tail(&lxc_conf->populate_devs, dev_list);
++
++	return 0;
++
++on_error:
++	free(dev_list);
++	if (dev_elem) {
++		free(dev_elem->name);
++		free(dev_elem->type);
++		free(dev_elem);
++	}
++	return -1;
++}
++
++/* isulad: get config populate device
++ * If you ask for 'lxc.populate.device', then all populate device
++ * entries will be printed, in 'lxc.populate.device = path_in_container:type:major:minor:mode:uid:gid' format.
++ * For e.g. lxc.populate.device = /dev/sda:b:8:0:0666:0:0
++ */
++static int get_config_populate_device(const char *key, char *retv, int inlen,
++                                      struct lxc_conf *c, void *data)
++{
++	int len;
++	struct lxc_list *it = NULL;
++	int fulllen = 0;
++
++	if (!retv)
++		inlen = 0;
++	else
++		memset(retv, 0, inlen);
++
++	lxc_list_for_each(it, &c->populate_devs) {
++		struct lxc_populate_devs *elem = it->elem;
++		strprint(retv, inlen, "lxc.populate.device = %s:%s:%d:%d:%o:%u:%u\n",
++		         elem->name, elem->type, elem->maj,
++		         elem->min, elem->file_mode, elem->uid, elem->gid);
++	}
++
++	return fulllen;
++}
++
++/* isulad: clr config populate devices*/
++static inline int clr_config_populate_device(const char *key, struct lxc_conf *c,
++                void *data)
++{
++	return lxc_clear_populate_devices(c);
++}
++
++/* isulad: set config for umask */
++static int set_config_umask(const char *key, const char *value,
++			      struct lxc_conf *lxc_conf, void *data)
++{
++	if (lxc_config_value_empty(value)) {
++		ERROR("Empty umask");
++		return -1;
++	}
++
++	if (strcmp(value, "normal") == 0) {
++		lxc_conf->umask = 0022;
++		return 0;
++	} else if (strcmp(value, "secure") == 0) {
++		lxc_conf->umask = 0027;
++		return 0;
++	} else {
++		ERROR("Invalid native umask: %s", value);
++		return -1;
++	}
++}
++
++/* isulad add: get umask value*/
++static int get_config_umask(const char *key, char *retv, int inlen,
++			      struct lxc_conf *c, void *data)
++{
++	return lxc_get_conf_size_t(c, retv, inlen, c->umask);
++}
++
++/* isulad add: clear umask value */
++static inline int clr_config_umask(const char *key, struct lxc_conf *c,
++				     void *data)
++{
++	c->umask = 0027;
++	return 0;
++}
++
++/* isulad: set config for rootfs masked paths */
++static int set_config_rootfs_masked_paths(const char *key, const char *value,
++                struct lxc_conf *lxc_conf, void *data)
++{
++	struct lxc_list *list_item = NULL;
++
++	if (lxc_config_value_empty(value))
++		return lxc_clear_rootfs_masked_paths(lxc_conf);
++
++	list_item = malloc(sizeof(*list_item));
++	if (list_item == NULL)
++		goto on_error;
++
++	list_item->elem = safe_strdup(value);
++
++	lxc_list_add_tail(&lxc_conf->rootfs.maskedpaths, list_item);
++
++	return 0;
++
++on_error:
++	free(list_item);
++
++	return -1;
++}
++
++// isulad: get config rootfs masked paths
++static int get_config_rootfs_masked_paths(const char *key, char *retv, int inlen,
++                struct lxc_conf *c, void *data)
++{
++	int len, fulllen = 0;
++	struct lxc_list *it = NULL;
++
++	if (!retv)
++		inlen = 0;
++	else
++		memset(retv, 0, inlen);
++
++	lxc_list_for_each(it, &c->rootfs.maskedpaths) {
++		strprint(retv, inlen, "%s\n", (char *)it->elem);
++	}
++
++	return fulllen;
++}
++
++/* isulad: set config for rootfs ro paths */
++static int set_config_rootfs_ro_paths(const char *key, const char *value,
++                                      struct lxc_conf *lxc_conf, void *data)
++{
++	struct lxc_list *list_item = NULL;
++
++	if (lxc_config_value_empty(value))
++		return lxc_clear_rootfs_ro_paths(lxc_conf);
++
++	list_item = malloc(sizeof(*list_item));
++	if (list_item == NULL)
++		goto on_error;
++
++	list_item->elem = safe_strdup(value);
++
++	lxc_list_add_tail(&lxc_conf->rootfs.ropaths, list_item);
++
++	return 0;
++
++on_error:
++	free(list_item);
++
++	return -1;
++}
++
++// isulad: get config rootfs ro paths
++static int get_config_rootfs_ro_paths(const char *key, char *retv, int inlen,
++                                      struct lxc_conf *c, void *data)
++{
++	int len, fulllen = 0;
++	struct lxc_list *it = NULL;
++
++	if (!retv)
++		inlen = 0;
++	else
++		memset(retv, 0, inlen);
++
++	lxc_list_for_each(it, &c->rootfs.ropaths) {
++		strprint(retv, inlen, "%s\n", (char *)it->elem);
++	}
++
++	return fulllen;
++}
++
++/* isulad: clr config rootfs masked paths */
++static inline int clr_config_rootfs_masked_paths(const char *key, struct lxc_conf *c,
++                void *data)
++{
++	return lxc_clear_rootfs_masked_paths(c);
++}
++
++/* isulad: clr config rootfs ro paths */
++static inline int clr_config_rootfs_ro_paths(const char *key, struct lxc_conf *c,
++                void *data)
++{
++	return lxc_clear_rootfs_ro_paths(c);
++}
++
++/* isulad: set config for systemd */
++static int set_config_systemd(const char *key, const char *value,
++			      struct lxc_conf *lxc_conf, void *data)
++{
++	if (lxc_config_value_empty(value)) {
++		ERROR("Empty umask");
++		return -1;
++	}
++	lxc_conf->systemd = strdup(value);
++	return 0;
++}
++
++/* isulad add: get systemd value*/
++static int get_config_systemd(const char *key, char *retv, int inlen,
++			      struct lxc_conf *c, void *data)
++{
++	return lxc_get_conf_str(retv, inlen, c->systemd);
++}
++
++/* isulad add: clear systemd value */
++static inline int clr_config_systemd(const char *key, struct lxc_conf *c,
++				     void *data)
++{
++	free(c->systemd);
++	c->systemd = NULL;
++	return 0;
++}
++
++static int set_config_console_log_driver(const char *key, const char *value,
++        struct lxc_conf *lxc_conf, void *data)
++{
++	return set_config_string_item(&lxc_conf->console.log_driver, value);
++}
++
++static int set_config_console_syslog_tag(const char *key, const char *value,
++        struct lxc_conf *lxc_conf, void *data)
++{
++	if (value == NULL) {
++		return -1;
++	}
++	return set_config_string_item(&lxc_conf->console.log_syslog_tag, value);
++}
++
++static int parse_facility(const char *facility)
++{
++#define FACILITIES_LEN 20
++	const char *facility_keys[FACILITIES_LEN] = {
++		"kern", "user", "mail", "daemon", "auth",
++		"syslog", "lpr", "news", "uucp", "cron", "authpriv", "ftp",
++		"local0", "local1", "local2", "local3", "local4", "local5", "local6", "local7"
++	};
++	const int facilities[FACILITIES_LEN] = {
++		LOG_KERN, LOG_USER, LOG_MAIL, LOG_DAEMON, LOG_AUTH, LOG_SYSLOG,
++		LOG_LPR, LOG_NEWS, LOG_UUCP, LOG_CRON, LOG_AUTHPRIV, LOG_FTP,
++		LOG_LOCAL0, LOG_LOCAL1, LOG_LOCAL2, LOG_LOCAL3, LOG_LOCAL4,
++		LOG_LOCAL5, LOG_LOCAL6, LOG_LOCAL7
++	};
++	int i = 0;
++
++	if (facility == NULL) {
++		return -1;
++	}
++
++	for (; i < FACILITIES_LEN; i++) {
++		if (strcmp(facility, facility_keys[i]) == 0) {
++			return facilities[i];
++		}
++	}
++
++	return -1;
++}
++
++static int set_config_console_syslog_facility(const char *key, const char *value,
++        struct lxc_conf *lxc_conf, void *data)
++{
++	int facility;
++
++	facility = parse_facility(value);
++	if (facility < 0) {
++		NOTICE("Invalid facility: %s", value);
++		facility = LOG_DAEMON;
++	}
++
++	lxc_conf->console.log_syslog_facility = facility;
++	return 0;
++}
++
++static int set_config_selinux_mount_context(const char *key, const char *value,
++    struct lxc_conf *lxc_conf, void *data)
++{
++	if (value != NULL && strcmp(value, "unconfined_t") == 0) {
++		return set_config_string_item(&lxc_conf->lsm_se_mount_context, NULL);
++	}
++
++	return set_config_string_item(&lxc_conf->lsm_se_mount_context, value);
++}
++
++static int get_config_console_log_driver(const char *key, char *retv, int inlen,
++        struct lxc_conf *c, void *data)
++{
++	return lxc_get_conf_str(retv, inlen, c->console.log_driver);
++}
++
++static int get_config_console_syslog_tag(const char *key, char *retv, int inlen,
++        struct lxc_conf *c, void *data)
++{
++	return lxc_get_conf_str(retv, inlen, c->console.log_syslog_tag);
++}
++
++static int get_config_console_syslog_facility(const char *key, char *retv, int inlen,
++        struct lxc_conf *c, void *data)
++{
++	return lxc_get_conf_int(c, retv, inlen, c->console.log_syslog_facility);
++}
++
++static int get_config_selinux_mount_context(const char *key, char *retv, int inlen,
++    struct lxc_conf *c, void *data)
++{
++	return lxc_get_conf_str(retv, inlen, c->lsm_se_mount_context);
++}
++
++static inline int clr_config_console_log_driver(const char *key,
++                struct lxc_conf *c, void *data)
++{
++	free(c->console.log_driver);
++	c->console.log_driver = NULL;
++	return 0;
++}
++
++static inline int clr_config_console_syslog_tag(const char *key,
++                struct lxc_conf *c, void *data)
++{
++	free(c->console.log_syslog_tag);
++	c->console.log_syslog_tag= NULL;
++	return 0;
++}
++
++static inline int clr_config_console_syslog_facility(const char *key,
++                struct lxc_conf *c, void *data)
++{
++	c->console.log_syslog_facility = LOG_DAEMON;
++	return 0;
++}
++
++static inline int clr_config_selinux_mount_context(const char *key,
++    struct lxc_conf *c, void *data)
++{
++	free(c->lsm_se_mount_context);
++	c->lsm_se_mount_context = NULL;
++	return 0;
++}
++#endif
+diff --git a/src/lxc/lxccontainer.c b/src/lxc/lxccontainer.c
+index aac6214..3f75184 100644
+--- a/src/lxc/lxccontainer.c
++++ b/src/lxc/lxccontainer.c
+@@ -62,6 +62,10 @@
+ #include "utils.h"
+ #include "version.h"
+ 
++#ifdef HAVE_ISULAD
++#include "exec_commands.h"
++#endif
++
+ #if HAVE_OPENSSL
+ #include <openssl/evp.h>
+ #endif
+@@ -83,6 +87,11 @@
+ 
+ lxc_log_define(lxccontainer, lxc);
+ 
++#ifdef HAVE_ISULAD
++typedef bool (*func_is_io_stat_read)(const char *value);
++typedef bool (*func_is_io_stat_write)(const char *value);
++#endif
++
+ static bool do_lxcapi_destroy(struct lxc_container *c);
+ static const char *lxcapi_get_config_path(struct lxc_container *c);
+ #define do_lxcapi_get_config_path(c) lxcapi_get_config_path(c)
+@@ -281,6 +290,13 @@ static void lxc_container_free(struct lxc_container *c)
+ 	free(c->config_path);
+ 	c->config_path = NULL;
+ 
++#ifdef HAVE_ISULAD
++	free(c->exit_fifo);
++	c->exit_fifo = NULL;
++	free(c->ocihookfile);
++	c->ocihookfile = NULL;
++#endif
++
+ 	free(c);
+ }
+ 
+@@ -519,6 +535,7 @@ static bool do_lxcapi_freeze(struct lxc_container *c)
+ 	return true;
+ }
+ 
++
+ WRAP_API(bool, lxcapi_freeze)
+ 
+ static bool do_lxcapi_unfreeze(struct lxc_container *c)
+@@ -623,6 +640,66 @@ static bool load_config_locked(struct lxc_container *c, const char *fname)
+ 	return true;
+ }
+ 
++#ifdef HAVE_ISULAD
++static bool load_ocihooks_locked(struct lxc_container *c)
++{
++	parser_error err = NULL;
++	oci_runtime_spec_hooks *hooks = NULL;
++
++	if (!c->lxc_conf)
++		c->lxc_conf = lxc_conf_init();
++
++	if (!c->lxc_conf)
++		return false;
++
++	hooks = oci_runtime_spec_hooks_parse_file(c->ocihookfile, NULL, &err);
++	if (!hooks) {
++		fprintf(stderr, "parse oci hooks config failed: %s\n", err);
++		free(err);
++		return true;
++	}
++	c->lxc_conf->ocihooks = hooks;
++
++	if (err)
++		free(err);
++	return true;
++}
++
++/*
++ * isulad: set oci hook file path
++ * */
++static bool set_oci_hook_config_filename(struct lxc_container *c)
++{
++#define OCI_HOOK_JSON_FILE_NAME "ocihooks.json"
++	char *newpath = NULL;
++	int len, ret;
++
++	if (!c->config_path)
++		return false;
++
++	/* $lxc_path + "/" + c->name + "/" + "config" + '\0' */
++	if (strlen(c->config_path) + strlen(c->name) > SIZE_MAX - strlen(OCI_HOOK_JSON_FILE_NAME) - 3)
++		return false;
++	len = strlen(c->config_path) + strlen(c->name) + strlen(OCI_HOOK_JSON_FILE_NAME) + 3;
++
++	newpath = malloc(len);
++	if (newpath == NULL)
++		return false;
++
++	ret = snprintf(newpath, len, "%s/%s/%s", c->config_path, c->name, OCI_HOOK_JSON_FILE_NAME);
++	if (ret < 0 || ret >= len) {
++		fprintf(stderr, "Error printing out config file name\n");
++		free(newpath);
++		return false;
++	}
++
++	free(c->ocihookfile);
++	c->ocihookfile = newpath;
++
++	return true;
++}
++#endif
++
+ static bool do_lxcapi_load_config(struct lxc_container *c, const char *alt_file)
+ {
+ 	int lret;
+@@ -656,6 +733,11 @@ static bool do_lxcapi_load_config(struct lxc_container *c, const char *alt_file)
+ 
+ 	ret = load_config_locked(c, fname);
+ 
++#ifdef HAVE_ISULAD
++	if (ret && file_exists(c->ocihookfile))
++		ret = load_ocihooks_locked(c);
++#endif
++
+ 	if (need_disklock)
+ 		container_disk_unlock(c);
+ 	else
+@@ -855,6 +937,33 @@ static bool wait_on_daemonized_start(struct lxc_handler *handler, int pid)
+ 	return true;
+ }
+ 
++#ifdef HAVE_ISULAD
++/* isulad: use init argv as init cmd */
++static char **use_init_args(char **init_argv, size_t init_args)
++{
++	size_t i;
++	int nargs = 0;
++	char **argv;
++
++	if (!init_argv)
++		return NULL;
++
++	do {
++		argv = malloc(sizeof(char *));
++	} while (!argv);
++
++	argv[0] = NULL;
++	for (i = 0; i < init_args; i++)
++		push_arg(&argv, init_argv[i], &nargs);
++
++	if (nargs == 0) {
++		free(argv);
++		return NULL;
++	}
++	return argv;
++}
++#endif
++
+ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const argv[])
+ {
+ 	int ret;
+@@ -865,6 +974,11 @@ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const a
+ 		NULL,
+ 	};
+ 	char **init_cmd = NULL;
++#ifdef HAVE_ISULAD
++	int keepfds[] = {-1, -1, -1, -1, -1};
++	ssize_t size_read;
++	char errbuf[BUFSIZ + 1] = {0};
++#endif
+ 
+ 	/* container does exist */
+ 	if (!c)
+@@ -911,6 +1025,16 @@ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const a
+ 			argv = init_cmd = split_init_cmd(conf->init_cmd);
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	if (!argv) {
++		argv = init_cmd = use_init_args(conf->init_argv, conf->init_argc);
++	}
++
++	if (c->image_type_oci) {
++		handler->image_type_oci = true;
++	}
++#endif
++
+ 	/* ... otherwise use default_args. */
+ 	if (!argv) {
+ 		if (useinit) {
+@@ -930,10 +1054,23 @@ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const a
+ 		char title[2048];
+ 		pid_t pid_first, pid_second;
+ 
++#ifdef HAVE_ISULAD
++		//isulad: pipdfd for get error message of child or grandchild process.
++		if (pipe2(conf->errpipe, O_CLOEXEC) != 0) {
++			SYSERROR("Failed to init errpipe");
++			free_init_cmd(init_cmd);
++			lxc_put_handler(handler);
++			return false;
++		}
++#endif
++
+ 		pid_first = fork();
+ 		if (pid_first < 0) {
+ 			free_init_cmd(init_cmd);
+ 			lxc_put_handler(handler);
++#ifdef HAVE_ISULAD
++			lxc_close_error_pipe(conf->errpipe);
++#endif
+ 			return false;
+ 		}
+ 
+@@ -943,11 +1080,25 @@ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const a
+ 			 * the PID file, child will do the free and unlink.
+ 			 */
+ 			c->pidfile = NULL;
++#ifdef HAVE_ISULAD
++			close(conf->errpipe[1]);
++			conf->errpipe[1] = -1;
++#endif
+ 
+ 			/* Wait for container to tell us whether it started
+ 			 * successfully.
+ 			 */
+ 			started = wait_on_daemonized_start(handler, pid_first);
++#ifdef HAVE_ISULAD
++			if (!started) {
++				size_read = read(conf->errpipe[0], errbuf, BUFSIZ);
++				if (size_read > 0) {
++					conf->errmsg = safe_strdup(errbuf);
++				}
++			}
++			close(conf->errpipe[0]);
++			conf->errpipe[0] = -1;
++#endif
+ 
+ 			free_init_cmd(init_cmd);
+ 			lxc_put_handler(handler);
+@@ -983,6 +1134,9 @@ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const a
+ 		if (pid_second != 0) {
+ 			free_init_cmd(init_cmd);
+ 			lxc_put_handler(handler);
++#ifdef HAVE_ISULAD
++			lxc_close_error_pipe(conf->errpipe);
++#endif
+ 			_exit(EXIT_SUCCESS);
+ 		}
+ 
+@@ -995,7 +1149,18 @@ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const a
+ 			_exit(EXIT_FAILURE);
+ 		}
+ 
++#ifdef HAVE_ISULAD
++		keepfds[0] = handler->conf->maincmd_fd;
++		keepfds[1] = handler->state_socket_pair[0];
++		keepfds[2] = handler->state_socket_pair[1];
++		keepfds[4] = conf->errpipe[1];
++		close(conf->errpipe[0]);
++		conf->errpipe[0] = -1;
++		ret = lxc_check_inherited(conf, true, keepfds,
++					  sizeof(keepfds) / sizeof(keepfds[0]));
++#else
+ 		ret = inherit_fds(handler, true);
++#endif
+ 		if (ret < 0)
+ 			_exit(EXIT_FAILURE);
+ 
+@@ -1028,6 +1193,9 @@ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const a
+ 		if (w < 0 || (size_t)w >= sizeof(pidstr)) {
+ 			free_init_cmd(init_cmd);
+ 			lxc_put_handler(handler);
++#ifdef HAVE_ISULAD
++			lxc_close_error_pipe(conf->errpipe);
++#endif
+ 
+ 			SYSERROR("Failed to write monitor pid to \"%s\"", c->pidfile);
+ 
+@@ -1041,6 +1209,9 @@ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const a
+ 		if (ret < 0) {
+ 			free_init_cmd(init_cmd);
+ 			lxc_put_handler(handler);
++#ifdef HAVE_ISULAD
++			lxc_close_error_pipe(conf->errpipe);
++#endif
+ 
+ 			SYSERROR("Failed to write monitor pid to \"%s\"", c->pidfile);
+ 
+@@ -1051,6 +1222,19 @@ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const a
+ 		}
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: open exit fifo */
++	if (c->exit_fifo) {
++		conf->exit_fd = lxc_open(c->exit_fifo, O_WRONLY | O_NONBLOCK | O_CLOEXEC, 0);
++		if (conf->exit_fd < 0) {
++			ERROR("Failed to open exit fifo %s: %s.", c->exit_fifo, strerror(errno));
++			lxc_put_handler(handler);
++			ret = 1;
++			goto on_error;
++		}
++	}
++#endif
++
+ 	conf->reboot = REBOOT_NONE;
+ 
+ 	/* Unshare the mount namespace if requested */
+@@ -1082,19 +1266,53 @@ reboot:
+ 		}
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	keepfds[0] = handler->conf->maincmd_fd;
++	keepfds[1] = handler->state_socket_pair[0];
++	keepfds[2] = handler->state_socket_pair[1];
++
++	/* keep exit fifo fd */
++	if (conf->exit_fd >= 0) {
++		keepfds[3] = conf->exit_fd;
++	}
++	/* isulad: keep errpipe fd */
++	if (c->daemonize)
++		keepfds[4] = conf->errpipe[1];
++
++	ret = lxc_check_inherited(conf, c->daemonize, keepfds,
++				  sizeof(keepfds) / sizeof(keepfds[0]));
++	if (ret < 0) {
++		lxc_put_handler(handler);
++		ret = 1;
++		goto on_error;
++	}
++#else
+ 	ret = inherit_fds(handler, c->daemonize);
+ 	if (ret < 0) {
+ 		lxc_put_handler(handler);
+ 		ret = 1;
+ 		goto on_error;
+ 	}
++#endif
+ 
++#ifndef HAVE_ISULAD
+ 	if (useinit)
+ 		ret = lxc_execute(c->name, argv, 1, handler, c->config_path,
+ 				  c->daemonize, &c->error_num);
+ 	else
+ 		ret = lxc_start(argv, handler, c->config_path, c->daemonize,
+ 				&c->error_num);
++#else
++	if (useinit) {
++		ret = lxc_execute(c->name, argv, 1, handler, c->config_path,
++				  c->daemonize, &c->error_num, c->start_timeout);
++	} else {
++		handler->disable_pty = c->disable_pty;
++		handler->open_stdin = c->open_stdin;
++		ret = lxc_start(argv, handler, c->config_path, c->daemonize,
++				&c->error_num, c->start_timeout);
++	}
++#endif
+ 
+ 	if (conf->reboot == REBOOT_REQ) {
+ 		INFO("Container requested reboot");
+@@ -1185,6 +1403,9 @@ WRAP_API(bool, lxcapi_stop)
+ 
+ static int do_create_container_dir(const char *path, struct lxc_conf *conf)
+ {
++#ifdef HAVE_ISULAD
++	__do_free char *p = NULL;
++#endif
+ 	int lasterr;
+ 	int ret = -1;
+ 
+@@ -1200,8 +1421,16 @@ static int do_create_container_dir(const char *path, struct lxc_conf *conf)
+ 		ret = 0;
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	p = must_copy_string(path);
++#endif
++
+ 	if (!lxc_list_empty(&conf->id_map)) {
++#ifdef HAVE_ISULAD
++		ret = chown_mapped_root(p, conf);
++#else
+ 		ret = chown_mapped_root(path, conf);
++#endif
+ 		if (ret < 0)
+ 			ret = -1;
+ 	}
+@@ -2048,7 +2277,12 @@ WRAP_API_1(bool, lxcapi_reboot2, int)
+ static bool do_lxcapi_shutdown(struct lxc_container *c, int timeout)
+ {
+ 	__do_close int pidfd = -EBADF, state_client_fd = -EBADF;
++#ifdef HAVE_ISULAD
++	// isulad: keep default signal the same as docker
++	int haltsignal = SIGTERM;
++#else
+ 	int haltsignal = SIGPWR;
++#endif
+ 	pid_t pid = -1;
+ 	lxc_state_t states[MAX_STATE] = {0};
+ 	int killret, ret;
+@@ -2067,9 +2301,10 @@ static bool do_lxcapi_shutdown(struct lxc_container *c, int timeout)
+ 	/* Detect whether we should send SIGRTMIN + 3 (e.g. systemd). */
+ 	if (c->lxc_conf && c->lxc_conf->haltsignal)
+ 		haltsignal = c->lxc_conf->haltsignal;
++#ifndef HAVE_ISULAD
+ 	else if (task_blocks_signal(pid, (SIGRTMIN + 3)))
+ 		haltsignal = (SIGRTMIN + 3);
+-
++#endif
+ 
+ 	/*
+ 	 * Add a new state client before sending the shutdown signal so
+@@ -2938,6 +3173,21 @@ static int lxc_unlink_exec_wrapper(void *data)
+ 	return unlink(arg);
+ }
+ 
++#ifdef HAVE_ISULAD
++static void container_sock_dir_delete(const char *name)
++{
++	__do_free char *sock_dir = NULL;
++
++	sock_dir = generate_named_unix_sock_dir(name);
++	if (sock_dir == NULL) {
++		ERROR("Failed to generate exec unix sock dir");
++		return;
++	}
++
++	(void)lxc_rmdir_onedev(sock_dir, NULL);
++}
++#endif
++
+ static bool container_destroy(struct lxc_container *c,
+ 			      struct lxc_storage *storage)
+ {
+@@ -2948,8 +3198,19 @@ static bool container_destroy(struct lxc_container *c,
+ 	bool bret = false;
+ 	int ret = 0;
+ 
++#ifdef HAVE_ISULAD
++	if (!c)
++		return false;
++	// isulad: if container is not defined, we need to remove disk lock file
++	// which is created in lxc_container_new.
++	if (!do_lxcapi_is_defined(c)) {
++		container_disk_removelock(c);
++		return false;
++	}
++#else
+ 	if (!c || !do_lxcapi_is_defined(c))
+ 		return false;
++#endif
+ 
+ 	conf = c->lxc_conf;
+ 	if (container_disk_lock(c))
+@@ -3069,8 +3330,20 @@ static bool container_destroy(struct lxc_container *c,
+ 	if (ret < 0) {
+ 		ERROR("Failed to destroy directory \"%s\" for \"%s\"", path,
+ 		      c->name);
++#ifdef HAVE_ISULAD
++		char msg[BUFSIZ] = { 0 };
++		ret = snprintf(msg, BUFSIZ, "Failed to destroy directory \"%s\": %s", path, errno ? strerror(errno) : "error");
++		if (ret < 0 || ret >= BUFSIZ) {
++			ERROR("Sprintf failed");
++			goto out;
++		}
++		c->error_string = safe_strdup(msg);
++#endif
+ 		goto out;
+ 	}
++#ifdef HAVE_ISULAD
++	container_sock_dir_delete(c->name);
++#endif
+ 	INFO("Destroyed directory \"%s\" for \"%s\"", path, c->name);
+ 
+ on_success:
+@@ -3081,6 +3354,11 @@ out:
+ 		free(path);
+ 
+ 	container_disk_unlock(c);
++#ifdef HAVE_ISULAD
++	if (bret && container_disk_removelock(c)) {
++		bret = false;
++	}
++#endif
+ 	return bret;
+ }
+ 
+@@ -4030,8 +4308,13 @@ static int lxcapi_attach(struct lxc_container *c,
+ 
+ 	current_config = c->lxc_conf;
+ 
++#ifdef HAVE_ISULAD
++	ret = lxc_attach(c, exec_function, exec_payload, options,
++			 attached_process, &c->lxc_conf->errmsg);
++#else
+ 	ret = lxc_attach(c, exec_function, exec_payload, options,
+ 			 attached_process);
++#endif
+ 	current_config = NULL;
+ 	return ret;
+ }
+@@ -4051,7 +4334,11 @@ static int do_lxcapi_attach_run_wait(struct lxc_container *c,
+ 	command.program = (char *)program;
+ 	command.argv = (char **)argv;
+ 
++#ifdef HAVE_ISULAD
++	ret = lxc_attach(c, lxc_attach_run_command, &command, options, &pid, NULL);
++#else
+ 	ret = lxc_attach(c, lxc_attach_run_command, &command, options, &pid);
++#endif
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -5230,7 +5517,561 @@ static int do_lxcapi_seccomp_notify_fd(struct lxc_container *c)
+ 
+ WRAP_API(int, lxcapi_seccomp_notify_fd)
+ 
++#ifdef HAVE_ISULAD
++/* isulad add set console fifos*/
++static bool do_lxcapi_set_terminal_default_fifos(struct lxc_container *c, const char *in, const char *out, const char *err)
++{
++	struct lxc_conf *conf = NULL;
++
++	if (!c || !c->lxc_conf)
++		return false;
++	if (container_mem_lock(c)) {
++		ERROR("Error getting mem lock");
++		return false;
++	}
++
++	conf = c->lxc_conf;
++	if (in) {
++		if (conf->console.init_fifo[0])
++			free(conf->console.init_fifo[0]);
++		conf->console.init_fifo[0] = safe_strdup(in);
++	}
++	if (out) {
++		if (conf->console.init_fifo[1])
++			free(conf->console.init_fifo[1]);
++		conf->console.init_fifo[1] = safe_strdup(out);
++	}
++	if (err) {
++		if (conf->console.init_fifo[2])
++			free(conf->console.init_fifo[2]);
++		conf->console.init_fifo[2] = safe_strdup(err);
++	}
++
++	container_mem_unlock(c);
++	return true;
++}
++
++WRAP_API_3(bool, lxcapi_set_terminal_default_fifos, const char *, const char *, const char *)
++
++/* isulad add set info file path */
++static bool do_lxcapi_set_container_info_file(struct lxc_container *c, const char *info_file)
++{
++	struct lxc_conf *conf = NULL;
++
++	if (!c || !c->lxc_conf || !info_file)
++		return false;
++	if (container_mem_lock(c)) {
++		ERROR("Error getting mem lock");
++		return false;
++	}
++
++	conf = c->lxc_conf;
++	if (conf->container_info_file)
++		free(conf->container_info_file);
++	conf->container_info_file = safe_strdup(info_file);
++
++	container_mem_unlock(c);
++	return true;
++}
++
++WRAP_API_1(bool, lxcapi_set_container_info_file, const char *)
++
++static bool do_lxcapi_want_disable_pty(struct lxc_container *c, bool state)
++{
++	if (!c || !c->lxc_conf)
++		return false;
++
++	if (container_mem_lock(c))
++		return false;
++
++	c->disable_pty = state;
++
++	container_mem_unlock(c);
++
++	return true;
++}
++
++WRAP_API_1(bool, lxcapi_want_disable_pty, bool)
++
++static bool do_lxcapi_want_open_stdin(struct lxc_container *c, bool state)
++{
++	if (!c || !c->lxc_conf)
++		return false;
++
++	if (container_mem_lock(c))
++		return false;
++
++	c->open_stdin = state;
++
++	container_mem_unlock(c);
++
++	return true;
++}
++
++WRAP_API_1(bool, lxcapi_want_open_stdin, bool)
++
++/* isulad add clean resources */
++static bool do_lxcapi_add_terminal_fifo(struct lxc_container *c, const char *in_fifo, const char *out_fifo, const char *err_fifo)
++{
++	bool ret = true;
++
++	if (!c || !c->lxc_conf)
++		return false;
++	if (container_mem_lock(c)) {
++		ERROR("Error getting mem lock");
++		return false;
++	}
++
++	if (lxc_cmd_set_terminal_fifos(c->name, c->config_path, in_fifo, out_fifo, err_fifo)) {
++		ERROR("Error set console fifos");
++		ret = false;
++	}
++
++	container_mem_unlock(c);
++	return ret;
++}
++
++WRAP_API_3(bool, lxcapi_add_terminal_fifo, const char *, const char *, const char *)
++
++static bool do_lxcapi_set_terminal_winch(struct lxc_container *c, unsigned int height, unsigned int width)
++{
++	bool ret = true;
++
++	if (!c || !c->lxc_conf)
++		return false;
++	if (container_mem_lock(c)) {
++		ERROR("Error getting mem lock");
++		return false;
++	}
++
++	if (lxc_cmd_set_terminal_winch(c->name, c->config_path, height, width)) {
++		ERROR("Error set terminal winch");
++		ret = false;
++	}
++
++	container_mem_unlock(c);
++	return ret;
++}
++
++WRAP_API_2(bool, lxcapi_set_terminal_winch, unsigned int, unsigned int)
++
++static bool do_lxcapi_set_exec_terminal_winch(struct lxc_container *c, const char *suffix, unsigned int height, unsigned int width)
++{
++	bool ret = true;
++
++	if (!c || !c->lxc_conf)
++		return false;
++	if (container_mem_lock(c)) {
++		ERROR("Error getting mem lock");
++		return false;
++	}
++
++	if (lxc_exec_cmd_set_terminal_winch(c->name, c->config_path, suffix, height, width)) {
++		ERROR("Error set terminal winch");
++		ret = false;
++	}
++
++	container_mem_unlock(c);
++	return ret;
++}
++
++WRAP_API_3(bool, lxcapi_set_exec_terminal_winch, const char *, unsigned int, unsigned int)
++
++/* isulad add clean resources */
++static bool do_lxcapi_clean_container_resource(struct lxc_container *c, pid_t pid)
++{
++	int ret;
++
++	if (!c)
++		return false;
++
++	ret = do_lxcapi_clean_resource(c->name, c->config_path, c->lxc_conf, pid);
++	if (ret)
++		ERROR("Failed to clean container %s resource", c->name);
++	return ret == 0;
++
++}
++
++WRAP_API_1(bool, lxcapi_clean_container_resource, pid_t)
++
++/* isulad get coantainer pids */
++static bool do_lxcapi_get_container_pids(struct lxc_container *c, pid_t **pids,size_t *pids_len)
++{
++	int ret;
++
++	if (!c)
++		return false;
++
++	ret = do_lxcapi_get_pids(c->name, c->config_path, c->lxc_conf, pids,pids_len);
++	if (ret)
++		ERROR("Failed to get container %s pids", c->name);
++	return ret == 0;
++
++}
++
++WRAP_API_2(bool, lxcapi_get_container_pids, pid_t **,size_t *)
++
++/* isulad add start timeout */
++static bool do_lxcapi_set_start_timeout(struct lxc_container *c,  unsigned int start_timeout)
++{
++	if (!c || !c->lxc_conf)
++		return false;
++	if (container_mem_lock(c)) {
++		ERROR("Error getting mem lock");
++		return false;
++	}
++	c->start_timeout = start_timeout;
++	container_mem_unlock(c);
++	return true;
++}
++
++WRAP_API_1(bool, lxcapi_set_start_timeout, unsigned int)
++
++/* isulad add set image type */
++static bool do_lxcapi_set_oci_type(struct lxc_container *c,  bool image_type_oci)
++{
++	if (!c || !c->lxc_conf)
++		return false;
++	if (container_mem_lock(c)) {
++		ERROR("Error getting mem lock");
++		return false;
++	}
++	c->image_type_oci = image_type_oci;
++	container_mem_unlock(c);
++	return true;
++}
++
++WRAP_API_1(bool, lxcapi_set_oci_type, bool)
++
++static uint64_t metrics_get_ull(struct lxc_container *c, struct cgroup_ops *cgroup_ops, const char *item)
++{
++    char buf[81] = {0};
++    int len = 0;
++    uint64_t val = 0;
++
++    len = cgroup_ops->get(cgroup_ops, item, buf, sizeof(buf) - 1, c->name, c->config_path);
++    if (len <= 0) {
++        DEBUG("unable to read cgroup item %s", item);
++        return 0;
++    }
++
++    val = strtoull(buf, NULL, 0);
++    return val;
++}
++
++static uint64_t metrics_get_ull_with_max(struct lxc_container *c, struct cgroup_ops *cgroup_ops, const char *item)
++{
++    char buf[81] = {0};
++    int len = 0;
++    uint64_t val = 0;
++
++    len = cgroup_ops->get(cgroup_ops, item, buf, sizeof(buf) - 1, c->name, c->config_path);
++    if (len <= 0) {
++        DEBUG("unable to read cgroup item %s", item);
++        return 0;
++    }
++
++    if (strcmp(buf, "max") == 0) {
++	return ULONG_MAX;
++    }
++
++    val = strtoull(buf, NULL, 0);
++    return val;
++}
++
++static inline bool is_blk_metrics_read(const char *value)
++{
++    return strcmp(value, "Read") == 0;
++}
++
++static inline bool is_blk_metrics_write(const char *value)
++{
++    return strcmp(value, "Write") == 0;
++}
++
++static inline bool is_blk_metrics_total(const char *value)
++{
++    return strcmp(value, "Total") == 0;
++}
++
++static void metrics_get_blk_stats(struct lxc_container *c, struct cgroup_ops *cgroup_ops, const char *item, struct lxc_blkio_metrics *stats)
++{
++    char *buf = NULL;
++    int i = 0;
++    int len = 0;
++    int ret = 0;
++    char **lines = NULL;
++    char **cols = NULL;
++
++    len = cgroup_ops->get(cgroup_ops, item, NULL, 0, c->name, c->config_path);
++    if (len <= 0) {
++        DEBUG("unable to read cgroup item %s", item);
++        return;
++    }
++
++    buf = malloc(len + 1);
++    (void)memset(buf, 0, len + 1);
++    ret = cgroup_ops->get(cgroup_ops, item, buf, len, c->name, c->config_path);
++    if (ret <= 0) {
++        DEBUG("unable to read cgroup item %s", item);
++        goto out;
++    }
++
++    lines = lxc_string_split_and_trim(buf, '\n');
++    if (lines == NULL) {
++        goto out;
++    }
++
++    (void)memset(stats, 0, sizeof(struct lxc_blkio_metrics));
++
++    for (i = 0; lines[i]; i++) {
++        cols = lxc_string_split_and_trim(lines[i], ' ');
++        if (cols == NULL) {
++            goto err_out;
++        }
++        if (lxc_array_len((void **)cols) == 3) {
++            if (is_blk_metrics_read(cols[1])) {
++                stats->read += strtoull(cols[2], NULL, 0);
++            } else if (is_blk_metrics_write(cols[1])) {
++                stats->write += strtoull(cols[2], NULL, 0);
++            }
++        }
++        if (lxc_array_len((void **)cols) == 2 && is_blk_metrics_total(cols[0])) {
++            stats->total = strtoull(cols[1], NULL, 0);
++        }
++
++        lxc_free_array((void **)cols, free);
++    }
++err_out:
++    lxc_free_array((void **)lines, free);
++out:
++    free(buf);
++    return;
++}
++
++static void metrics_get_io_stats_v2(struct lxc_container *c, struct cgroup_ops *cgroup_ops, const char *item, struct lxc_blkio_metrics *stats, func_is_io_stat_read is_io_stat_read, func_is_io_stat_write is_io_stat_write)
++{
++    char *buf = NULL;
++    int i = 0;
++    int j = 0;
++    int len = 0;
++    int ret = 0;
++    char **lines = NULL;
++    char **cols = NULL;
++    char **kv = NULL;
++
++    len = cgroup_ops->get(cgroup_ops, item, NULL, 0, c->name, c->config_path);
++    if (len <= 0) {
++        DEBUG("unable to read cgroup item %s", item);
++        return;
++    }
++
++    buf = malloc(len + 1);
++    (void)memset(buf, 0, len + 1);
++    ret = cgroup_ops->get(cgroup_ops, item, buf, len, c->name, c->config_path);
++    if (ret <= 0) {
++        DEBUG("unable to read cgroup item %s", item);
++        goto out;
++    }
++
++    lines = lxc_string_split_and_trim(buf, '\n');
++    if (lines == NULL) {
++        goto out;
++    }
++
++    (void)memset(stats, 0, sizeof(struct lxc_blkio_metrics));
++    // line example:
++    // 259:0 rbytes=0 wbytes=12288 rios=0 wios=4 dbytes=0 dios=0
++    for (i = 0; lines[i]; i++) {
++        cols = lxc_string_split_and_trim(lines[i], ' ');
++        if (cols == NULL || lxc_array_len((void **)cols) < 2) {
++            goto err_out;
++        }
++        len = lxc_array_len((void **)cols);
++        for (j = 1; j < len; j++) {
++            kv = lxc_string_split(cols[j], '=');
++            if (kv == NULL || lxc_array_len((void **)kv) != 2) {
++                lxc_free_array((void **)kv, free);
++                continue;
++            }
++            if (is_io_stat_read(kv[0])) {
++                stats->read += strtoull(kv[1], NULL, 0);
++            } else if (is_io_stat_write(kv[0])) {
++                stats->write += strtoull(kv[1], NULL, 0);
++            }
++            lxc_free_array((void **)kv, free);
++        }
++        lxc_free_array((void **)cols, free);
++    }
++
++    stats->total = stats->read + stats->write;
++
++err_out:
++    lxc_free_array((void **)lines, free);
++out:
++    free(buf);
++    return;
++}
++
++static uint64_t metrics_match_get_ull(struct lxc_container *c, struct cgroup_ops *cgroup_ops, const char *item, const char *match, int column)
++{
++#define BUFSIZE 4096
++    char buf[BUFSIZE] = {0};
++    int i = 0;
++    int j = 0;
++    int len = 0;
++    uint64_t val = 0;
++    char **lines = NULL;
++    char **cols = NULL;
++    size_t matchlen = 0;
++
++    len = cgroup_ops->get(cgroup_ops, item, buf, sizeof(buf) - 1, c->name, c->config_path);
++    if (len <= 0) {
++        DEBUG("unable to read cgroup item %s", item);
++        goto err_out;
++    }
++
++    lines = lxc_string_split_and_trim(buf, '\n');
++    if (lines == NULL) {
++        goto err_out;
++    }
++
++    matchlen = strlen(match);
++    for (i = 0; lines[i]; i++) {
++        if (strncmp(lines[i], match, matchlen) != 0) {
++            continue;
++        }
++
++        cols = lxc_string_split_and_trim(lines[i], ' ');
++        if (cols == NULL) {
++            goto err1;
++        }
++        for (j = 0; cols[j]; j++) {
++            if (j == column) {
++                val = strtoull(cols[j], NULL, 0);
++                break;
++            }
++        }
++        lxc_free_array((void **)cols, free);
++        break;
++    }
++err1:
++    lxc_free_array((void **)lines, free);
++err_out:
++    return val;
++}
++
++static bool is_io_stat_rbytes(const char *value)
++{
++    return strcmp(value, "rbytes") == 0;
++}
++
++static bool is_io_stat_wbytes(const char *value)
++{
++    return strcmp(value, "wbytes") == 0;
++}
++
++static bool is_io_stat_rios(const char *value)
++{
++    return strcmp(value, "rios") == 0;
++}
++
++static bool is_io_stat_wios(const char *value)
++{
++    return strcmp(value, "wios") == 0;
++}
++
++static bool unified_metrics_get(struct lxc_container *c, struct cgroup_ops *cgroup_ops, struct lxc_container_metrics *metrics)
++{
++	// cpu
++	metrics->cpu_use_nanos = metrics_match_get_ull(c, cgroup_ops, "cpu.stat", "usage_usec", 1) * 1000;
++	metrics->cpu_use_user = metrics_match_get_ull(c, cgroup_ops, "cpu.stat", "user_usec", 1) * 1000;
++	metrics->cpu_use_sys = metrics_match_get_ull(c, cgroup_ops, "cpu.stat", "system_usec", 1) * 1000;
++
++	// io
++	metrics_get_io_stats_v2(c, cgroup_ops, "io.stat", &metrics->io_service_bytes, is_io_stat_rbytes, is_io_stat_wbytes);
++	metrics_get_io_stats_v2(c, cgroup_ops, "io.stat", &metrics->io_serviced, is_io_stat_rios, is_io_stat_wios);
++
++	// memory
++	metrics->mem_used = metrics_get_ull(c, cgroup_ops, "memory.current");
++	metrics->mem_limit = metrics_get_ull_with_max(c, cgroup_ops, "memory.max");
++	metrics->inactive_file_total = metrics_match_get_ull(c, cgroup_ops, "memory.stat", "inactive_file", 1);
++	metrics->cache = metrics_match_get_ull(c, cgroup_ops, "memory.stat", "file", 1);
++	metrics->cache_total = metrics->cache;
++
++	// cgroup v2 does not support kernel memory
++	metrics->kmem_used = 0;
++	metrics->kmem_limit = 0;
++
++	// pids
++	metrics->pids_current = metrics_get_ull(c, cgroup_ops, "pids.current");
++
++	return true;
++}
++
++/* isulad add get container metrics */
++static bool do_lxcapi_get_container_metrics(struct lxc_container *c,  struct lxc_container_metrics *metrics)
++{
++	call_cleaner(cgroup_exit) struct cgroup_ops *cgroup_ops = NULL;
++	const char *state = NULL;
++	if (c == NULL || c->lxc_conf == NULL || metrics == NULL) {
++		return false;
++	}
++
++	state = c->state(c);
++	metrics->state = state;
++
++	if (!is_stopped(c)) {
++		metrics->init = c->init_pid(c);
++	} else {
++		metrics->init = -1;
++	}
++
++	cgroup_ops = cgroup_init(c->lxc_conf);
++	if (cgroup_ops == NULL) {
++		return false;
++	}
++
++	if (cgroup_ops->cgroup_layout == CGROUP_LAYOUT_UNIFIED) {
++		return unified_metrics_get(c, cgroup_ops, metrics);
++	}
++
++	metrics->cpu_use_nanos = metrics_get_ull(c, cgroup_ops, "cpuacct.usage");
++	metrics->pids_current = metrics_get_ull(c, cgroup_ops, "pids.current");
++
++	metrics->cpu_use_user = metrics_match_get_ull(c, cgroup_ops, "cpuacct.stat", "user", 1);
++	metrics->cpu_use_sys = metrics_match_get_ull(c, cgroup_ops, "cpuacct.stat", "system", 1);
++
++	// Try to read CFQ stats available on all CFQ enabled kernels first
++	metrics_get_blk_stats(c, cgroup_ops, "blkio.io_serviced_recursive", &metrics->io_serviced);
++	if (metrics->io_serviced.read == 0 && metrics->io_serviced.write == 0 && metrics->io_serviced.total == 0) {
++		metrics_get_blk_stats(c, cgroup_ops, "blkio.throttle.io_service_bytes", &metrics->io_service_bytes);
++		metrics_get_blk_stats(c, cgroup_ops, "blkio.throttle.io_serviced", &metrics->io_serviced);
++	} else {
++		metrics_get_blk_stats(c, cgroup_ops, "blkio.io_service_bytes_recursive", &metrics->io_service_bytes);
++	}
++
++	metrics->mem_used = metrics_get_ull(c, cgroup_ops, "memory.usage_in_bytes");
++	metrics->mem_limit = metrics_get_ull(c, cgroup_ops, "memory.limit_in_bytes");
++	metrics->kmem_used = metrics_get_ull(c, cgroup_ops, "memory.kmem.usage_in_bytes");
++	metrics->kmem_limit = metrics_get_ull(c, cgroup_ops, "memory.kmem.limit_in_bytes");
++
++	metrics->cache = metrics_match_get_ull(c, cgroup_ops, "memory.stat", "cache", 1);
++	metrics->cache_total = metrics_match_get_ull(c, cgroup_ops, "memory.stat", "total_cache", 1);
++	metrics->inactive_file_total = metrics_match_get_ull(c, cgroup_ops, "memory.stat", "total_inactive_file", 1);
++
++	return true;
++}
++
++WRAP_API_1(bool, lxcapi_get_container_metrics, struct lxc_container_metrics *)
++
++#endif
++
++#ifdef HAVE_ISULAD
++static struct lxc_container *do_lxc_container_new(const char *name, const char *configpath, bool load_config)
++#else
+ struct lxc_container *lxc_container_new(const char *name, const char *configpath)
++#endif
+ {
+ 	struct lxc_container *c;
+ 	size_t len;
+@@ -5283,10 +6124,24 @@ struct lxc_container *lxc_container_new(const char *name, const char *configpath
+ 		goto err;
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	if (!set_oci_hook_config_filename(c)) {
++		fprintf(stderr, "Error allocating oci hooks file pathname\n");
++		goto err;
++	}
++
++	if (load_config && file_exists(c->configfile)) {
++		if (!lxcapi_load_config(c, NULL)) {
++			fprintf(stderr, "Failed to load config for %s\n", name);
++			goto err;
++		}
++	}
++#else
+ 	if (file_exists(c->configfile) && !lxcapi_load_config(c, NULL)) {
+ 		fprintf(stderr, "Failed to load config for %s\n", name);
+ 		goto err;
+ 	}
++#endif
+ 
+ 	rc = ongoing_create(c);
+ 	switch (rc) {
+@@ -5310,6 +6165,9 @@ struct lxc_container *lxc_container_new(const char *name, const char *configpath
+ 
+ 	c->daemonize = true;
+ 	c->pidfile = NULL;
++#ifdef HAVE_ISULAD
++	c->image_type_oci = false;
++#endif
+ 
+ 	/* Assign the member functions. */
+ 	c->is_defined = lxcapi_is_defined;
+@@ -5371,7 +6229,20 @@ struct lxc_container *lxc_container_new(const char *name, const char *configpath
+ 	c->mount = lxcapi_mount;
+ 	c->umount = lxcapi_umount;
+ 	c->seccomp_notify_fd = lxcapi_seccomp_notify_fd;
+-
++#ifdef HAVE_ISULAD
++	c->set_container_info_file = lxcapi_set_container_info_file;
++	c->set_terminal_init_fifos = lxcapi_set_terminal_default_fifos;
++	c->add_terminal_fifos = lxcapi_add_terminal_fifo;
++	c->set_terminal_winch = lxcapi_set_terminal_winch;
++	c->set_exec_terminal_winch = lxcapi_set_exec_terminal_winch;
++	c->want_disable_pty = lxcapi_want_disable_pty;
++	c->want_open_stdin = lxcapi_want_open_stdin;
++	c->clean_container_resource = lxcapi_clean_container_resource;
++	c->get_container_pids = lxcapi_get_container_pids;
++	c->set_start_timeout = lxcapi_set_start_timeout;
++	c->set_oci_type = lxcapi_set_oci_type;
++	c->get_container_metrics = lxcapi_get_container_metrics;
++#endif
+ 	return c;
+ 
+ err:
+@@ -5379,6 +6250,19 @@ err:
+ 	return NULL;
+ }
+ 
++#ifdef HAVE_ISULAD
++// isulad: new container without load config to save time
++struct lxc_container *lxc_container_without_config_new(const char *name, const char *configpath)
++{
++	return do_lxc_container_new(name, configpath, false);
++}
++
++struct lxc_container *lxc_container_new(const char *name, const char *configpath)
++{
++	return do_lxc_container_new(name, configpath, true);
++}
++#endif
++
+ int lxc_get_wait_states(const char **states)
+ {
+ 	int i;
+@@ -5557,11 +6441,21 @@ int list_active_containers(const char *lxcpath, char ***nret,
+ 				continue;
+ 		}
+ 
++#ifdef HAVE_ISULAD
++		if (ct_name && ct_name_cnt) {
++			if (array_contains(&ct_name, p, ct_name_cnt)) {
++				if (is_hashed)
++					free(p);
++				continue;
++			}
++		}
++#else
+ 		if (array_contains(&ct_name, p, ct_name_cnt)) {
+ 			if (is_hashed)
+ 				free(p);
+ 			continue;
+ 		}
++#endif
+ 
+ 		if (!add_to_array(&ct_name, p, ct_name_cnt)) {
+ 			if (is_hashed)
+diff --git a/src/lxc/lxclock.c b/src/lxc/lxclock.c
+index 318e5bf..ce6f889 100644
+--- a/src/lxc/lxclock.c
++++ b/src/lxc/lxclock.c
+@@ -179,6 +179,10 @@ struct lxc_lock *lxc_newlock(const char *lxcpath, const char *name)
+ 	l->u.f.fd = -1;
+ 
+ on_error:
++#ifdef HAVE_ISULAD
++	if (l == NULL)
++		fprintf(stderr, "Failed to create lock for %s, path %s\n", name, lxcpath);
++#endif
+ 	return l;
+ }
+ 
+@@ -370,3 +374,30 @@ void container_disk_unlock(struct lxc_container *c)
+ 	lxcunlock(c->slock);
+ 	lxcunlock(c->privlock);
+ }
++
++#ifdef HAVE_ISULAD
++static int lxc_removelock(struct lxc_lock *l)
++{
++	int ret = 0;
++
++	if (l->type == LXC_LOCK_FLOCK) {
++		ret = unlink(l->u.f.fname);
++		if (ret && errno != ENOENT) {
++			SYSERROR("Error unlink %s", l->u.f.fname);
++			return ret;
++		}
++	}
++
++	return ret;
++}
++
++int container_disk_removelock(struct lxc_container *c)
++{
++	int ret;
++
++	ret = lxc_removelock(c->slock);
++	if (ret)
++		return ret;
++	return lxc_removelock(c->privlock);
++}
++#endif
+diff --git a/src/lxc/mainloop.c b/src/lxc/mainloop.c
+index d5ae2a6..c47f31b 100644
+--- a/src/lxc/mainloop.c
++++ b/src/lxc/mainloop.c
+@@ -150,3 +150,19 @@ void lxc_mainloop_close(struct lxc_epoll_descr *descr)
+ 
+ 	close_prot_errno_disarm(descr->epfd);
+ }
++
++#ifdef HAVE_ISULAD
++int isulad_safe_mainloop(struct lxc_epoll_descr *descr, int timeout_ms)
++{
++    int ret;
++
++    ret = lxc_mainloop(descr, timeout_ms);
++
++    // There are stdout and stderr channels, and two epolls should be performed to prevent
++    // one of the channels from exiting first, causing the other channel to not receive data,
++    // resulting in data loss
++    (void)lxc_mainloop(descr, 100);
++
++    return ret;
++}
++#endif
+diff --git a/src/lxc/path.c b/src/lxc/path.c
+new file mode 100644
+index 0000000..46256cb
+--- /dev/null
++++ b/src/lxc/path.c
+@@ -0,0 +1,655 @@
++/* SPDX-License-Identifier: LGPL-2.1+ */
++/******************************************************************************
++ * Copyright (c) Huawei Technologies Co., Ltd. 2020. Allrights reserved
++ * Description: isulad utils
++ * Author: lifeng
++ * Create: 2020-04-11
++******************************************************************************/
++#include <unistd.h>
++#include <stdlib.h>
++#include <limits.h>
++#include <string.h>
++#include <stdio.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <sys/param.h>
++#include <libgen.h>
++
++#include "path.h"
++#include "log.h"
++#include "isulad_utils.h"
++
++lxc_log_define(lxc_path_ui, lxc);
++
++#define ISSLASH(C) ((C) == '/')
++#define IS_ABSOLUTE_FILE_NAME(F) (ISSLASH ((F)[0]))
++#define IS_RELATIVE_FILE_NAME(F) (! IS_ABSOLUTE_FILE_NAME (F))
++
++bool specify_current_dir(const char *path)
++{
++	char *basec = NULL, *bname = NULL;
++	bool res = false;
++
++	basec = safe_strdup(path);
++
++	bname = basename(basec);
++	if (bname == NULL) {
++		free(basec);
++		ERROR("Out of memory");
++		return false;
++	}
++	res = !strcmp(bname, ".");
++	free(basec);
++	return res;
++}
++
++bool has_traling_path_separator(const char *path)
++{
++	return path && strlen(path) && (path[strlen(path) - 1] == '/');
++}
++
++// PreserveTrailingDotOrSeparator returns the given cleaned path
++// and appends a trailing `/.` or `/` if its corresponding  original
++// path ends with a trailing `/.` or `/`. If the cleaned
++// path already ends in a `.` path segment, then another is not added. If the
++// clean path already ends in a path separator, then another is not added.
++char *preserve_trailing_dot_or_separator(const char *cleanedpath,
++                const char *originalpath)
++{
++	char *respath = NULL;
++	size_t len;
++
++	if (strlen(cleanedpath) > (SIZE_MAX - 3)) {
++		return NULL;
++	}
++
++	len = strlen(cleanedpath) + 3;
++	respath = malloc(len);
++	if (respath == NULL) {
++		ERROR("Out of memory");
++		return NULL;
++	}
++	memset(respath, 0x00, len);
++	strcat(respath, cleanedpath);
++
++	if (!specify_current_dir(cleanedpath) && specify_current_dir(originalpath)) {
++		if (!has_traling_path_separator(respath))
++			strcat(respath, "/");
++		strcat(respath, ".");
++	}
++
++	if (!has_traling_path_separator(respath) &&
++	                has_traling_path_separator(originalpath))
++		strcat(respath, "/");
++
++	return respath;
++}
++
++
++// Split splits path immediately following the final Separator,
++// separating it into a directory and file name component.
++// If there is no Separator in path, Split returns an empty dir
++// and file set to path.
++// The returned values have the property that path = dir+file.
++bool filepath_split(const char *path, char **dir, char **base)
++{
++	ssize_t i;
++	size_t len;
++
++	len = strlen(path);
++	if (len >= PATH_MAX) {
++		ERROR("Invalid path");
++		return false;
++	}
++	i = len - 1;
++	while (i >= 0 && path[i] != '/')
++		i--;
++
++	*dir = malloc(i + 2);
++	if (*dir == NULL) {
++		ERROR("Out of memory");
++		return false;
++	}
++	memcpy(*dir, path, i + 1);
++	*(*dir + i + 1) = '\0';
++
++	*base = safe_strdup(path + i + 1);
++
++	return true;
++}
++
++
++static bool do_clean_path_continue(const char *endpos, const char *stpos, const char *respath, char **dst)
++{
++	if (endpos - stpos == 1 && stpos[0] == '.') {
++		return true;
++	} else if (endpos - stpos == 2 && stpos[0] == '.' && stpos[1] == '.') {
++		char *dest = *dst;
++		if (dest <= respath + 1) {
++			return true;
++		}
++		for (--dest; dest > respath && !ISSLASH(dest[-1]); --dest) {
++			*dst = dest;
++			return true;
++		}
++		*dst = dest;
++		return true;
++	}
++	return false;
++}
++
++int do_clean_path(const char *respath, const char *limit_respath,
++                  const char *stpos, char **dst)
++{
++	char *dest = *dst;
++	const char *endpos = NULL;
++
++	for (endpos = stpos; *stpos; stpos = endpos) {
++		while (ISSLASH(*stpos)) {
++			++stpos;
++		}
++
++		for (endpos = stpos; *endpos && !ISSLASH(*endpos); ++endpos) {
++		}
++
++		if (endpos - stpos == 0) {
++			break;
++		} else if (do_clean_path_continue(endpos, stpos, respath, &dest)) {
++			continue;
++		}
++
++		if (!ISSLASH(dest[-1])) {
++			*dest++ = '/';
++		}
++
++		if (dest + (endpos - stpos) >= limit_respath) {
++			ERROR("Path is too long");
++			if (dest > respath + 1) {
++				dest--;
++			}
++			*dest = '\0';
++			return -1;
++		}
++
++		memcpy(dest, stpos, (size_t)(endpos - stpos));
++		dest += endpos - stpos;
++		*dest = '\0';
++	}
++	*dst = dest;
++	return 0;
++}
++
++char *cleanpath(const char *path, char *realpath, size_t realpath_len)
++{
++	char *respath = NULL;
++	char *dest = NULL;
++	const char *stpos = NULL;
++	const char *limit_respath = NULL;
++
++	if (path == NULL || path[0] == '\0' || \
++	                realpath == NULL || (realpath_len < PATH_MAX)) {
++		return NULL;
++	}
++
++	respath = realpath;
++
++	memset(respath, 0, realpath_len);
++	limit_respath = respath + PATH_MAX;
++
++	if (!IS_ABSOLUTE_FILE_NAME(path)) {
++		if (!getcwd(respath, PATH_MAX)) {
++			ERROR("Failed to getcwd");
++			respath[0] = '\0';
++			goto error;
++		}
++		dest = strchr(respath, '\0');
++		if (dest == NULL) {
++			ERROR("Failed to get the end of respath");
++			goto error;
++		}
++		if (strlen(path) > (PATH_MAX - strlen(respath) - 1)) {
++			ERROR("Path is too long");
++			goto error;
++		}
++		strcat(respath, path);
++		stpos = path;
++	} else {
++		dest = respath;
++		*dest++ = '/';
++		stpos = path;
++	}
++
++	if (do_clean_path(respath, limit_respath, stpos, &dest)) {
++		goto error;
++	}
++
++	if (dest > respath + 1 && ISSLASH(dest[-1])) {
++		--dest;
++	}
++	*dest = '\0';
++
++	return respath;
++
++error:
++	return NULL;
++}
++
++static int do_path_realloc(const char *start, const char *end,
++                           char **rpath, char **dest, const char **rpath_limit)
++{
++	long long dest_offset = *dest - *rpath;
++	char *new_rpath = NULL;
++	size_t new_size;
++	int nret = 0;
++	size_t gap = 0;
++
++	if (*dest + (end - start) < *rpath_limit) {
++		return 0;
++	}
++
++	gap = (size_t)(end - start) + 1;
++	new_size = (size_t)(*rpath_limit - *rpath);
++	if (new_size > SIZE_MAX - gap) {
++		ERROR("Out of range!");
++		return -1;
++	}
++
++	if (gap > PATH_MAX) {
++		new_size += gap;
++	} else {
++		new_size += PATH_MAX;
++	}
++	nret = lxc_mem_realloc((void **)&new_rpath, new_size, *rpath, PATH_MAX);
++	if (nret) {
++		ERROR("Failed to realloc memory for files limit variables");
++		return -1;
++	}
++	*rpath = new_rpath;
++	*rpath_limit = *rpath + new_size;
++
++	*dest = *rpath + dest_offset;
++
++	return 0;
++}
++
++static int do_get_symlinks_copy_buf(const char *buf, const char *prefix, size_t prefix_len,
++                                    char **rpath, char **dest)
++{
++	if (IS_ABSOLUTE_FILE_NAME(buf)) {
++		if (prefix_len) {
++			memcpy(*rpath, prefix, prefix_len);
++		}
++		*dest = *rpath + prefix_len;
++		*(*dest)++ = '/';
++	} else {
++		if (*dest > *rpath + prefix_len + 1) {
++			for (--(*dest); *dest > *rpath && !ISSLASH((*dest)[-1]); --(*dest)) {
++				continue;
++			}
++		}
++	}
++	return 0;
++}
++
++static int do_get_symlinks(const char **fullpath, const char *prefix, size_t prefix_len,
++                           char **rpath, char **dest, const char **end,
++                           int *num_links, char **extra_buf)
++{
++	char *buf = NULL;
++	size_t len;
++	ssize_t n;
++	int ret = -1;
++
++	if (++(*num_links) > MAXSYMLINKS) {
++		ERROR("Too many links in '%s'", *fullpath);
++		goto out;
++	}
++
++	buf = lxc_common_calloc_s(PATH_MAX);
++	if (buf == NULL) {
++		ERROR("Out of memory");
++		goto out;
++	}
++
++	n = readlink(*rpath, buf, PATH_MAX - 1);
++	if (n < 0) {
++		goto out;
++	}
++	buf[n] = '\0';
++
++	if (*extra_buf == NULL) {
++		*extra_buf = lxc_common_calloc_s(PATH_MAX);
++		if (*extra_buf == NULL) {
++			ERROR("Out of memory");
++			goto out;
++		}
++	}
++
++	len = strlen(*end);
++	if (len >= PATH_MAX - n) {
++		ERROR("Path is too long");
++		goto out;
++	}
++
++	memmove(&(*extra_buf)[n], *end, len + 1);
++	memcpy(*extra_buf, buf, (size_t)n);
++
++	*fullpath = *end = *extra_buf;
++
++	if (do_get_symlinks_copy_buf(buf, prefix, prefix_len, rpath, dest) != 0) {
++		goto out;
++	}
++
++	ret = 0;
++out:
++	free(buf);
++	return ret;
++}
++
++static bool do_eval_symlinks_in_scope_is_symlink(const char *path)
++{
++	struct stat st;
++
++	if (lstat(path, &st) < 0) {
++		return true;
++	}
++
++	if (!S_ISLNK(st.st_mode)) {
++		return true;
++	}
++	return false;
++}
++
++static void do_eval_symlinks_skip_slash(const char **start, const char **end)
++{
++	while (ISSLASH(**start)) {
++		++(*start);
++	}
++
++	for (*end = *start; **end && !ISSLASH(**end); ++(*end)) {
++	}
++}
++
++static inline void skip_dest_traling_slash(char **dest, char **rpath, size_t prefix_len)
++{
++	if (*dest > *rpath + prefix_len + 1) {
++		for (--(*dest); *dest > *rpath && !ISSLASH((*dest)[-1]); --(*dest)) {
++			continue;
++		}
++	}
++}
++
++static inline bool is_current_char(const char c)
++{
++	return c == '.';
++}
++
++static inline bool is_specify_current(const char *end, const char *start)
++{
++	return (end - start == 1) && is_current_char(start[0]);
++}
++
++static inline bool is_specify_parent(const char *end, const char *start)
++{
++	return (end - start == 2) && is_current_char(start[0]) && is_current_char(start[1]);
++}
++
++static int do_eval_symlinks_in_scope(const char *fullpath, const char *prefix,
++                                     size_t prefix_len,
++                                     char **rpath, char **dest, const char *rpath_limit)
++{
++	const char *start = NULL;
++	const char *end = NULL;
++	char *extra_buf = NULL;
++	int nret = 0;
++	int num_links = 0;
++
++	start = fullpath + prefix_len;
++	for (end = start; *start; start = end) {
++		do_eval_symlinks_skip_slash(&start, &end);
++		if (end - start == 0) {
++			break;
++		} else if (is_specify_current(end, start)) {
++			;
++		} else if (is_specify_parent(end, start)) {
++			skip_dest_traling_slash(dest, rpath, prefix_len);
++		} else {
++			if (!ISSLASH((*dest)[-1])) {
++				*(*dest)++ = '/';
++			}
++
++			nret = do_path_realloc(start, end, rpath, dest, &rpath_limit);
++			if (nret != 0) {
++				nret = -1;
++				goto out;
++			}
++
++			memcpy(*dest, start, (size_t)(end - start));
++			*dest += end - start;
++			**dest = '\0';
++
++			if (do_eval_symlinks_in_scope_is_symlink(*rpath)) {
++				continue;
++			}
++
++			nret = do_get_symlinks(&fullpath, prefix, prefix_len, rpath, dest, &end, &num_links, &extra_buf);
++			if (nret != 0) {
++				nret = -1;
++				goto out;
++			}
++		}
++	}
++out:
++	free(extra_buf);
++	return nret;
++}
++static char *eval_symlinks_in_scope(const char *fullpath, const char *rootpath)
++{
++	char resroot[PATH_MAX] = {0};
++	char *root = NULL;
++	char *rpath = NULL;
++	char *dest = NULL;
++	char *prefix = NULL;
++	const char *rpath_limit = NULL;
++	size_t prefix_len;
++
++	if (fullpath == NULL || rootpath == NULL) {
++		return NULL;
++	}
++
++	root = cleanpath(rootpath, resroot, sizeof(resroot));
++	if (root == NULL) {
++		ERROR("Failed to get cleaned path");
++		return NULL;
++	}
++
++	if (!strcmp(fullpath, root)) {
++		return safe_strdup(fullpath);
++	}
++
++	if (strstr(fullpath, root) == NULL) {
++		ERROR("Path '%s' is not in '%s'", fullpath, root);
++		return NULL;
++	}
++
++	rpath = lxc_common_calloc_s(PATH_MAX);
++	if (rpath == NULL) {
++		ERROR("Out of memory");
++		goto out;
++	}
++	rpath_limit = rpath + PATH_MAX;
++
++	prefix = root;
++	prefix_len = (size_t)strlen(prefix);
++	if (!strcmp(prefix, "/")) {
++		prefix_len = 0;
++	}
++
++	dest = rpath;
++	if (prefix_len) {
++		memcpy(rpath, prefix, prefix_len);
++		dest += prefix_len;
++	}
++	*dest++ = '/';
++
++	if (do_eval_symlinks_in_scope(fullpath, prefix, prefix_len, &rpath, &dest,
++	                              rpath_limit)) {
++		goto out;
++	}
++
++	if (dest > rpath + prefix_len + 1 && ISSLASH(dest[-1])) {
++		--dest;
++	}
++	*dest = '\0';
++	return rpath;
++
++out:
++	free(rpath);
++	return NULL;
++}
++
++// FollowSymlinkInScope is a wrapper around evalSymlinksInScope that returns an
++// absolute path. This function handles paths in a platform-agnostic manner.
++char *follow_symlink_in_scope(const char *fullpath, const char *rootpath)
++{
++	char resfull[PATH_MAX] = {0}, *full = NULL;
++	char resroot[PATH_MAX] = {0}, *root = NULL;
++
++	full = cleanpath(fullpath, resfull, PATH_MAX);
++	if (!full) {
++		ERROR("Failed to get cleaned path");
++		return NULL;
++	}
++
++	root = cleanpath(rootpath, resroot, PATH_MAX);
++	if (!root) {
++		ERROR("Failed to get cleaned path");
++		return NULL;
++	}
++
++	return eval_symlinks_in_scope(full, root);
++}
++
++// GetResourcePath evaluates `path` in the scope of the container's rootpath, with proper path
++// sanitisation. Symlinks are all scoped to the rootpath of the container, as
++// though the container's rootpath was `/`.
++//
++// The BaseFS of a container is the host-facing path which is bind-mounted as
++// `/` inside the container. This method is essentially used to access a
++// particular path inside the container as though you were a process in that
++// container.
++int get_resource_path(const char *rootpath, const char *path,
++                      char **scopepath)
++{
++	char resolved[PATH_MAX] = {0}, *cleanedpath = NULL;
++	char *fullpath = NULL;
++	size_t len;
++
++	if (!rootpath || !path || !scopepath)
++		return -1;
++
++	*scopepath = NULL;
++
++	cleanedpath = cleanpath(path, resolved, PATH_MAX);
++	if (!cleanedpath) {
++		ERROR("Failed to get cleaned path");
++		return -1;
++	}
++
++	len = strlen(rootpath) + strlen(cleanedpath) + 1;
++	fullpath = malloc(len);
++	if (!fullpath) {
++		ERROR("Out of memory");
++		return -1;
++	}
++	snprintf(fullpath, len, "%s%s", rootpath, cleanedpath);
++
++	*scopepath = follow_symlink_in_scope(fullpath, rootpath);
++
++	free(fullpath);
++	return 0;
++}
++
++// Rel returns a relative path that is lexically equivalent to targpath when
++// joined to basepath with an intervening separator. That is,
++// Join(basepath, Rel(basepath, targpath)) is equivalent to targpath itself.
++// On success, the returned path will always be relative to basepath,
++// even if basepath and targpath share no elements.
++// An error is returned if targpath can't be made relative to basepath or if
++// knowing the current working directory would be necessary to compute it.
++// Rel calls Clean on the result.
++char *path_relative(const char *basepath, const char *targpath)
++{
++	char resbase[PATH_MAX] = {0}, *base = NULL;
++	char restarg[PATH_MAX] = {0}, *targ = NULL;
++	size_t bl = 0, tl = 0, b0 = 0, bi = 0, t0 = 0, ti = 0;
++
++	base = cleanpath(basepath, resbase, PATH_MAX);
++	if (!base) {
++		ERROR("Failed to get cleaned path");
++		return NULL;
++	}
++
++	targ = cleanpath(targpath, restarg, PATH_MAX);
++	if (!targ) {
++		ERROR("Failed to get cleaned path");
++		return NULL;
++	}
++
++	if (strcmp(base, targ) == 0)
++		return safe_strdup(".");
++
++	bl = strlen(base);
++	tl = strlen(targ);
++	while(true) {
++		while(bi < bl && !ISSLASH(base[bi]))
++			bi++;
++		while(ti < tl && !ISSLASH(targ[ti]))
++			ti++;
++		//not the same string
++		if (((bi - b0) != (ti - t0)) || strncmp(base + b0, targ + t0, bi - b0))
++			break;
++		if (bi < bl)
++			bi++;
++		if (ti < tl)
++			ti++;
++		b0 = bi;
++		t0 = ti;
++	}
++
++	if (b0 != bl) {
++		// Base elements left. Must go up before going down.
++		int seps = 0, i;
++		size_t ncopyed = 0, seps_size;
++		char *buf = NULL;
++
++		for (bi = b0; bi < bl; bi++) {
++			if (ISSLASH(base[bi]))
++				seps++;
++		}
++		//strlen(..) + strlen(/..) + '\0'
++		seps_size = 2 + seps * 3 + 1;
++		if (t0 != tl)
++			seps_size += 1 + tl - t0;
++
++		buf = calloc(seps_size, 1);
++		if (!buf) {
++			ERROR("Out of memory");
++			return NULL;
++		}
++		buf[ncopyed++] = '.';
++		buf[ncopyed++] = '.';
++		for (i = 0; i < seps; i++) {
++			buf[ncopyed++] = '/';
++			buf[ncopyed++] = '.';
++			buf[ncopyed++] = '.';
++		}
++		if (t0 != tl) {
++			buf[ncopyed++] = '/';
++			memcpy(buf + ncopyed, targ + t0, tl - t0 + 1);
++		}
++		return buf;
++	}
++
++	return safe_strdup(targ + t0);
++}
+\ No newline at end of file
+diff --git a/src/lxc/storage/dir.c b/src/lxc/storage/dir.c
+index 18a10a4..dc642a4 100644
+--- a/src/lxc/storage/dir.c
++++ b/src/lxc/storage/dir.c
+@@ -94,6 +94,9 @@ int dir_create(struct lxc_storage *bdev, const char *dest, const char *n,
+ 
+ int dir_destroy(struct lxc_storage *orig)
+ {
++#ifdef HAVE_ISULAD
++	// isulad: do not destroy rootfs for directory, it should be managed by caller
++#else
+ 	int ret;
+ 	const char *src;
+ 
+@@ -102,6 +105,7 @@ int dir_destroy(struct lxc_storage *orig)
+ 	ret = lxc_rmdir_onedev(src, NULL);
+ 	if (ret < 0)
+ 		return log_error_errno(ret, errno, "Failed to delete \"%s\"", src);
++#endif
+ 
+ 	return 0;
+ }
+@@ -124,6 +128,35 @@ bool dir_detect(const char *path)
+ 	return false;
+ }
+ 
++#ifdef HAVE_ISULAD
++int dir_mount(struct lxc_storage *bdev)
++{
++	__do_free char *mntdata = NULL;
++	unsigned long mntflags = 0, pflags = 0;
++	int ret;
++	const char *src;
++
++	if (strcmp(bdev->type, "dir"))
++		return -22;
++
++	if (!bdev->src || !bdev->dest)
++		return -22;
++
++	ret = parse_mntopts(bdev->mntopts, &mntflags, &pflags, &mntdata);
++	if (ret < 0)
++		return log_error_errno(ret, errno, "Failed to parse mount options \"%s\"", bdev->mntopts);
++
++	src = lxc_storage_get_path(bdev->src, bdev->type);
++
++	ret = mount(src, bdev->dest, "bind", MS_BIND | MS_REC | (mntflags & ~MS_RDONLY) | pflags, mntdata);
++	if (ret < 0) {
++		return log_error_errno(-errno, errno, "Failed to mount \"%s\" on \"%s\"", src, bdev->dest);
++	}
++	TRACE("Mounted \"%s\" on \"%s\"", src, bdev->dest);
++
++	return 0;
++}
++#else
+ int dir_mount(struct lxc_storage *bdev)
+ {
+ 	__do_free char *mntdata = NULL;
+@@ -166,6 +199,7 @@ int dir_mount(struct lxc_storage *bdev)
+ 	      src ? src : "(none)", bdev->dest ? bdev->dest : "(none)", mntdata, mflags, pflags);
+ 	return 0;
+ }
++#endif
+ 
+ int dir_umount(struct lxc_storage *bdev)
+ {
+diff --git a/src/lxc/storage/loop.c b/src/lxc/storage/loop.c
+index eebc1b6..3a97c1d 100644
+--- a/src/lxc/storage/loop.c
++++ b/src/lxc/storage/loop.c
+@@ -21,6 +21,9 @@
+ #include "memory_utils.h"
+ #include "storage.h"
+ #include "storage_utils.h"
++#ifdef HAVE_ISULAD
++#include "lxclock.h"
++#endif
+ #include "utils.h"
+ 
+ lxc_log_define(loop, lxc);
+@@ -216,7 +219,13 @@ bool loop_detect(const char *path)
+ 
+ int loop_mount(struct lxc_storage *bdev)
+ {
++#ifdef HAVE_ISULAD
++	int ret = 0;
++	int loopfd, lret;
++	struct lxc_lock *l = NULL;
++#else
+ 	int ret, loopfd;
++#endif
+ 	char loname[PATH_MAX];
+ 	const char *src;
+ 
+@@ -226,13 +235,35 @@ int loop_mount(struct lxc_storage *bdev)
+ 	if (!bdev->src || !bdev->dest)
+ 		return -22;
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: do lock before mount, so we can avoid use loop which is used by
++	 * other starting contianers */
++	l = lxc_newlock("mount_lock", "mount_lock");
++	if (!l) {
++		SYSERROR("create file lock error when mount fs");
++		return -1;
++	}
++
++	lret = lxclock(l, 0);
++	if (lret) {
++		SYSERROR("try to lock failed when mount fs");
++		ret = -1;
++		goto out;
++	}
++#endif
++
+ 	/* skip prefix */
+ 	src = lxc_storage_get_path(bdev->src, bdev->type);
+ 
+ 	loopfd = lxc_prepare_loop_dev(src, loname, LO_FLAGS_AUTOCLEAR);
+ 	if (loopfd < 0) {
+ 		ERROR("Failed to prepare loop device for loop file \"%s\"", src);
++#ifdef HAVE_ISULAD
++		ret = -1;
++		goto out;
++#else
+ 		return -1;
++#endif
+ 	}
+ 	DEBUG("Prepared loop device \"%s\"", loname);
+ 
+@@ -241,14 +272,29 @@ int loop_mount(struct lxc_storage *bdev)
+ 		ERROR("Failed to mount rootfs \"%s\" on \"%s\" via loop device \"%s\"",
+ 		      bdev->src, bdev->dest, loname);
+ 		close(loopfd);
++#ifdef HAVE_ISULAD
++		ret = -1;
++		goto out;
++#else
+ 		return -1;
++#endif
+ 	}
+ 
+ 	bdev->lofd = loopfd;
+ 	DEBUG("Mounted rootfs \"%s\" on \"%s\" via loop device \"%s\"",
+ 	      bdev->src, bdev->dest, loname);
+-
++#ifdef HAVE_ISULAD
++out:
++	lret = lxcunlock(l);
++	if (lret) {
++		SYSERROR("try to unlock failed when mount fs");
++		ret = -1;
++	}
++	lxc_putlock(l);
++	return ret;
++#else
+ 	return 0;
++#endif
+ }
+ 
+ int loop_umount(struct lxc_storage *bdev)
+diff --git a/src/lxc/storage/storage.c b/src/lxc/storage/storage.c
+index 3f1b713..371513d 100644
+--- a/src/lxc/storage/storage.c
++++ b/src/lxc/storage/storage.c
+@@ -41,6 +41,9 @@
+ #include "storage_utils.h"
+ #include "utils.h"
+ #include "zfs.h"
++#ifdef HAVE_ISULAD
++#include "block.h"
++#endif
+ 
+ #ifndef HAVE_STRLCPY
+ #include "include/strlcpy.h"
+@@ -94,6 +97,22 @@ static const struct lxc_storage_ops loop_ops = {
+     .can_backup = true,
+ };
+ 
++#ifdef HAVE_ISULAD
++/* block */
++static const struct lxc_storage_ops blk_ops = {
++    .detect = &blk_detect,
++    .mount = &blk_mount,
++    .umount = &blk_umount,
++    .clone_paths = NULL,
++    .destroy = &blk_destroy,
++    .create = NULL,
++    .copy = NULL,
++    .snapshot = NULL,
++    .can_snapshot = false,
++    .can_backup = true,
++};
++#endif
++
+ /* lvm */
+ static const struct lxc_storage_ops lvm_ops = {
+     .detect = &lvm_detect,
+@@ -179,6 +198,10 @@ static const struct lxc_storage_type bdevs[] = {
+ 	{ .name = "overlayfs", .ops = &ovl_ops,   },
+ 	{ .name = "loop",      .ops = &loop_ops,  },
+ 	{ .name = "nbd",       .ops = &nbd_ops,   },
++#ifdef HAVE_ISULAD
++	//isulad: block device
++	{ .name = "blk",       .ops = &blk_ops,   }
++#endif
+ };
+ 
+ static const size_t numbdevs = sizeof(bdevs) / sizeof(struct lxc_storage_type);
+@@ -570,9 +593,15 @@ bool storage_destroy(struct lxc_conf *conf)
+ 	int destroy_rv = 0;
+ 
+ 	r = storage_init(conf);
++#ifdef HAVE_ISULAD
++	if (r == NULL) {
++		WARN("%s 's storage init failed, the storage may be deleted already", conf->name);
++		return true;
++	}
++#else
+ 	if (!r)
+ 		return ret;
+-
++#endif
+ 	destroy_rv = r->ops->destroy(r);
+ 	if (destroy_rv == 0)
+ 		ret = true;
+-- 
+2.25.1
+

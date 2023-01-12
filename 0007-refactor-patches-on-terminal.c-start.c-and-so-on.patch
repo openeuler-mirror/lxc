@@ -1,0 +1,2726 @@
+From 06b071d6bc7683023d3131d4e428210005333c8c Mon Sep 17 00:00:00 2001
+From: chengzrz <czrzrichard@gmail.com>
+Date: Wed, 20 Jul 2022 15:03:45 +0800
+Subject: [PATCH] refactor patches on terminal.c, start.c and so on
+
+Signed-off-by: chengzrz <czrzrichard@gmail.com>
+---
+ hooks/Makefile.am         |   3 +
+ src/lxc/attach.h          |   6 +
+ src/lxc/cgroups/cgroup.c  |   4 +
+ src/lxc/commands_utils.h  |   6 +
+ src/lxc/initutils.c       |   4 +
+ src/lxc/lsm/lsm.h         |   8 +
+ src/lxc/lxclock.h         |   4 +
+ src/lxc/mainloop.h        |   4 +
+ src/lxc/start.c           | 958 ++++++++++++++++++++++++++++++++++++
+ src/lxc/storage/btrfs.c   |  11 +
+ src/lxc/storage/overlay.c |   8 +
+ src/lxc/sync.h            |   4 +
+ src/lxc/terminal.c        | 990 ++++++++++++++++++++++++++++++++++++++
+ src/tests/Makefile.am     |   4 +
+ src/tests/attach.c        |  11 +
+ 15 files changed, 2025 insertions(+)
+
+diff --git a/hooks/Makefile.am b/hooks/Makefile.am
+index 5ae73d7..ddfd4bc 100644
+--- a/hooks/Makefile.am
++++ b/hooks/Makefile.am
+@@ -10,6 +10,8 @@ hooks_SCRIPTS = \
+ 	squid-deb-proxy-client \
+ 	nvidia
+ 
++
++if !HAVE_ISULAD
+ binhooks_PROGRAMS = \
+ 	unmount-namespace
+ 
+@@ -20,5 +22,6 @@ if IS_BIONIC
+ unmount_namespace_SOURCES += \
+ 	../src/include/lxcmntent.c ../src/include/lxcmntent.h
+ endif
++endif
+ 
+ EXTRA_DIST=$(hooks_SCRIPTS)
+diff --git a/src/lxc/attach.h b/src/lxc/attach.h
+index ef5a6c1..8316344 100644
+--- a/src/lxc/attach.h
++++ b/src/lxc/attach.h
+@@ -20,9 +20,15 @@ struct lxc_proc_context_info {
+ 	int ns_fd[LXC_NS_MAX];
+ };
+ 
++#ifdef HAVE_ISULAD
++extern int lxc_attach(struct lxc_container *container,
++		      lxc_attach_exec_t exec_function, void *exec_payload,
++		      lxc_attach_options_t *options, pid_t *attached_process, char **err_msg);
++#else
+ extern int lxc_attach(struct lxc_container *container,
+ 		      lxc_attach_exec_t exec_function, void *exec_payload,
+ 		      lxc_attach_options_t *options, pid_t *attached_process);
++#endif
+ 
+ extern int lxc_attach_remount_sys_proc(void);
+ 
+diff --git a/src/lxc/cgroups/cgroup.c b/src/lxc/cgroups/cgroup.c
+index 7c94fd8..5aa2c3c 100644
+--- a/src/lxc/cgroups/cgroup.c
++++ b/src/lxc/cgroups/cgroup.c
+@@ -31,7 +31,11 @@ struct cgroup_ops *cgroup_init(struct lxc_conf *conf)
+ 	if (!cgroup_ops)
+ 		return log_error_errno(NULL, errno, "Failed to initialize cgroup driver");
+ 
++#ifdef HAVE_ISULAD
++	if (cgroup_ops->data_init(cgroup_ops, conf)) {
++#else
+ 	if (cgroup_ops->data_init(cgroup_ops)) {
++#endif
+ 		cgroup_exit(cgroup_ops);
+ 		return log_error_errno(NULL, errno,
+ 				       "Failed to initialize cgroup data");
+diff --git a/src/lxc/commands_utils.h b/src/lxc/commands_utils.h
+index 3ef7920..c836ead 100644
+--- a/src/lxc/commands_utils.h
++++ b/src/lxc/commands_utils.h
+@@ -65,4 +65,10 @@ extern int lxc_add_state_client(int state_client_fd,
+ extern int lxc_cmd_connect(const char *name, const char *lxcpath,
+ 			   const char *hashed_sock_name, const char *suffix);
+ 
++#ifdef HAVE_ISULAD
++extern char *generate_named_unix_sock_dir(const char *name);
++extern int generate_named_unix_sock_path(const char *container_name,
++				const char *sock_name, char *out_path, size_t len);
++#endif
++
+ #endif /* __LXC_COMMANDS_UTILS_H */
+diff --git a/src/lxc/initutils.c b/src/lxc/initutils.c
+index 5549c2e..76f0048 100644
+--- a/src/lxc/initutils.c
++++ b/src/lxc/initutils.c
+@@ -54,11 +54,15 @@ const char *lxc_global_config_value(const char *option_name)
+ 		{ NULL, NULL },
+ 	};
+ 
++#ifdef HAVE_ISULAD
++	static const char *values[sizeof(options) / sizeof(options[0])] = {0};
++#else
+ 	/* placed in the thread local storage pool for non-bionic targets */
+ #ifdef HAVE_TLS
+ 	static thread_local const char *values[sizeof(options) / sizeof(options[0])] = {0};
+ #else
+ 	static const char *values[sizeof(options) / sizeof(options[0])] = {0};
++#endif
+ #endif
+ 
+ 	/* user_config_path is freed as soon as it is used */
+diff --git a/src/lxc/lsm/lsm.h b/src/lxc/lsm/lsm.h
+index ee578bb..4872f55 100644
+--- a/src/lxc/lsm/lsm.h
++++ b/src/lxc/lsm/lsm.h
+@@ -17,6 +17,10 @@ struct lsm_drv {
+ 	char *(*process_label_get)(pid_t pid);
+ 	int (*process_label_set)(const char *label, struct lxc_conf *conf,
+ 				 bool on_exec);
++#ifdef HAVE_ISULAD
++	int (*file_label_set)(const char *path, const char *label);
++	int (*relabel)(const char *path, const char *label, bool share);
++#endif
+ 	int (*keyring_label_set)(char* label);
+ 	int (*prepare)(struct lxc_conf *conf, const char *lxcpath);
+ 	void (*cleanup)(struct lxc_conf *conf, const char *lxcpath);
+@@ -32,6 +36,10 @@ extern int lsm_process_label_set(const char *label, struct lxc_conf *conf,
+ extern int lsm_process_label_fd_get(pid_t pid, bool on_exec);
+ extern int lsm_process_label_set_at(int label_fd, const char *label,
+ 				    bool on_exec);
++#ifdef HAVE_ISULAD
++extern int lsm_file_label_set(const char *path, const char *label);
++extern int lsm_relabel(const char *path, const char *label, bool share);
++#endif
+ extern void lsm_process_cleanup(struct lxc_conf *conf, const char *lxcpath);
+ extern int lsm_keyring_label_set(char *label);
+ 
+diff --git a/src/lxc/lxclock.h b/src/lxc/lxclock.h
+index 9f9bc3b..6a71d7c 100644
+--- a/src/lxc/lxclock.h
++++ b/src/lxc/lxclock.h
+@@ -154,4 +154,8 @@ extern int container_disk_lock(struct lxc_container *c);
+  */
+ extern void container_disk_unlock(struct lxc_container *c);
+ 
++#ifdef HAVE_ISULAD
++int container_disk_removelock(struct lxc_container *c);
++#endif
++
+ #endif
+diff --git a/src/lxc/mainloop.h b/src/lxc/mainloop.h
+index e6ab9a6..aa41a93 100644
+--- a/src/lxc/mainloop.h
++++ b/src/lxc/mainloop.h
+@@ -38,4 +38,8 @@ extern void lxc_mainloop_close(struct lxc_epoll_descr *descr);
+ 
+ define_cleanup_function(struct lxc_epoll_descr *, lxc_mainloop_close);
+ 
++#ifdef HAVE_ISULAD
++extern int isulad_safe_mainloop(struct lxc_epoll_descr *descr, int timeout_ms);
++#endif
++
+ #endif
+diff --git a/src/lxc/start.c b/src/lxc/start.c
+index fd969c4..f82df34 100644
+--- a/src/lxc/start.c
++++ b/src/lxc/start.c
+@@ -304,7 +304,11 @@ static int setup_signal_fd(sigset_t *oldmask)
+ {
+ 	int ret;
+ 	sigset_t mask;
++#ifdef HAVE_ISULAD
++	const int signals[] = {SIGBUS, SIGILL, SIGSEGV, SIGWINCH, SIGTERM};
++#else
+ 	const int signals[] = {SIGBUS, SIGILL, SIGSEGV, SIGWINCH};
++#endif
+ 
+ 	/* Block everything except serious error signals. */
+ 	ret = sigfillset(&mask);
+@@ -590,13 +594,27 @@ int lxc_poll(const char *name, struct lxc_handler *handler)
+ 
+ 	TRACE("Mainloop is ready");
+ 
++#ifdef HAVE_ISULAD
++	// iSulad: close stdin pipe if we do not want open_stdin with container stdin
++	if (!handler->conf->console.open_stdin) {
++		if (handler->conf->console.pipes[0][1] > 0) {
++			close(handler->conf->console.pipes[0][1]);
++			handler->conf->console.pipes[0][1] = -1;
++		}
++	}
++#endif
++
+ 	ret = lxc_mainloop(&descr, -1);
+ 	close_prot_errno_disarm(descr.epfd);
+ 	if (ret < 0 || !handler->init_died)
+ 		goto out_mainloop_console;
+ 
+ 	if (has_console)
++#ifdef HAVE_ISULAD
++		ret = isulad_safe_mainloop(&descr_console, 100);
++#else
+ 		ret = lxc_mainloop(&descr_console, 0);
++#endif
+ 
+ out_mainloop_console:
+ 	if (has_console) {
+@@ -637,7 +655,9 @@ struct lxc_handler *lxc_init_handler(struct lxc_handler *old,
+ 				     const char *name, struct lxc_conf *conf,
+ 				     const char *lxcpath, bool daemonize)
+ {
++#ifndef HAVE_ISULAD
+ 	int nr_keep_fds = 0;
++#endif
+ 	int ret;
+ 	struct lxc_handler *handler;
+ 
+@@ -671,6 +691,12 @@ struct lxc_handler *lxc_init_handler(struct lxc_handler *old,
+ 		handler->nsfd[i] = -EBADF;
+ 
+ 	handler->name = name;
++
++#ifdef HAVE_ISULAD
++	handler->exit_code = -1; /* isulad: record exit code of container */
++	handler->image_type_oci = false;
++#endif
++
+ 	if (daemonize)
+ 		handler->transient_pid = lxc_raw_getpid();
+ 	else
+@@ -691,8 +717,10 @@ struct lxc_handler *lxc_init_handler(struct lxc_handler *old,
+ 		TRACE("Created anonymous pair {%d,%d} of unix sockets",
+ 		      handler->state_socket_pair[0],
+ 		      handler->state_socket_pair[1]);
++#ifndef HAVE_ISULAD
+ 		handler->keep_fds[nr_keep_fds++] = handler->state_socket_pair[0];
+ 		handler->keep_fds[nr_keep_fds++] = handler->state_socket_pair[1];
++#endif
+ 	}
+ 
+ 	if (handler->conf->reboot == REBOOT_NONE) {
+@@ -701,7 +729,9 @@ struct lxc_handler *lxc_init_handler(struct lxc_handler *old,
+ 			ERROR("Failed to set up command socket");
+ 			goto on_error;
+ 		}
++#ifndef HAVE_ISULAD
+ 		handler->keep_fds[nr_keep_fds++] = handler->conf->maincmd_fd;
++#endif
+ 	}
+ 
+ 	TRACE("Unix domain socket %d for command server is ready",
+@@ -721,6 +751,10 @@ int lxc_init(const char *name, struct lxc_handler *handler)
+ 	int ret;
+ 	const char *loglevel;
+ 	struct lxc_conf *conf = handler->conf;
++#ifdef HAVE_ISULAD
++	conf->console.disable_pty = handler->disable_pty;
++	conf->console.open_stdin = handler->open_stdin;
++#endif
+ 
+ 	handler->monitor_pid = lxc_raw_getpid();
+ 	status_fd = open("/proc/self/status", O_RDONLY | O_CLOEXEC);
+@@ -810,6 +844,9 @@ int lxc_init(const char *name, struct lxc_handler *handler)
+ 	ret = lxc_terminal_setup(conf);
+ 	if (ret < 0) {
+ 		ERROR("Failed to create console");
++#ifdef HAVE_ISULAD
++		lxc_write_error_message(conf->errpipe[1], "Failed to create console for container \"%s\".", name);
++#endif
+ 		goto out_restore_sigmask;
+ 	}
+ 	TRACE("Created console");
+@@ -853,6 +890,185 @@ out_restore_sigmask:
+ 	return -1;
+ }
+ 
++#ifdef HAVE_ISULAD
++/* isulad: start timeout thread */
++typedef enum {
++	START_INIT,
++	START_TIMEOUT,
++	START_MAX,
++} start_timeout_t;
++
++static start_timeout_t global_timeout_state = START_INIT;
++static sem_t global_timeout_sem;
++
++struct start_timeout_conf {
++	unsigned int timeout;
++	int errfd;
++};
++
++void trim_line(char *s)
++{
++	size_t len;
++
++	len = strlen(s);
++	while ((len > 1) && (s[len - 1] == '\n'))
++		s[--len] = '\0';
++}
++
++static int _read_procs_file(const char *path, pid_t **pids, size_t *len)
++{
++	FILE *f;
++	char *line = NULL;
++	size_t sz = 0;
++	pid_t *tmp_pids = NULL;
++
++	f = fopen_cloexec(path, "r");
++	if (!f)
++		return -1;
++
++	while (getline(&line, &sz, f) != -1) {
++		pid_t pid;
++		trim_line(line);
++		pid = (pid_t)atoll(line);
++		if (lxc_mem_realloc((void **)&tmp_pids, sizeof(pid_t) * (*len + 1), *pids, sizeof(pid_t) * (*len)) != 0) {
++			free(*pids);
++			*pids = NULL;
++			ERROR("out of memory");
++			free(line);
++			fclose(f);
++			return -1;
++		}
++		*pids = tmp_pids;
++
++		(*pids)[*len] = pid;
++		(*len)++;
++	}
++
++	free(line);
++	fclose(f);
++	return 0;
++}
++
++static int _recursive_read_cgroup_procs(const char *dirpath, pid_t **pids, size_t *len)
++{
++	struct dirent *direntp = NULL;
++	DIR *dir = NULL;
++	int ret, failed = 0;
++	char pathname[PATH_MAX];
++
++	dir = opendir(dirpath);
++	if (dir == NULL) {
++		WARN("Failed to open \"%s\"", dirpath);
++		return 0;
++	}
++
++	while ((direntp = readdir(dir))) {
++		struct stat mystat;
++		int rc;
++
++		if (!strcmp(direntp->d_name, ".") ||
++		                !strcmp(direntp->d_name, ".."))
++			continue;
++
++		rc = snprintf(pathname, PATH_MAX, "%s/%s", dirpath, direntp->d_name);
++		if (rc < 0 || rc >= PATH_MAX) {
++			failed = 1;
++			continue;
++		}
++
++		if (strcmp(direntp->d_name, "cgroup.procs") == 0) {
++			if (_read_procs_file(pathname, pids, len)) {
++				failed = 1;
++
++			}
++			continue;
++		}
++
++		ret = lstat(pathname, &mystat);
++		if (ret) {
++			failed = 1;
++			continue;
++		}
++
++		if (S_ISDIR(mystat.st_mode)) {
++			if (_recursive_read_cgroup_procs(pathname, pids, len) < 0)
++				failed = 1;
++		}
++	}
++
++	ret = closedir(dir);
++	if (ret) {
++		WARN("Failed to close directory \"%s\"", dirpath);
++		failed = 1;
++	}
++
++	return failed ? -1 : 0;
++}
++
++int get_all_pids(struct cgroup_ops *cg_ops, pid_t **pids, size_t *len)
++{
++	const char *devices_path = NULL;
++
++	devices_path = cg_ops->get_cgroup_full_path(cg_ops, "devices");
++	if (!file_exists(devices_path)) {
++		return 0;
++	}
++
++	return _recursive_read_cgroup_procs(devices_path, pids, len);
++}
++
++static int set_cgroup_freezer(struct cgroup_ops *cg_ops, const char *value)
++{
++	char *fullpath;
++	int ret;
++
++	fullpath = must_make_path(cg_ops->get_cgroup_full_path(cg_ops, "freezer"), "freezer.state", NULL);
++	ret = lxc_write_to_file(fullpath, value, strlen(value), false, 0666);
++	free(fullpath);
++	return ret;
++}
++
++/* isulad: kill all process in container cgroup path */
++static void signal_all_processes(struct lxc_handler *handler)
++{
++	int ret;
++	struct cgroup_ops *cg_ops = handler->cgroup_ops;
++	pid_t *pids = NULL;
++	size_t len = 0, i;
++
++	ret = set_cgroup_freezer(cg_ops, "FROZEN");
++	if (ret < 0 && errno != ENOENT) {
++		WARN("cgroup_set frozen failed");
++	}
++
++	ret = get_all_pids(cg_ops, &pids, &len);
++	if (ret < 0) {
++		WARN("failed to get all pids");
++	}
++
++	for (i = 0; i < len; i++) {
++		ret = kill(pids[i], SIGKILL);
++		if (ret < 0 && errno != ESRCH) {
++			WARN("Can not kill process (pid=%d) with SIGKILL for container %s", pids[i], handler->name);
++		}
++	}
++
++	ret = set_cgroup_freezer(cg_ops, "THAWED");
++	if (ret < 0 && errno != ENOENT) {
++		WARN("cgroup_set thawed failed");
++	}
++
++	for (i = 0; i < len; i++) {
++		ret = lxc_wait_for_pid_status(pids[i]);
++		if (ret < 0 && errno != ECHILD) {
++			WARN("Failed to wait pid %d for container %s: %s", pids[i], handler->name, strerror(errno));
++		}
++	}
++
++	free(pids);
++}
++#endif
++
+ void lxc_end(struct lxc_handler *handler)
+ {
+ 	int ret;
+@@ -926,6 +1142,33 @@ void lxc_end(struct lxc_handler *handler)
+ 
+ 	lsm_process_cleanup(handler->conf, handler->lxcpath);
+ 
++#ifdef HAVE_ISULAD
++	// close maincmd fd before destroy cgroup for isulad
++	if (handler->conf->reboot == REBOOT_NONE) {
++		/* For all new state clients simply close the command socket.
++		 * This will inform all state clients that the container is
++		 * STOPPED and also prevents a race between a open()/close() on
++		 * the command socket causing a new process to get ECONNREFUSED
++		 * because we haven't yet closed the command socket.
++		 */
++		close_prot_errno_disarm(handler->conf->maincmd_fd);
++		TRACE("Closed command socket");
++	}
++	int retry_count = 0;
++	int max_retry = 10;
++retry:
++	if (cgroup_ops != NULL && !cgroup_ops->payload_destroy(cgroup_ops, handler)) {
++	        TRACE("Trying to kill all subprocess");
++	        signal_all_processes(handler);
++	        TRACE("Finished kill all subprocess");
++	        if (retry_count < max_retry) {
++				usleep(100 * 1000); /* 100 millisecond */
++				retry_count++;
++				goto retry;
++		}
++		SYSERROR("Failed to destroy cgroup path for container: \"%s\"", handler->name);
++	}
++#else
+ 	if (cgroup_ops) {
+ 		cgroup_ops->payload_destroy(cgroup_ops, handler);
+ 		cgroup_ops->monitor_destroy(cgroup_ops, handler);
+@@ -940,12 +1183,25 @@ void lxc_end(struct lxc_handler *handler)
+ 		 */
+ 		close_prot_errno_disarm(handler->conf->maincmd_fd);
+ 		TRACE("Closed command socket");
++	}
++#endif
+ 
++	if (handler->conf->reboot == REBOOT_NONE) {
+ 		/* This function will try to connect to the legacy lxc-monitord
+ 		 * state server and only exists for backwards compatibility.
+ 		 */
+ 		lxc_monitor_send_state(name, STOPPED, handler->lxcpath);
+ 
++#ifdef HAVE_ISULAD
++		/* isuald: write exit code to exit fifo */
++		if (handler->conf->exit_fd >= 0) {
++			ret = write(handler->conf->exit_fd, &handler->exit_code, sizeof(int));
++			if (ret != sizeof(int)) {
++				SYSERROR("Failed to write to exit code to exit fifo.");
++			}
++		}
++#endif
++
+ 		/* The command socket is closed so no one can acces the command
+ 		 * socket anymore so there's no need to lock it.
+ 		 */
+@@ -1042,6 +1298,25 @@ static int do_start(void *data)
+ 
+ 	lxc_sync_fini_parent(handler);
+ 
++#ifdef HAVE_ISULAD
++	sigset_t mask;
++
++	/*isulad: restore default signal handlers and unblock all signals*/
++	for (int i = 1; i < NSIG; i++)
++		signal(i, SIG_DFL);
++
++	ret = sigfillset(&mask);
++	if (ret < 0) {
++		SYSERROR("Failed to fill signal mask");
++		goto out_warn_father;
++	}
++	ret = sigprocmask(SIG_UNBLOCK, &mask, NULL);
++	if (ret < 0) {
++		SYSERROR("Failed to set signal mask");
++		goto out_warn_father;
++	}
++#endif
++
+ 	if (lxc_abstract_unix_recv_fds(data_sock1, &status_fd, 1, NULL, 0) < 0) {
+ 		ERROR("Failed to receive status file descriptor to child process");
+ 		goto out_warn_father;
+@@ -1155,7 +1430,11 @@ static int do_start(void *data)
+ 	 * means that migration won't work, but at least we won't spew output
+ 	 * where it isn't wanted.
+ 	 */
++#ifdef HAVE_ISULAD
++	if (!handler->disable_pty && handler->daemonize && !handler->conf->autodev) {
++#else
+ 	if (handler->daemonize && !handler->conf->autodev) {
++#endif
+ 		char path[PATH_MAX];
+ 
+ 		ret = snprintf(path, sizeof(path), "%s/dev/null",
+@@ -1221,6 +1500,9 @@ static int do_start(void *data)
+ 	/* Setup the container, ip, names, utsname, ... */
+ 	ret = lxc_setup(handler);
+ 	if (ret < 0) {
++#ifdef HAVE_ISULAD
++		lxc_write_error_message(handler->conf->errpipe[1], "Failed to setup lxc, please check the config file.");
++#endif
+ 		ERROR("Failed to setup container \"%s\"", handler->name);
+ 		goto out_warn_father;
+ 	}
+@@ -1243,12 +1525,70 @@ static int do_start(void *data)
+ 		DEBUG("Set PR_SET_NO_NEW_PRIVS to block execve() gainable privileges");
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: dup2 pipe[0][0] to container stdin, pipe[1][1] to container stdout, pipe[2][1] to container stderr */
++	if (handler->disable_pty) {
++		if (handler->conf->console.pipes[0][1] >= 0) {
++			close(handler->conf->console.pipes[0][1]);
++			handler->conf->console.pipes[0][1] = -1;
++		}
++
++		if (handler->conf->console.pipes[0][0] >= 0) {
++			ret = dup2(handler->conf->console.pipes[0][0], STDIN_FILENO);
++			if (ret < 0)
++				goto out_warn_father;
++		}
++
++		if (handler->conf->console.pipes[1][0] >= 0) {
++			close(handler->conf->console.pipes[1][0]);
++			handler->conf->console.pipes[1][0] = -1;
++		}
++
++		if (handler->conf->console.pipes[1][1] >= 0) {
++			ret = dup2(handler->conf->console.pipes[1][1], STDOUT_FILENO);
++			if (ret < 0)
++				goto out_warn_father;
++		}
++		if (handler->conf->console.pipes[2][0] >= 0) {
++			close(handler->conf->console.pipes[2][0]);
++			handler->conf->console.pipes[2][0] = -1;
++		}
++
++		if (handler->conf->console.pipes[2][1] >= 0) {
++			ret = dup2(handler->conf->console.pipes[2][1], STDERR_FILENO);
++			if (ret < 0)
++				goto out_warn_father;
++		}
++	}
++#endif
++
+ 	/* Some init's such as busybox will set sane tty settings on stdin,
+ 	 * stdout, stderr which it thinks is the console. We already set them
+ 	 * the way we wanted on the real terminal, and we want init to do its
+ 	 * setup on its console ie. the pty allocated in lxc_terminal_setup() so
+ 	 * make sure that that pty is stdin,stdout,stderr.
+ 	 */
++#ifdef HAVE_ISULAD
++	setsid();
++	if (!handler->disable_pty && handler->conf->console.pts >= 0) {
++		/* isulad:make the given terminal as controlling terminal to avoid warning
++		* sh: cannot set terminal process group (-1): Inappropriate ioctl for device
++		* sh: no job control in this shell */
++		if (ioctl(handler->conf->console.pts, TIOCSCTTY, NULL) < 0) {
++			ERROR("Faild to make the given terminal the controlling terminal of the calling process");
++			goto out_warn_father;
++		}
++		if (handler->daemonize || !handler->conf->is_execute)
++			ret = set_stdfds(handler->conf->console.pts);
++		else
++			ret = lxc_terminal_set_stdfds(handler->conf->console.pts);
++		if (ret < 0) {
++			ERROR("Failed to redirect std{in,out,err} to pty file "
++			      "descriptor %d", handler->conf->console.pts);
++			goto out_warn_father;
++		}
++	}
++#else
+ 	 if (handler->conf->console.pts >= 0) {
+ 		 if (handler->daemonize || !handler->conf->is_execute)
+ 			 ret = set_stdfds(handler->conf->console.pts);
+@@ -1260,6 +1600,7 @@ static int do_start(void *data)
+ 			goto out_warn_father;
+ 		 }
+ 	 }
++#endif
+ 
+ 	/* If we mounted a temporary proc, then unmount it now. */
+ 	tmp_proc_unmount(handler->conf);
+@@ -1283,6 +1624,21 @@ static int do_start(void *data)
+ 
+ 	close_prot_errno_disarm(handler->sigfd);
+ 
++#ifdef HAVE_ISULAD
++	if (!handler->disable_pty && handler->conf->console.pts < 0 && handler->daemonize) {
++		if (devnull_fd < 0) {
++			devnull_fd = open_devnull();
++			if (devnull_fd < 0)
++				goto out_warn_father;
++		}
++
++		ret = set_stdfds(devnull_fd);
++		if (ret < 0) {
++			ERROR("Failed to redirect std{in,out,err} to \"/dev/null\"");
++			goto out_warn_father;
++		}
++	}
++#else
+ 	if (handler->conf->console.pts < 0 && handler->daemonize) {
+ 		if (devnull_fd < 0) {
+ 			devnull_fd = open_devnull();
+@@ -1296,12 +1652,25 @@ static int do_start(void *data)
+ 			goto out_warn_father;
+ 		}
+ 	}
++#endif
+ 
+ 	close_prot_errno_disarm(devnull_fd);
+ 
++#ifndef HAVE_ISULAD
+ 	setsid();
+ 
++#endif
+ 	if (handler->conf->init_cwd) {
++#ifdef HAVE_ISULAD
++		/* try to craete workdir if not exist */
++		struct stat st;
++		if (stat(handler->conf->init_cwd, &st) < 0 && mkdir_p(handler->conf->init_cwd, 0755) < 0) {
++			SYSERROR("Try to create directory \"%s\" as workdir failed", handler->conf->init_cwd);
++			lxc_write_error_message(handler->conf->errpipe[1], "%s:%d: Failed to create workdir: %s.",
++			                        __FILE__, __LINE__, strerror(errno));
++			goto out_warn_father;
++		}
++#endif
+ 		ret = chdir(handler->conf->init_cwd);
+ 		if (ret < 0) {
+ 			SYSERROR("Could not change directory to \"%s\"",
+@@ -1345,6 +1714,13 @@ static int do_start(void *data)
+ 		}
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	if (prctl(PR_SET_KEEPCAPS, 1) < 0) {
++		SYSERROR("Failed to keep permitted capabilities");
++		goto out_warn_father;
++	}
++#endif
++
+ 	/* The container has been setup. We can now switch to an unprivileged
+ 	 * uid/gid.
+ 	 */
+@@ -1358,6 +1734,13 @@ static int do_start(void *data)
+ 	if (new_gid == nsgid)
+ 		new_gid = LXC_INVALID_GID;
+ 
++#ifdef HAVE_ISULAD
++	// isulad: set env home in container
++	if (lxc_setup_env_home(new_uid) < 0) {
++		goto out_warn_father;
++	}
++#endif
++
+ 	/* Make sure that the processes STDIO is correctly owned by the user that we are switching to */
+ 	ret = fix_stdio_permissions(new_uid);
+ 	if (ret)
+@@ -1371,8 +1754,16 @@ static int do_start(void *data)
+ 		#if HAVE_LIBCAP
+ 		if (lxc_proc_cap_is_set(CAP_SETGID, CAP_EFFECTIVE))
+ 		#endif
++#ifdef HAVE_ISULAD
++			/* isulad: set groups for init process, and before we set uid and gid */
++			if (!lxc_setgroups(handler->conf->init_groups_len, handler->conf->init_groups)) {
++				ERROR("Can not set groups");
++				goto out_warn_father;
++				}
++#else
+ 			if (!lxc_setgroups(0, NULL))
+ 				goto out_warn_father;
++#endif
+ 
+ 	if (!lxc_switch_uid_gid(new_uid, new_gid))
+ 		goto out_warn_father;
+@@ -1383,6 +1774,19 @@ static int do_start(void *data)
+ 		goto out_warn_father;
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: drop the cap of current process */
++	if (prctl(PR_SET_KEEPCAPS, 0) < 0) {
++		SYSERROR("Failed to clear permitted capabilities");
++		goto out_warn_father;
++	}
++
++	if (lxc_drop_caps(handler->conf)) {
++		SYSERROR("Failed to drop caps");
++		goto out_warn_father;
++	}
++#endif
++
+ 	if (handler->conf->monitor_signal_pdeath != SIGKILL) {
+ 		ret = lxc_set_death_signal(handler->conf->monitor_signal_pdeath,
+ 					   handler->monitor_pid, status_fd);
+@@ -1397,7 +1801,12 @@ static int do_start(void *data)
+ 	 * After this call, we are in error because this ops should not return
+ 	 * as it execs.
+ 	 */
++#ifdef HAVE_ISULAD
++	close_prot_errno_disarm(status_fd);
++	handler->ops->start(handler, handler->data, handler->daemonize ? handler->conf->errpipe[1] : -1);
++#else
+ 	handler->ops->start(handler, handler->data);
++#endif
+ 
+ out_warn_father:
+ 	/*
+@@ -1529,6 +1938,94 @@ static inline int do_share_ns(void *arg)
+ 	return 0;
+ }
+ 
++#ifdef HAVE_ISULAD
++static int lxc_write_container_info(char *filename, pid_t pid, pid_t p_pid,
++		unsigned long long start_at, unsigned long long p_start_at)
++{
++	FILE *pid_fp = NULL;
++	int ret = 0;
++
++	pid_fp = lxc_fopen(filename, "w");
++	if (pid_fp == NULL) {
++		SYSERROR("Failed to create pidfile '%s'",filename);
++		ret = -1;
++		goto out;
++	}
++
++	if (fprintf(pid_fp, "%d %llu %d %llu\n", pid, start_at, p_pid, p_start_at) < 0) {
++		SYSERROR("Failed to write '%s'", filename);
++		ret = -1;
++		goto out;
++	}
++out:
++	if (pid_fp)
++		fclose(pid_fp);
++	pid_fp = NULL;
++	return ret;
++}
++
++static int lxc_check_container_info(char *filename, pid_t pid, pid_t p_pid,
++		unsigned long long start_at, unsigned long long p_start_at)
++{
++	int ret = 0;
++	int num;
++	char sbuf[1024] = {0}; /* bufs for stat */
++	int saved_pid;		/* process id */
++	int saved_ppid;		/* pid of parent process */
++	unsigned long long saved_start_time;	/* start time of process -- seconds since 1-1-70 */
++	unsigned long long saved_pstart_time;	/* start time of parent process -- seconds since 1-1-70 */
++
++	if ((lxc_file2str(filename, sbuf, sizeof(sbuf))) == -1) {
++		SYSERROR("Failed to read pidfile %s", filename);
++		ret = -1;
++		goto out;
++	}
++
++	num = sscanf(sbuf, "%d %Lu %d %Lu", &saved_pid, &saved_start_time, &saved_ppid, &saved_pstart_time);
++	if (num != 4) {
++		SYSERROR("Call sscanf error");
++		ret = -1;
++		goto out;
++	}
++
++	if (pid != saved_pid || p_pid != saved_ppid
++	                || start_at != saved_start_time || p_start_at != saved_pstart_time) {
++		ERROR("Check container info failed");
++		ret = -1;
++		goto out;
++	}
++
++out:
++	return ret;
++}
++
++/* isuald: save pid/ppid info */
++static int lxc_save_container_info(char *filename, pid_t pid)
++{
++	int ret = 0;
++	pid_t p_pid = 0;
++	unsigned long long start_at = 0;
++	unsigned long long p_start_at = 0;
++
++	start_at = lxc_get_process_startat(pid);
++	p_pid = getpid();
++	p_start_at = lxc_get_process_startat(p_pid);
++
++	ret = lxc_write_container_info(filename, pid, p_pid, start_at, p_start_at);
++	if (ret != 0) {
++		goto out;
++	}
++
++	ret = lxc_check_container_info(filename, pid, p_pid, start_at, p_start_at);
++	if (ret != 0) {
++		goto out;
++	}
++
++out:
++	return ret;
++}
++#endif
++
+ /* lxc_spawn() performs crucial setup tasks and clone()s the new process which
+  * exec()s the requested container binary.
+  * Note that lxc_spawn() runs in the parent namespaces. Any operations performed
+@@ -1595,7 +2092,11 @@ static int lxc_spawn(struct lxc_handler *handler)
+ 	 * it readonly.
+ 	 * If the container is unprivileged then skip rootfs pinning.
+ 	 */
++#ifdef HAVE_ISULAD
++	if (!wants_to_map_ids && !handler->image_type_oci) {
++#else
+ 	if (!wants_to_map_ids) {
++#endif
+ 		handler->pinfd = pin_rootfs(conf->rootfs.path);
+ 		if (handler->pinfd == -EBADF)
+ 			INFO("Failed to pin the rootfs for container \"%s\"", handler->name);
+@@ -1640,6 +2141,32 @@ static int lxc_spawn(struct lxc_handler *handler)
+ 	}
+ 	TRACE("Cloned child process %d", handler->pid);
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: close pipe after clone */
++	if (handler->conf->console.pipes[0][0] >= 0) {
++		close(handler->conf->console.pipes[0][0]);
++		handler->conf->console.pipes[0][0] = -1;
++	}
++
++	if (handler->conf->console.pipes[1][1] >= 0) {
++		close(handler->conf->console.pipes[1][1]);
++		handler->conf->console.pipes[1][1] = -1;
++	}
++
++	if (handler->conf->console.pipes[2][1] >= 0) {
++		close(handler->conf->console.pipes[2][1]);
++		handler->conf->console.pipes[2][1] = -1;
++	}
++
++	/* isulad: save pid/ppid info into file*/
++	if (handler->conf->container_info_file) {
++		if (lxc_save_container_info(handler->conf->container_info_file, handler->pid)) {
++			ERROR("Failed to save cloned container pid");
++			goto out_delete_net;
++		}
++	}
++#endif
++
+ 	/* Verify that we can actually make use of pidfds. */
+ 	if (!lxc_can_use_pidfd(handler->pidfd))
+ 		close_prot_errno_disarm(handler->pidfd);
+@@ -1652,6 +2179,13 @@ static int lxc_spawn(struct lxc_handler *handler)
+ 	if (ret < 0)
+ 		SYSERROR("Failed to set environment variable: LXC_PID=%s", pidstr);
+ 
++#ifdef HAVE_ISULAD
++	if (handler->cgroup_ops->container_cgroup) {
++		if (setenv("LXC_CGROUP_PATH", handler->cgroup_ops->container_cgroup, 1))
++			SYSERROR("Failed to set environment variable: LXC_CGROUP_PATH=%s.", handler->cgroup_ops->container_cgroup);
++	}
++#endif
++
+ 	for (i = 0; i < LXC_NS_MAX; i++)
+ 		if (handler->ns_on_clone_flags & ns_info[i].clone_flag)
+ 			INFO("Cloned %s", ns_info[i].flag_name);
+@@ -1765,7 +2299,11 @@ static int lxc_spawn(struct lxc_handler *handler)
+ 		goto out_delete_net;
+ 
+ 	if (!lxc_list_empty(&conf->limits)) {
++#ifdef HAVE_ISULAD
++		ret = setup_resource_limits(&conf->limits, handler->pid, conf->errpipe[1]);
++#else
+ 		ret = setup_resource_limits(&conf->limits, handler->pid);
++#endif
+ 		if (ret < 0) {
+ 			ERROR("Failed to setup resource limits");
+ 			goto out_delete_net;
+@@ -1816,6 +2354,26 @@ static int lxc_spawn(struct lxc_handler *handler)
+ 		ERROR("Failed to run lxc.hook.start-host");
+ 		goto out_delete_net;
+ 	}
++#ifdef HAVE_ISULAD
++	/* isulad: Run oci prestart hook at here */
++	ret = run_oci_hooks(name, "oci-prestart", conf, lxcpath);
++	if (ret < 0) {
++		ERROR("Failed to run oci prestart hooks");
++		goto out_delete_net;
++	}
++
++	if (START_TIMEOUT == global_timeout_state) {
++		lxc_write_error_message(conf->errpipe[1], "Starting the container \"%s\" timeout.", name);
++		ERROR("Starting the container \"%s\" timeout.", name);
++		goto out_delete_net;
++	}
++
++       /* Tell the child to continue its initialization. We'll get
++        * LXC_SYNC_POST_OCI_PRESTART_HOOK when it is ready for us to run oci prestart hooks.
++        */
++       if (lxc_sync_barrier_child(handler, LXC_SYNC_POST_OCI_PRESTART_HOOK))
++               goto out_delete_net;
++#endif
+ 
+ 	/* Tell the child to complete its initialization and wait for it to exec
+ 	 * or return an error. (The child will never return
+@@ -1859,6 +2417,22 @@ static int lxc_spawn(struct lxc_handler *handler)
+ 	if (ret < 0)
+ 		goto out_abort;
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: Run oci prestart hook at here */
++	ret = run_oci_hooks(name, "oci-poststart", conf, lxcpath);
++	if (ret < 0) {
++		ERROR("Failed to run oci poststart hooks");
++		goto out_abort;
++	}
++
++	if (START_TIMEOUT == global_timeout_state) {
++		lxc_write_error_message(conf->errpipe[1], "Starting the container \"%s\" timeout.", name);
++		ERROR("Starting the container \"%s\" timeout.", name);
++		goto out_abort;
++	}
++
++#endif
++
+ 	ret = lxc_set_state(name, handler, RUNNING);
+ 	if (ret < 0) {
+ 		ERROR("Failed to set state to \"%s\"", lxc_state2str(RUNNING));
+@@ -1883,9 +2457,83 @@ out_sync_fini:
+ 	return -1;
+ }
+ 
++#ifdef HAVE_ISULAD
++/* isulad: start timeout thread function */
++static void* wait_start_timeout(void *arg)
++{
++	struct start_timeout_conf *conf = (struct start_timeout_conf *)arg;
++
++	sem_post(&global_timeout_sem);
++
++	if (!conf || conf->timeout < 1)
++		goto out;
++
++	sleep(conf->timeout);
++
++	global_timeout_state = START_TIMEOUT;
++
++out:
++	free(conf);
++	return ((void *)0);
++}
++
++/* isulad: create start timeout thread */
++static int create_start_timeout_thread(struct lxc_conf *conf, unsigned int start_timeout)
++{
++	int ret = 0;
++	pthread_t ptid;
++	pthread_attr_t attr;
++	struct start_timeout_conf *timeout_conf = NULL;
++
++	if (sem_init(&global_timeout_sem, 0, 0)) {
++		ERROR("Failed to init start timeout semaphore");/*lint !e613*/
++		ret = -1;
++		return ret;
++	}
++
++	timeout_conf = malloc(sizeof(struct start_timeout_conf));
++	if (timeout_conf == NULL) {
++		ERROR("Failed to malloc start timeout conf");
++		ret = -1;
++		goto out;
++	}
++
++	memset(timeout_conf, 0, sizeof(struct start_timeout_conf));
++	timeout_conf->errfd = conf->errpipe[1];
++	timeout_conf->timeout = start_timeout;
++
++	pthread_attr_init(&attr);
++	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++	ret = pthread_create(&ptid, &attr, wait_start_timeout, timeout_conf);
++	pthread_attr_destroy(&attr);
++	if (ret != 0) {
++		ERROR("Create start wait timeout thread failed");
++		free(timeout_conf);
++		goto out;
++	}
++
++	sem_wait(&global_timeout_sem);
++out:
++	sem_destroy(&global_timeout_sem);
++	return ret;
++}
++
++// isulad: send '128 + signal' if container is killed by signal.
++#define EXIT_SIGNAL_OFFSET 128
++#endif
++
++
++#ifdef HAVE_ISULAD
++int __lxc_start(struct lxc_handler *handler, struct lxc_operations *ops,
++		void *data, const char *lxcpath, bool daemonize, int *error_num,
++		unsigned int start_timeout)
++{
++	int exit_code;
++#else
+ int __lxc_start(struct lxc_handler *handler, struct lxc_operations *ops,
+ 		void *data, const char *lxcpath, bool daemonize, int *error_num)
+ {
++#endif
+ 	int ret, status;
+ 	const char *name = handler->name;
+ 	struct lxc_conf *conf = handler->conf;
+@@ -1901,6 +2549,16 @@ int __lxc_start(struct lxc_handler *handler, struct lxc_operations *ops,
+ 	handler->daemonize = daemonize;
+ 	cgroup_ops = handler->cgroup_ops;
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: add start timeout limit */
++	if (start_timeout > 0) {
++		ret = create_start_timeout_thread(conf, start_timeout);
++		if (ret) {
++			ERROR("Failed to create start timeout thread for container \"%s\".", name);
++			goto out_abort;
++		}
++	}
++#endif
+ 	if (!attach_block_device(handler->conf)) {
+ 		ERROR("Failed to attach block device");
+ 		ret = -1;
+@@ -1959,11 +2617,13 @@ int __lxc_start(struct lxc_handler *handler, struct lxc_operations *ops,
+ 		goto out_delete_network;
+ 	}
+ 
++#ifndef HAVE_ISULAD
+ 	if (!handler->init_died && handler->pid > 0) {
+ 		ERROR("Child process is not killed");
+ 		ret = -1;
+ 		goto out_delete_network;
+ 	}
++#endif
+ 
+ 	status = lxc_wait_for_pid_status(handler->pid);
+ 	if (status < 0)
+@@ -1973,6 +2633,21 @@ int __lxc_start(struct lxc_handler *handler, struct lxc_operations *ops,
+ 	 * reboot. This should mean it was an lxc-execute which simply exited.
+ 	 * In any case, treat it as a 'halt'.
+ 	 */
++#ifdef HAVE_ISULAD
++	// isulad: recored log for container init exit
++	if (WIFSIGNALED(status)) {
++		int signal = WTERMSIG(status);
++		signal = WTERMSIG(status);
++		exit_code = EXIT_SIGNAL_OFFSET + signal;
++		ERROR("Container \"%s\" init exited with signal %d", name, signal);
++	} else if (WIFEXITED(status)) {
++		exit_code = WEXITSTATUS(status);
++		ERROR("Container \"%s\" init exited with status %d", name, exit_code);
++	} else {
++		exit_code = -1;
++		ERROR("Container \"%s\" init exited with unknown status", name);
++	}
++#else
+ 	if (WIFSIGNALED(status)) {
+ 		switch(WTERMSIG(status)) {
+ 		case SIGINT: /* halt */
+@@ -1990,6 +2665,7 @@ int __lxc_start(struct lxc_handler *handler, struct lxc_operations *ops,
+ 			break;
+ 		}
+ 	}
++#endif
+ 
+ 	ret = lxc_restore_phys_nics_to_netns(handler);
+ 	if (ret < 0)
+@@ -1997,11 +2673,20 @@ int __lxc_start(struct lxc_handler *handler, struct lxc_operations *ops,
+ 
+ 	close_prot_errno_disarm(handler->pinfd);
+ 
++#ifdef HAVE_ISULAD
++	lxc_monitor_send_exit_code(name, exit_code, handler->lxcpath);
++#else
+ 	lxc_monitor_send_exit_code(name, status, handler->lxcpath);
++#endif
++
+ 	lxc_error_set_and_log(handler->pid, status);
+ 	if (error_num)
+ 		*error_num = handler->exit_status;
+ 
++#ifdef HAVE_ISULAD
++	handler->exit_code = exit_code; /* record exit code */
++#endif
++
+ /* These are not the droids you are looking for. */
+ __private_goto1:
+ 	lxc_delete_network(handler);
+@@ -2032,7 +2717,11 @@ struct start_args {
+ 	char *const *argv;
+ };
+ 
++#ifdef HAVE_ISULAD
++static int start(struct lxc_handler *handler, void* data, int fd)
++#else
+ static int start(struct lxc_handler *handler, void* data)
++#endif
+ {
+ 	struct start_args *arg = data;
+ 
+@@ -2040,6 +2729,9 @@ static int start(struct lxc_handler *handler, void* data)
+ 
+ 	execvp(arg->argv[0], arg->argv);
+ 	SYSERROR("Failed to exec \"%s\"", arg->argv[0]);
++#ifdef HAVE_ISULAD
++	lxc_write_error_message(fd, "exec: \"%s\": %s.", arg->argv[0], strerror(errno));
++#endif
+ 	return 0;
+ }
+ 
+@@ -2057,14 +2749,22 @@ static struct lxc_operations start_ops = {
+ };
+ 
+ int lxc_start(char *const argv[], struct lxc_handler *handler,
++#ifdef HAVE_ISULAD
++	      const char *lxcpath, bool daemonize, int *error_num, unsigned int start_timeout)
++#else
+ 	      const char *lxcpath, bool daemonize, int *error_num)
++#endif
+ {
+ 	struct start_args start_arg = {
+ 		.argv = argv,
+ 	};
+ 
+ 	TRACE("Doing lxc_start");
++#ifdef HAVE_ISULAD
++	return __lxc_start(handler, &start_ops, &start_arg, lxcpath, daemonize, error_num, start_timeout);
++#else
+ 	return __lxc_start(handler, &start_ops, &start_arg, lxcpath, daemonize, error_num);
++#endif
+ }
+ 
+ static void lxc_destroy_container_on_signal(struct lxc_handler *handler,
+@@ -2136,3 +2836,261 @@ static bool do_destroy_container(struct lxc_handler *handler)
+ 
+ 	return storage_destroy(handler->conf);
+ }
++
++#ifdef HAVE_ISULAD
++/*isulad: set env for clean resources */
++static int clean_resource_set_env(struct lxc_handler *handler)
++{
++	const char *name = handler->name;
++	struct lxc_conf *conf = handler->conf;
++	char bufstr[PATH_MAX + 1];
++	int i = 0;
++	int j = 0;
++	int len = 2; //set "LXC_PID" and "LXC_CGNS_AWARE"
++
++	if (conf == NULL || conf->ocihooks == NULL || conf->ocihooks->poststop_len == 0) {
++		return 0;
++	}
++
++	if (name) {
++		len++;
++	}
++	if (conf->rcfile) {
++		len++;
++	}
++	if (conf->rootfs.mount) {
++		len++;
++	}
++	if (conf->rootfs.path) {
++		len++;
++	}
++	if (conf->console.path) {
++		len++;
++	}
++	if (conf->console.log_path) {
++		len++;
++	}
++	if (handler->cgroup_ops->container_cgroup) {
++		len++;
++	}
++
++	for (; i < conf->ocihooks->poststop_len; i++) {
++		size_t cap = conf->ocihooks->poststop[i]->env_len;
++		size_t newcap = cap + len + 1;
++		if (lxc_grow_array((void ***)&(conf->ocihooks->poststop[i]->env), &cap, newcap, 1) != 0) {
++			return -1;
++		}
++		j = conf->ocihooks->poststop[i]->env_len;
++		/* Start of environment variable setup for hooks. */
++		if (name) {
++			snprintf(bufstr, PATH_MAX + 1, "LXC_NAME=%s", name);
++			conf->ocihooks->poststop[i]->env[j++] = safe_strdup(bufstr);
++		}
++		if (conf->rcfile) {
++			snprintf(bufstr, PATH_MAX + 1, "LXC_CONFIG_FILE=%s", conf->rcfile);
++			conf->ocihooks->poststop[i]->env[j++] = safe_strdup(bufstr);
++		}
++		if (conf->rootfs.mount) {
++			snprintf(bufstr, PATH_MAX + 1, "LXC_ROOTFS_MOUNT=%s", conf->rootfs.mount);
++			conf->ocihooks->poststop[i]->env[j++] = safe_strdup(bufstr);
++		}
++		if (conf->rootfs.path) {
++			snprintf(bufstr, PATH_MAX + 1, "LXC_ROOTFS_PATH=%s", conf->rootfs.path);
++			conf->ocihooks->poststop[i]->env[j++] = safe_strdup(bufstr);
++		}
++		if (conf->console.path) {
++			snprintf(bufstr, PATH_MAX + 1, "LXC_CONSOLE=%s", conf->console.path);
++			conf->ocihooks->poststop[i]->env[j++] = safe_strdup(bufstr);
++		}
++		if (conf->console.log_path) {
++			snprintf(bufstr, PATH_MAX + 1, "LXC_CONSOLE_LOGPATH=%s", conf->console.log_path);
++			conf->ocihooks->poststop[i]->env[j++] = safe_strdup(bufstr);
++		}
++		conf->ocihooks->poststop[i]->env[j++] = safe_strdup("LXC_CGNS_AWARE=1");
++
++		snprintf(bufstr, PATH_MAX + 1, "LXC_PID=%d", handler->pid);
++		conf->ocihooks->poststop[i]->env[j++] = safe_strdup(bufstr);
++		if (handler->cgroup_ops->container_cgroup) {
++			snprintf(bufstr, PATH_MAX + 1, "LXC_CGROUP_PATH=%s", handler->cgroup_ops->container_cgroup);
++			conf->ocihooks->poststop[i]->env[j++] = safe_strdup(bufstr);
++		}
++		conf->ocihooks->poststop[i]->env_len = j;
++		/* End of environment variable setup for hooks. */
++	}
++	return 0;
++}
++
++/*isulad: init handler for clean */
++static struct lxc_handler *lxc_init_clean_handler(char *name, char *lxcpath, struct lxc_conf *conf, pid_t pid)
++{
++	int i;
++	struct lxc_handler *handler;
++
++	handler = malloc(sizeof(*handler));
++	if (handler == NULL)
++		return NULL;
++
++	memset(handler, 0, sizeof(*handler));
++
++	/* Note that am_guest_unpriv() checks the effective uid. We
++	 * probably don't care if we are real root only if we are running
++	 * as root so this should be fine.
++	 */
++	handler->am_root = !am_guest_unpriv();
++	handler->data_sock[0] = handler->data_sock[1] = -1;
++	handler->conf = conf;
++	handler->lxcpath = lxcpath;
++	handler->pinfd = -1;
++	handler->sigfd = -EBADF;
++	handler->pidfd = -EBADF;
++	handler->init_died = false;
++	handler->monitor_status_fd = -EBADF;
++	handler->pid = pid;
++	handler->state_socket_pair[0] = handler->state_socket_pair[1] = -1;
++	if (handler->conf->reboot == REBOOT_NONE)
++		lxc_list_init(&handler->conf->state_clients);
++
++	for (i = 0; i < LXC_NS_MAX; i++)
++		handler->nsfd[i] = -1;
++
++	handler->name = name;
++	handler->exit_code = -1; /* isulad: record exit code of container */
++
++	handler->cgroup_ops = cgroup_init(conf);
++	if (!handler->cgroup_ops) {
++		ERROR("Failed to initialize cgroup driver");
++		goto on_error;
++	}
++
++	INFO("Container \"%s\" 's clean handler is initialized.", name);
++
++	return handler;
++
++on_error:
++	lxc_put_handler(handler);
++
++	return NULL;
++}
++
++/*isulad: init handler for clean */
++static struct lxc_handler *lxc_init_pids_handler(char *name, char *lxcpath, struct lxc_conf *conf)
++{
++	int i;
++	struct lxc_handler *handler;
++
++	handler = malloc(sizeof(*handler));
++	if (handler == NULL)
++		return NULL;
++
++	memset(handler, 0, sizeof(*handler));
++
++	/* Note that am_guest_unpriv() checks the effective uid. We
++	 * probably don't care if we are real root only if we are running
++	 * as root so this should be fine.
++	 */
++	handler->am_root = !am_guest_unpriv();
++	handler->data_sock[0] = handler->data_sock[1] = -1;
++	handler->conf = conf;
++	handler->lxcpath = lxcpath;
++	handler->pinfd = -1;
++	handler->sigfd = -EBADF;
++	handler->init_died = false;
++	handler->state_socket_pair[0] = handler->state_socket_pair[1] = -1;
++	handler->monitor_status_fd = -EBADF;
++	handler->pidfd = -EBADF;
++	if (handler->conf->reboot == REBOOT_NONE)
++		lxc_list_init(&handler->conf->state_clients);
++
++	for (i = 0; i < LXC_NS_MAX; i++)
++		handler->nsfd[i] = -1;
++
++	handler->name = name;
++	handler->exit_code = -1; /* isulad: record exit code of container */
++
++	handler->cgroup_ops = cgroup_init(conf);
++	if (!handler->cgroup_ops) {
++		ERROR("Failed to initialize cgroup driver");
++		goto on_error;
++	}
++
++	INFO("Container \"%s\" 's clean handler is initialized.", name);
++
++	return handler;
++
++on_error:
++	lxc_put_handler(handler);
++
++	return NULL;
++}
++
++/*isulad: do_lxcapi_clean_resource */
++int do_lxcapi_clean_resource(char *name, char *lxcpath, struct lxc_conf *conf, pid_t pid)
++{
++	int ret = 0;
++	struct lxc_handler *handler = NULL;
++	int retry_count = 0;
++	int max_retry = 10;
++
++	handler = lxc_init_clean_handler(name, lxcpath, conf, pid);
++	if (!handler) {
++		ERROR("Failed to init container %s clean handler", name);
++		ret = -1;
++		goto out;
++	}
++
++	if (clean_resource_set_env(handler) != 0) {
++		ERROR("Failed to set env for poststop hooks");
++		ret = -1;
++		goto out;
++	}
++
++	if (run_oci_hooks(handler->name, "oci-poststop", handler->conf, handler->lxcpath)) {
++		ERROR("Failed to run lxc.hook.post-stop for container \"%s\".", handler->name);
++		ret = -1;
++	}
++
++retry:
++	if (!handler->cgroup_ops->payload_destroy(handler->cgroup_ops, handler)) {
++		TRACE("Trying to kill all subprocess");
++		signal_all_processes(handler);
++		TRACE("Finished kill all subprocess");
++		if (retry_count < max_retry) {
++			usleep(100 * 1000); /* 100 millisecond */
++			retry_count++;
++			goto retry;
++		}
++		SYSERROR("Failed to destroy cgroup path for container: \"%s\"", handler->name);
++		ret = -1;
++	}
++
++out:
++	lxc_put_handler(handler);
++	return ret;
++}
++
++/*isulad: do_lxcapi_get_pids */
++int do_lxcapi_get_pids(char *name, char *lxcpath, struct lxc_conf *conf, pid_t **pids,size_t *pids_len)
++{
++	int ret = 0;
++	struct lxc_handler *handler = NULL;
++	struct cgroup_ops *cg_ops = NULL;
++
++	handler = lxc_init_pids_handler(name, lxcpath, conf);
++	if (!handler) {
++		ERROR("Failed to init container %s clean handler", name);
++		ret = -1;
++		goto out;
++	}
++
++	cg_ops = handler->cgroup_ops;
++	ret = get_all_pids(cg_ops, pids, pids_len);
++	if (ret < 0) {
++		WARN("failed to get all pids");
++	}
++
++out:
++	lxc_put_handler(handler);
++	return ret;
++}
++
++#endif
+diff --git a/src/lxc/storage/btrfs.c b/src/lxc/storage/btrfs.c
+index 92a4a6d..069a9dd 100644
+--- a/src/lxc/storage/btrfs.c
++++ b/src/lxc/storage/btrfs.c
+@@ -197,16 +197,27 @@ int btrfs_mount(struct lxc_storage *bdev)
+ 	const char *src;
+ 	int ret;
+ 
++#ifdef HAVE_ISULAD
++    unsigned long pflags = 0;
++#endif
++
+ 	if (strcmp(bdev->type, "btrfs"))
+ 		return -22;
+ 
+ 	if (!bdev->src || !bdev->dest)
+ 		return -22;
+ 
++#ifdef HAVE_ISULAD
++    if (parse_mntopts(bdev->mntopts, &mntflags, &pflags, &mntdata) < 0) {
++		free(mntdata);
++		return -22;
++	}
++#else
+ 	if (parse_mntopts(bdev->mntopts, &mntflags, &mntdata) < 0) {
+ 		free(mntdata);
+ 		return -22;
+ 	}
++#endif
+ 
+ 	src = lxc_storage_get_path(bdev->src, "btrfs");
+ 
+diff --git a/src/lxc/storage/overlay.c b/src/lxc/storage/overlay.c
+index 770785c..75a81de 100644
+--- a/src/lxc/storage/overlay.c
++++ b/src/lxc/storage/overlay.c
+@@ -349,6 +349,9 @@ int ovl_mount(struct lxc_storage *bdev)
+ 	char *work, *lastslash;
+ 	size_t len, len2;
+ 	int ret, ret2;
++#ifdef HAVE_ISULAD
++	unsigned long pflags = 0;
++#endif
+ 
+ 	if (strcmp(bdev->type, "overlay") && strcmp(bdev->type, "overlayfs"))
+ 		return -22;
+@@ -414,7 +417,12 @@ int ovl_mount(struct lxc_storage *bdev)
+ 	work = must_make_path(upper, LXC_OVERLAY_WORK_DIR, NULL);
+ 	upper[lastslash - upper] = '/';
+ 
++#ifdef HAVE_ISULAD
++	ret = parse_mntopts(bdev->mntopts, &mntflags, &pflags, &mntdata);
++#else
+ 	ret = parse_mntopts(bdev->mntopts, &mntflags, &mntdata);
++#endif
++
+ 	if (ret < 0) {
+ 		ERROR("Failed to parse mount options");
+ 		free(mntdata);
+diff --git a/src/lxc/sync.h b/src/lxc/sync.h
+index ff7a1eb..56c1dfc 100644
+--- a/src/lxc/sync.h
++++ b/src/lxc/sync.h
+@@ -11,6 +11,10 @@ enum {
+ 	LXC_SYNC_POST_CONFIGURE,
+ 	LXC_SYNC_CGROUP,
+ 	LXC_SYNC_CGROUP_UNSHARE,
++#ifdef HAVE_ISULAD
++	LXC_SYNC_OCI_PRESTART_HOOK,
++	LXC_SYNC_POST_OCI_PRESTART_HOOK,
++#endif
+ 	LXC_SYNC_CGROUP_LIMITS,
+ 	LXC_SYNC_READY_START,
+ 	LXC_SYNC_RESTART,
+diff --git a/src/lxc/terminal.c b/src/lxc/terminal.c
+index e58db5c..0539eca 100644
+--- a/src/lxc/terminal.c
++++ b/src/lxc/terminal.c
+@@ -28,6 +28,10 @@
+ #include "syscall_wrappers.h"
+ #include "terminal.h"
+ #include "utils.h"
++#ifdef HAVE_ISULAD
++#include "logger_json_file.h"
++#include "include/strlcpy.h"
++#endif
+ 
+ #if HAVE_PTY_H
+ #include <pty.h>
+@@ -183,6 +187,69 @@ static int lxc_terminal_truncate_log_file(struct lxc_terminal *terminal)
+ 	return lxc_unpriv(ftruncate(terminal->log_fd, 0));
+ }
+ 
++#ifdef HAVE_ISULAD
++
++int lxc_set_terminal_winsz(struct lxc_terminal *terminal, unsigned int height, unsigned int width)
++{
++	int ret = 0;
++	struct winsize wsz;
++
++	if (terminal->ptmx < 0) {
++		return 0;
++	}
++
++	ret = ioctl(terminal->ptmx, TIOCGWINSZ, &wsz);
++	if (ret < 0) {
++		WARN("Failed to get window size");
++		return -1;
++	}
++	wsz.ws_col = width;
++	wsz.ws_row = height;
++
++	ret = ioctl(terminal->ptmx, TIOCSWINSZ, &wsz);
++	if (ret < 0)
++		WARN("Failed to set window size");
++	else
++		DEBUG("Set window size to %d columns and %d rows", wsz.ws_col,
++		      wsz.ws_row);
++	return ret;
++}
++
++/*
++ * isulad: support mult-logfiles
++ * */
++static int lxc_terminal_rename_old_log_file(struct lxc_terminal *terminal)
++{
++	int ret;
++	unsigned int i;
++	char tmp[PATH_MAX] = {0};
++	char *rename_fname = NULL;
++
++	for (i = terminal->log_rotate - 1; i > 1; i--) {
++		ret = snprintf(tmp, PATH_MAX, "%s.%u", terminal->log_path, i);
++		if (ret < 0 || ret >= PATH_MAX) {
++			free(rename_fname);
++			return -EFBIG;
++		}
++		free(rename_fname);
++		rename_fname = safe_strdup(tmp);
++		ret = snprintf(tmp, PATH_MAX, "%s.%u", terminal->log_path, (i - 1));
++		if (ret < 0 || ret >= PATH_MAX) {
++			free(rename_fname);
++			return -EFBIG;
++		}
++		ret = lxc_unpriv(rename(tmp, rename_fname));
++		if (ret < 0 && errno != ENOENT) {
++			free(rename_fname);
++			return ret;
++		}
++	}
++
++	free(rename_fname);
++	return 0;
++}
++#endif
++
+ static int lxc_terminal_rotate_log_file(struct lxc_terminal *terminal)
+ {
+ 	__do_free char *tmp = NULL;
+@@ -196,6 +263,15 @@ static int lxc_terminal_rotate_log_file(struct lxc_terminal *terminal)
+ 	if (terminal->log_fd < 0)
+ 		return -EBADF;
+ 
++#ifdef HAVE_ISULAD
++	/* isuald: rotate old log file first */
++	ret = lxc_terminal_rename_old_log_file(terminal);
++	if(ret != 0) {
++		ERROR("Rename old log file failed");
++		return ret;
++	}
++#endif
++
+ 	len = strlen(terminal->log_path) + sizeof(".1");
+ 	tmp = must_realloc(NULL, len);
+ 
+@@ -212,6 +288,7 @@ static int lxc_terminal_rotate_log_file(struct lxc_terminal *terminal)
+ 	return lxc_terminal_create_log_file(terminal);
+ }
+ 
++#ifndef HAVE_ISULAD
+ static int lxc_terminal_write_log_file(struct lxc_terminal *terminal, char *buf,
+ 				       int bytes_read)
+ {
+@@ -317,7 +394,465 @@ static int lxc_terminal_write_log_file(struct lxc_terminal *terminal, char *buf,
+ 	bytes_read -= ret;
+ 	return bytes_read;
+ }
++#endif
++
++#ifdef HAVE_ISULAD
++/* get time buffer */
++static bool get_time_buffer(struct timespec *timestamp, char *timebuffer,
++                            size_t maxsize)
++{
++	struct tm tm_utc = { 0 };
++	int32_t nanos = 0;
++	time_t seconds;
++	size_t len = 0;
++	int ret = 0;
++
++	if (!timebuffer || !maxsize) {
++		return false;
++	}
++
++	seconds = (time_t)timestamp->tv_sec;
++	gmtime_r(&seconds, &tm_utc);
++	strftime(timebuffer, maxsize, "%Y-%m-%dT%H:%M:%S", &tm_utc);
++
++	nanos = (int32_t)timestamp->tv_nsec;
++	len = strlen(timebuffer);
++	ret = snprintf(timebuffer + len, (maxsize - len), ".%09dZ", nanos);
++	if (ret < 0 || ret >= (maxsize - len)) {
++		return false;
++	}
++
++	return true;
++}
++
++/* get now time buffer */
++static bool get_now_time_buffer(char *timebuffer, size_t maxsize)
++{
++	int err = 0;
++	struct timespec ts;
++
++	err = clock_gettime(CLOCK_REALTIME, &ts);
++	if (err != 0) {
++		ERROR("failed to get time");
++		return false;
++	}
++
++	return get_time_buffer(&ts, timebuffer, maxsize);
++}
++
++static int isulad_lxc_terminal_rotate_write_data(struct lxc_terminal *terminal, const char *buf,
++                int bytes_read)
++{
++	int ret;
++	struct stat st;
++	int64_t space_left = -1;
++
++	if (terminal->log_fd < 0)
++		return 0;
++
++	/* A log size <= 0 means that there's no limit on the size of the log
++	 * file at which point we simply ignore whether the log is supposed to
++	 * be rotated or not.
++	 */
++	if (terminal->log_size <= 0)
++		return lxc_write_nointr(terminal->log_fd, buf, bytes_read);
++
++	/* Get current size of the log file. */
++	ret = fstat(terminal->log_fd, &st);
++	if (ret < 0) {
++		SYSERROR("Failed to stat the terminal log file descriptor");
++		return -1;
++	}
++
++	/* handle non-regular files */
++	if ((st.st_mode & S_IFMT) != S_IFREG) {
++		/* This isn't a regular file. so rotating the file seems a
++		 * dangerous thing to do, size limits are also very
++		 * questionable. Let's not risk anything and tell the user that
++		 * he's requesting us to do weird stuff.
++		 */
++		if (terminal->log_rotate > 0 || terminal->log_size > 0)
++			return -EINVAL;
++
++		/* I mean, sure log wherever you want to. */
++		return lxc_write_nointr(terminal->log_fd, buf, bytes_read);
++	}
++
++	space_left = terminal->log_size - st.st_size;
++
++	/* User doesn't want to rotate the log file and there's no more space
++	 * left so simply truncate it.
++	 */
++	if (space_left <= 0 && terminal->log_rotate <= 0) {
++		ret = lxc_terminal_truncate_log_file(terminal);
++		if (ret < 0)
++			return ret;
++
++		if (bytes_read <= terminal->log_size)
++			return lxc_write_nointr(terminal->log_fd, buf, bytes_read);
++
++		/* Write as much as we can into the buffer and loose the rest. */
++		return lxc_write_nointr(terminal->log_fd, buf, terminal->log_size);
++	}
++
++	/* There's enough space left. */
++	if (bytes_read <= space_left)
++		return lxc_write_nointr(terminal->log_fd, buf, bytes_read);
++
++	/* There'd be more to write but we aren't instructed to rotate the log
++	 * file so simply return. There's no error on our side here.
++	 */
++	if (terminal->log_rotate > 0)
++		ret = lxc_terminal_rotate_log_file(terminal);
++	else
++		ret = lxc_terminal_truncate_log_file(terminal);
++	if (ret < 0)
++		return ret;
++
++	if (terminal->log_size < bytes_read) {
++		/* Well, this is unfortunate because it means that there is more
++		 * to write than the user has granted us space. There are
++		 * multiple ways to handle this but let's use the simplest one:
++		 * write as much as we can, tell the user that there was more
++		 * stuff to write and move on.
++		 * Note that this scenario shouldn't actually happen with the
++		 * standard pty-based terminal that LXC allocates since it will
++		 * be switched into raw mode. In raw mode only 1 byte at a time
++		 * should be read and written.
++		 */
++		WARN("Size of terminal log file is smaller than the bytes to write");
++		ret = lxc_write_nointr(terminal->log_fd, buf, terminal->log_size);
++		if (ret < 0)
++			return -1;
++		bytes_read -= ret;
++		return bytes_read;
++	}
++
++	/* Yay, we made it. */
++	ret = lxc_write_nointr(terminal->log_fd, buf, bytes_read);
++	if (ret < 0)
++		return -1;
++	bytes_read -= ret;
++	return bytes_read;
++}
++
++static ssize_t isulad_logger_json_write(struct lxc_terminal *terminal, const char *type, const char *buf,
++                                int bytes_read)
++{
++	logger_json_file *msg = NULL;
++	ssize_t ret = -1;
++	size_t len;
++	char *json = NULL;
++	char timebuffer[64] = { 0 };
++	parser_error err = NULL;
++	struct parser_context ctx = { GEN_OPTIONS_SIMPLIFY | GEN_OPTIONS_NOT_VALIDATE_UTF8, stderr };
++
++	if (bytes_read < 0 || bytes_read >= INT_MAX) {
++		return -1;
++	}
++	msg = calloc(sizeof(logger_json_file), 1);
++	if (msg == NULL) {
++		return -errno;
++	}
++	msg->log = calloc(bytes_read, 1);
++	if (!msg->log) {
++		goto cleanup;
++	}
++	memcpy(msg->log, buf, bytes_read);
++	msg->log_len = bytes_read;
++	msg->stream = type ? safe_strdup(type) : safe_strdup("stdout");
++
++	get_now_time_buffer(timebuffer, sizeof(timebuffer));
++	msg->time = safe_strdup(timebuffer);
++
++	json = logger_json_file_generate_json(msg, &ctx, &err);
++	if (!json) {
++		ERROR("Failed to generate json: %s", err);
++		goto cleanup;
++	}
++	len = strlen(json);
++	json[len] = '\n';
++	ret = isulad_lxc_terminal_rotate_write_data(terminal, json, len + 1);
++cleanup:
++	free(json);
++	free_logger_json_file(msg);
++	free(err);
++	return ret;
++}
++
++static ssize_t isulad_logger_syslog_write(struct lxc_terminal *terminal, const char *buf)
++{
++        syslog(LOG_INFO, "%s", buf);
++        return 0;
++}
++
++static inline bool is_syslog(const char *driver)
++{
++        if (driver == NULL) {
++                return false;
++        }
++
++        return (strcmp("syslog", driver) == 0);
++}
++
++static inline ssize_t isulad_logger_write(struct lxc_terminal *terminal, const char *type, const char *buf,
++                                int bytes_read)
++{
++        if (is_syslog(terminal->log_driver)) {
++                return isulad_logger_syslog_write(terminal, buf);
++        }
++
++        return isulad_logger_json_write(terminal, type, buf, bytes_read);
++}
++
++static int isulad_lxc_terminal_write_log_file(struct lxc_terminal *terminal, const char *type, char *buf,
++                                       int bytes_read)
++{
++#define __BUF_CACHE_SIZE (16 * LXC_TERMINAL_BUFFER_SIZE)
++	static char cache[__BUF_CACHE_SIZE];
++	static int size = 0;
++	int upto, index;
++	int begin = 0, buf_readed = 0,  buf_left = 0;
++	int ret;
++
++	if (buf != NULL && bytes_read > 0) {
++		/* Work out how much more data we are okay with reading this time. */
++		upto = size + bytes_read;
++		if (upto > __BUF_CACHE_SIZE) {
++			upto = __BUF_CACHE_SIZE;
++		}
++
++		if (upto > size) {
++			buf_readed = upto - size;
++			memcpy(cache + size, buf, buf_readed);
++			buf_left = bytes_read - buf_readed;
++			size += buf_readed;
++		}
++	}
++
++	// If we have no data to log, and there's no more coming, we're done.
++	if (size == 0)
++		return 0;
++
++	// Break up the data that we've buffered up into lines, and log each in turn.
++	for (index = 0; index < size; index++) {
++		if (cache[index] == '\n') {
++			ret = isulad_logger_write(terminal, type, cache + begin, index - begin + 1);
++			if (ret < 0) {
++				WARN("Failed to log msg");
++			}
++			begin = index + 1;
++		}
++	}
++	/* If there's no more coming, or the buffer is full but
++	 * has no newlines, log whatever we haven't logged yet,
++	 * noting that it's a partial log line. */
++	if (buf == NULL || (begin == 0 && size == __BUF_CACHE_SIZE)) {
++		if (begin < size) {
++			ret = isulad_logger_write(terminal, type, cache + begin, size - begin);
++			if (ret < 0) {
++				WARN("Failed to log msg");
++			}
++			begin = 0;
++			size = 0;
++		}
++		if (buf == NULL) {
++			return 0;
++		}
++	}
++	/* Move any unlogged data to the front of the buffer in preparation for another read. */
++	if (begin > 0) {
++		memcpy(cache, cache + begin, size - begin);
++		size -= begin;
++	}
++	/* Move left data to cache buffer */
++	if (buf_left > 0) {
++		memcpy(cache + size, buf + buf_readed, buf_left);
++		size += buf_left;
++	}
++	return 0;
++}
++
++/* isulad: forward data to all fifos */
++static void lxc_forward_data_to_fifo(struct lxc_list *list, bool is_err, const char *buf, int r)
++{
++	struct lxc_list *it  = NULL;
++	struct lxc_list *next = NULL;
++	struct lxc_fifos_fd *elem = NULL;
++	ssize_t w = 0;
++
++	lxc_list_for_each_safe(it, list, next) {
++		elem = it->elem;
++		if (is_err) {
++			if (elem->err_fd >= 0) {
++				w = lxc_write_nointr_for_fifo(elem->err_fd, buf, r);
++				if (w != r) {
++					WARN("Failed to write to fifo fd %d with error: %s", elem->err_fd, strerror(errno));
++				}
++			}
++		} else {
++			if (elem->out_fd >= 0) {
++				w = lxc_write_nointr_for_fifo(elem->out_fd, buf, r);
++				if (w != r) {
++					WARN("Failed to write to fifo fd %d with error: %s", elem->out_fd, strerror(errno));
++				}
++			}
++		}
++	}
++
++	return;
++}
++
++/* isulad: judge the fd whether is fifo */
++static bool lxc_terminal_is_fifo(int fd, struct lxc_list *list)
++{
++	struct lxc_list *it = NULL;
++	struct lxc_list *next = NULL;
++	struct lxc_fifos_fd *elem = NULL;
++
++	lxc_list_for_each_safe(it, list, next) {
++		elem = it->elem;
++		if (elem->in_fd == fd)
++			return true;
++	}
++
++	return false;
++}
++
++/* isulad: if fd == -1, means delete all the fifos*/
++int lxc_terminal_delete_fifo(int fd, struct lxc_list *list)
++{
++	struct lxc_list *it = NULL;
++	struct lxc_list *next = NULL;
++	struct lxc_fifos_fd *elem = NULL;
++
++	lxc_list_for_each_safe(it, list, next) {
++		elem = it->elem;
++		if (elem->in_fd == fd || -1 == fd) {
++			INFO("Delete fifo fd %d", fd);
++			lxc_list_del(it);
++			if (elem->in_fifo)
++				free(elem->in_fifo);
++			if (elem->out_fifo)
++				free(elem->out_fifo);
++			if (elem->err_fifo)
++				free(elem->err_fifo);
++			if (elem->in_fd >= 0)
++				close(elem->in_fd);
++			if (elem->out_fd >= 0)
++				close(elem->out_fd);
++			if (elem->err_fd >= 0)
++				close(elem->err_fd);
++			free(elem);
++		}
++	}
++
++	return 0;
++}
++
++int lxc_terminal_io_cb(int fd, uint32_t events, void *data,
++                       struct lxc_epoll_descr *descr)
++{
++	struct lxc_terminal *terminal = data;
++	char buf[2 * LXC_TERMINAL_BUFFER_SIZE];
++	int r, w, w_log, w_rbuf;
++
++	w = r = lxc_read_nointr(fd, buf, sizeof(buf));
++	if (r <= 0) {
++		INFO("Terminal client on fd %d has exited", fd);
++		lxc_mainloop_del_handler(descr, fd);
++
++		if (fd == terminal->ptmx) {
++			terminal->ptmx = -EBADF;
++			/* write remained buffer to terminal log */
++			if (terminal->log_fd >= 0) {
++				w_log = isulad_lxc_terminal_write_log_file(terminal, "stdout", NULL, 0);
++				if (w_log < 0)
++					TRACE("Failed to write %d bytes to terminal log", r);
++			}
++			/* notes: do not close the ptmx fd due to if we close the fd, the process may
++			 * recive SIGHUP and the exit code will be 129 (128 + 1)
++			 */
++			return LXC_MAINLOOP_CLOSE;
++		} else if (fd == terminal->peer) {
++			lxc_terminal_signal_fini(terminal);
++			terminal->peer = -EBADF;
++			close(fd);
++			return LXC_MAINLOOP_CONTINUE; /* isulad: do not close mainloop when peer close*/
++		} else if (lxc_terminal_is_fifo(fd, &terminal->fifos)) {
++			/* isulad: delete fifos when the client close */
++			lxc_terminal_delete_fifo(fd, &terminal->fifos);
++			return LXC_MAINLOOP_CONTINUE;
++		} else if (fd == terminal->pipes[1][0] || fd == terminal->pipes[2][0]) {
++			if (fd == terminal->pipes[1][0]) {
++				if (terminal->log_fd >= 0) {
++					w_log = isulad_lxc_terminal_write_log_file(terminal, "stdout", NULL, 0);
++				}
++				terminal->pipes[1][0] = -EBADF;
++			} else if (fd == terminal->pipes[2][0]) {
++				if (terminal->log_fd >= 0) {
++					w_log = isulad_lxc_terminal_write_log_file(terminal, "stderr", NULL, 0);
++				}
++				terminal->pipes[2][0] = -EBADF;
++			}
++			/* notes: do not close the ptmx fd due to if we close the fd, the process may
++			 * recive SIGHUP and the exit code will be 141 (128 + 13)
++			 */
++			return LXC_MAINLOOP_CONTINUE;
++		} else if (fd == terminal->pipes[0][1]) {
++			TRACE("closed stdin pipe of container stdin");
++			terminal->pipes[0][1] = -EBADF;
++			return LXC_MAINLOOP_CONTINUE;
++		} else {
++			WARN("Handler received unexpected file descriptor");
++		}
++		close(fd);
++		return LXC_MAINLOOP_CLOSE;
++	}
++
++	if (fd == terminal->peer || lxc_terminal_is_fifo(fd, &terminal->fifos)) {
++		if (terminal->ptmx > 0)
++			w = lxc_write_nointr(terminal->ptmx, buf, r);
++		if (terminal->pipes[0][1] > 0)
++			w = lxc_write_nointr(terminal->pipes[0][1], buf, r);
++	}
++
++	w_rbuf = w_log = 0;
++	if (fd == terminal->ptmx || fd == terminal->pipes[1][0] || fd == terminal->pipes[2][0]) {
++		/* write to peer first */
++		if (terminal->peer >= 0)
++			w = lxc_write_nointr(terminal->peer, buf, r);
++
++		/* isulad: forward data to fifos */
++		lxc_forward_data_to_fifo(&terminal->fifos, fd == terminal->pipes[2][0], buf, r);
++
++		/* write to terminal ringbuffer */
++		if (terminal->buffer_size > 0)
++			w_rbuf = lxc_ringbuf_write(&terminal->ringbuf, buf, r);
++
++		/* write to terminal log */
++		if (terminal->log_fd >= 0) {
++			if (fd == terminal->ptmx || fd == terminal->pipes[1][0])
++				w_log = isulad_lxc_terminal_write_log_file(terminal, "stdout", buf, r);
++			else if (fd == terminal->pipes[2][0])
++				w_log = isulad_lxc_terminal_write_log_file(terminal, "stderr", buf, r);
++		}
++	}
++
++	if (w != r)
++		WARN("Short write on terminal r:%d != w:%d", r, w);
++
++	if (w_rbuf < 0) {
++		errno = -w_rbuf;
++		SYSTRACE("Failed to write %d bytes to terminal ringbuffer", r);
++	}
++
++	if (w_log < 0)
++		TRACE("Failed to write %d bytes to terminal log", r);
+ 
++	return LXC_MAINLOOP_CONTINUE;
++}
++#else
+ int lxc_terminal_io_cb(int fd, uint32_t events, void *data,
+ 		       struct lxc_epoll_descr *descr)
+ {
+@@ -374,6 +909,7 @@ int lxc_terminal_io_cb(int fd, uint32_t events, void *data,
+ 
+ 	return LXC_MAINLOOP_CONTINUE;
+ }
++#endif
+ 
+ static int lxc_terminal_mainloop_add_peer(struct lxc_terminal *terminal)
+ {
+@@ -401,6 +937,110 @@ static int lxc_terminal_mainloop_add_peer(struct lxc_terminal *terminal)
+ 	return 0;
+ }
+ 
++#ifdef HAVE_ISULAD
++/* isulad add pipes to mainloop */
++static int lxc_terminal_mainloop_add_pipes(struct lxc_terminal *terminal)
++{
++	int ret = 0;
++
++	// parent read data from fifo, and send to stdin of container
++	if (terminal->pipes[0][1] > 0) {
++		ret = lxc_mainloop_add_handler(terminal->descr, terminal->pipes[0][1],
++		                               lxc_terminal_io_cb, terminal);
++		if (ret) {
++			ERROR("pipe fd %d not added to mainloop", terminal->pipes[0][1]);
++			return -1;
++		}
++	}
++	// parent read data from stdout of container, and send to fifo
++	if (terminal->pipes[1][0] > 0) {
++		ret = lxc_mainloop_add_handler(terminal->descr, terminal->pipes[1][0],
++		                               lxc_terminal_io_cb, terminal);
++		if (ret) {
++			ERROR("pipe fd %d not added to mainloop", terminal->pipes[1][0]);
++			return -1;
++		}
++	}
++	// parent read data from stderr of container, and send to fifo
++	if (terminal->pipes[2][0] > 0) {
++		ret = lxc_mainloop_add_handler(terminal->descr, terminal->pipes[2][0],
++		                               lxc_terminal_io_cb, terminal);
++		if (ret) {
++			ERROR("pipe fd %d not added to mainloop", terminal->pipes[2][0]);
++			return -1;
++		}
++	}
++	return ret;
++}
++
++/* isulad add fifo to mainloop */
++static int lxc_terminal_mainloop_add_fifo(struct lxc_terminal *terminal)
++{
++	int ret = 0;
++	struct lxc_list *it = NULL;
++	struct lxc_list *next = NULL;
++	struct lxc_fifos_fd *elem = NULL;
++
++	lxc_list_for_each_safe(it, &terminal->fifos, next) {
++		elem = it->elem;
++		if (elem->in_fd >= 0) {
++			ret = lxc_mainloop_add_handler(terminal->descr, elem->in_fd,
++			                               lxc_terminal_io_cb, terminal);
++			if (ret) {
++				ERROR("console fifo %s not added to mainloop", elem->in_fifo);
++				return -1;
++			}
++		}
++	}
++	return ret;
++}
++
++int lxc_terminal_mainloop_add(struct lxc_epoll_descr *descr,
++                              struct lxc_terminal *terminal)
++{
++	int ret;
++
++	/* We cache the descr so that we can add an fd to it when someone
++	 * does attach to it in lxc_terminal_allocate().
++	 */
++	terminal->descr = descr;
++
++	ret = lxc_terminal_mainloop_add_peer(terminal);
++	if (ret < 0) {
++		ERROR("Failed to add handler for terminal peer to mainloop");
++		return -1;
++	}
++
++	/* isulad add pipes to mainloop */
++	ret = lxc_terminal_mainloop_add_pipes(terminal);
++	if (ret < 0) {
++		ERROR("Failed to add handler for terminal fifos to mainloop");
++		return -1;
++	}
++
++	/* isulad add fifo to mainloop */
++	ret = lxc_terminal_mainloop_add_fifo(terminal);
++	if (ret < 0) {
++		ERROR("Failed to add handler for terminal fifos to mainloop");
++		return -1;
++	}
++
++	if (terminal->ptmx < 0) {
++		INFO("Terminal is not initialized");
++		return 0;
++	}
++
++	ret = lxc_mainloop_add_handler(descr, terminal->ptmx,
++	                               lxc_terminal_io_cb, terminal);
++	if (ret < 0) {
++		ERROR("Failed to add handler for terminal ptmx fd %d to "
++		      "mainloop", terminal->ptmx);
++		return -1;
++	}
++
++	return 0;
++}
++#else
+ int lxc_terminal_mainloop_add(struct lxc_epoll_descr *descr,
+ 			      struct lxc_terminal *terminal)
+ {
+@@ -426,6 +1066,7 @@ int lxc_terminal_mainloop_add(struct lxc_epoll_descr *descr,
+ 
+ 	return lxc_terminal_mainloop_add_peer(terminal);
+ }
++#endif
+ 
+ int lxc_setup_tios(int fd, struct termios *oldtios)
+ {
+@@ -639,14 +1280,39 @@ void lxc_terminal_free(struct lxc_conf *conf, int fd)
+ 
+ static int lxc_terminal_peer_default(struct lxc_terminal *terminal)
+ {
++#ifdef HAVE_ISULAD
++	struct lxc_terminal_state *ts = NULL;
++	const char *path = NULL;
++#else
+ 	struct lxc_terminal_state *ts;
+ 	const char *path;
++#endif
+ 	int ret = 0;
+ 
+ 	if (terminal->path)
+ 		path = terminal->path;
++
++#ifdef HAVE_ISULAD
++	/* isulad: if no console was given, try current controlling terminal, there
++	 * won't be one if we were started as a daemon (-d)
++	 */
++	if (!path && !access("/dev/tty", F_OK)) {
++		int fd;
++		fd = open("/dev/tty", O_RDWR);
++		if (fd >= 0) {
++			close(fd);
++			path = "/dev/tty";
++		}
++	}
++
++	if (!path) {
++		DEBUG("Not have a controlling terminal");
++		return 0;
++	}
++#else
+ 	else
+ 		path = "/dev/tty";
++#endif
+ 
+ 	terminal->peer = lxc_unpriv(open(path, O_RDWR | O_CLOEXEC));
+ 	if (terminal->peer < 0) {
+@@ -760,6 +1426,35 @@ void lxc_terminal_delete(struct lxc_terminal *terminal)
+ 	if (terminal->log_fd >= 0)
+ 		close(terminal->log_fd);
+ 	terminal->log_fd = -1;
++
++#ifdef HAVE_ISULAD
++        if (is_syslog(terminal->log_driver)) {
++                closelog();
++                free(terminal->log_driver);
++	}
++	/* isulad: close all pipes */
++	if (terminal->pipes[0][0] >= 0)
++		close(terminal->pipes[0][0]);
++	terminal->pipes[0][0] = -1;
++	if (terminal->pipes[0][1] >= 0)
++		close(terminal->pipes[0][1]);
++	terminal->pipes[0][1] = -1;
++	if (terminal->pipes[1][0] >= 0)
++		close(terminal->pipes[1][0]);
++	terminal->pipes[1][0] = -1;
++	if (terminal->pipes[1][1] >= 0)
++		close(terminal->pipes[1][1]);
++	terminal->pipes[1][1] = -1;
++	if (terminal->pipes[2][0] >= 0)
++		close(terminal->pipes[2][0]);
++	terminal->pipes[2][0] = -1;
++	if (terminal->pipes[2][1] >= 0)
++		close(terminal->pipes[2][1]);
++	terminal->pipes[2][1] = -1;
++
++	/* isulad: delete all fifos */
++	lxc_terminal_delete_fifo(-1, &terminal->fifos);
++#endif
+ }
+ 
+ /**
+@@ -828,6 +1523,251 @@ int lxc_terminal_create_log_file(struct lxc_terminal *terminal)
+ 	return 0;
+ }
+ 
++#ifdef HAVE_ISULAD
++/* isulad: fd_nonblock */
++static int fd_nonblock(int fd)
++{
++	int flags;
++
++	flags = fcntl(fd, F_GETFL);
++
++	return fcntl(fd, F_SETFL, (int)((unsigned int)flags | O_NONBLOCK));
++}
++
++static int terminal_fifo_open(const char *fifo_path, int flags)
++{
++	int fd = -1;
++
++	fd = lxc_open(fifo_path, flags, 0);
++	if (fd < 0) {
++		WARN("Failed to open fifo %s to send message: %s.", fifo_path,
++		     strerror(errno));
++		return -1;
++	}
++
++	return fd;
++}
++
++bool fifo_exists(const char *path)
++{
++	struct stat sb;
++	int ret;
++
++	ret = stat(path, &sb);
++	if (ret < 0)
++		// could be something other than eexist, just say no
++		return false;
++	return S_ISFIFO(sb.st_mode);
++}
++
++/* isulad: set terminal fifos */
++static int lxc_terminal_set_fifo(struct lxc_terminal *console, const char *in, const char *out, const char *err, int *input_fd)
++{
++	int fifofd_in = -1, fifofd_out = -1, fifofd_err = -1;
++	struct lxc_fifos_fd *fifo_elem = NULL;
++
++	if ((in && !fifo_exists(in)) || (out && !fifo_exists(out)) || (err && !fifo_exists(err))) {
++		ERROR("File %s or %s or %s does not refer to a FIFO", in, out, err);
++		return -1;
++	}
++
++	if (in) {
++		fifofd_in = terminal_fifo_open(in, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++		if (fifofd_in < 0) {
++			SYSERROR("Failed to open FIFO: %s", in);
++			return -1;
++		}
++	}
++
++	if (out) {
++		fifofd_out = terminal_fifo_open(out, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
++		if (fifofd_out < 0) {
++			SYSERROR("Failed to open FIFO: %s", out);
++			if (fifofd_in >= 0)
++				close(fifofd_in);
++			return -1;
++		}
++	}
++
++	if (err) {
++		fifofd_err = terminal_fifo_open(err, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
++		if (fifofd_err < 0) {
++			SYSERROR("Failed to open FIFO: %s", err);
++			if (fifofd_in >= 0)
++				close(fifofd_in);
++			if (fifofd_out >= 0)
++				close(fifofd_out);
++			return -1;
++		}
++	}
++
++	fifo_elem = malloc(sizeof(*fifo_elem));
++	if (fifo_elem == NULL) {
++		if (fifofd_in >= 0)
++			close(fifofd_in);
++		if (fifofd_out >= 0)
++			close(fifofd_out);
++		if (fifofd_err >= 0)
++			close(fifofd_err);
++		return -1;
++	}
++	memset(fifo_elem, 0, sizeof(*fifo_elem));
++
++	fifo_elem->in_fifo = safe_strdup(in ? in : "");
++	fifo_elem->out_fifo = safe_strdup(out ? out : "");
++	fifo_elem->err_fifo = safe_strdup(err ? err : "");
++	fifo_elem->in_fd = fifofd_in;
++	fifo_elem->out_fd = fifofd_out;
++	fifo_elem->err_fd = fifofd_err;
++	lxc_list_add_elem(&fifo_elem->node, fifo_elem);
++	lxc_list_add_tail(&console->fifos, &fifo_elem->node);
++
++	if (input_fd)
++		*input_fd = fifofd_in;
++
++	return 0;
++}
++
++/* isulad: add default fifos */
++static int lxc_terminal_fifo_default(struct lxc_terminal *terminal)
++{
++	if (terminal->init_fifo[0] || terminal->init_fifo[1] || terminal->init_fifo[2])
++		return lxc_terminal_set_fifo(terminal, terminal->init_fifo[0], terminal->init_fifo[1], terminal->init_fifo[2], NULL);
++	return 0;
++}
++
++int lxc_terminal_create(struct lxc_terminal *terminal)
++{
++	int ret;
++
++	if (!terminal->disable_pty) {
++		ret = openpty(&terminal->ptmx, &terminal->pts, NULL, NULL, NULL);
++		if (ret < 0) {
++			SYSERROR("Failed to open terminal");
++			return -1;
++		}
++
++		ret = ttyname_r(terminal->pts, terminal->name, sizeof(terminal->name));
++		if (ret < 0) {
++			SYSERROR("Failed to retrieve name of terminal pts");
++			goto err;
++		}
++
++		ret = fd_cloexec(terminal->ptmx, true);
++		if (ret < 0) {
++			SYSERROR("Failed to set FD_CLOEXEC flag on terminal ptmx");
++			goto err;
++		}
++
++		/* isulad: make ptmx NONBLOCK */
++		ret = fd_nonblock(terminal->ptmx);
++		if (ret < 0) {
++			SYSERROR("Failed to set O_NONBLOCK flag on terminal ptmx");
++			goto err;
++		}
++
++		ret = fd_cloexec(terminal->pts, true);
++		if (ret < 0) {
++			SYSERROR("Failed to set FD_CLOEXEC flag on terminal pts");
++			goto err;
++		}
++
++		ret = lxc_terminal_peer_default(terminal);
++		if (ret < 0) {
++			ERROR("Failed to allocate proxy terminal");
++			goto err;
++		}
++	} else {
++		/* isulad: create 3 pipes */
++		/* for stdin */
++		if (pipe2(terminal->pipes[0], O_CLOEXEC)) {
++			ERROR("Failed to create stdin pipe");
++			goto err;
++		}
++
++		/* for stdout */
++		if (pipe2(terminal->pipes[1], O_CLOEXEC)) {
++			ERROR("Failed to create stdout pipe");
++			goto err;
++		}
++		/* for stderr */
++		if (pipe2(terminal->pipes[2], O_CLOEXEC)) {
++			ERROR("Failed to create stderr pipe");
++			goto err;
++		}
++	}
++
++	/* isulad: open fifos */
++	ret = lxc_terminal_fifo_default(terminal);
++	if (ret < 0) {
++		ERROR("Failed to allocate fifo terminal");
++		goto err;
++	}
++
++	return 0;
++
++err:
++	lxc_terminal_delete(terminal);
++	return -ENODEV;
++}
++
++/* isulad: add fifos dynamic*/
++int lxc_terminal_add_fifos(struct lxc_conf *conf, const char *fifonames)
++{
++	int ret = 0;
++	struct lxc_terminal *terminal = &conf->console;
++	int fifofd_in = -1;
++	char *tmp = NULL, *saveptr = NULL, *in = NULL, *out = NULL, *err = NULL;
++	const char *none_fifo_name = "none";
++
++	tmp = safe_strdup(fifonames);
++
++	in = strtok_r(tmp, "&&&&", &saveptr);
++	if (!in) {
++		ret = -1;
++		goto free_out;
++	}
++	if (strcmp(in, none_fifo_name) == 0)
++		in = NULL;
++
++	out = strtok_r(NULL, "&&&&",  &saveptr);
++	if (!out) {
++		ret = -1;
++		goto free_out;
++	}
++	if (strcmp(out, none_fifo_name) == 0)
++		out = NULL;
++
++	err = strtok_r(NULL, "&&&&",  &saveptr);
++	if (!err) {
++		ret = -1;
++		goto free_out;
++	}
++	if (strcmp(err, none_fifo_name) == 0)
++		err = NULL;
++
++	ret = lxc_terminal_set_fifo(terminal, in, out, err, &fifofd_in);
++	if (ret < 0) {
++		ERROR("Faild to set fifos to console config");
++		ret = -1;
++		goto free_out;
++	}
++
++	if (lxc_mainloop_add_handler(terminal->descr, fifofd_in,
++	                             lxc_terminal_io_cb, terminal)) {
++		ERROR("console fifo not added to mainloop");
++		lxc_terminal_delete_fifo(fifofd_in, &terminal->fifos);
++		ret = -1;
++		goto free_out;
++	}
++
++free_out:
++	if (tmp)
++		free(tmp);
++	return ret;
++}
++
++#else
+ int lxc_terminal_create(struct lxc_terminal *terminal)
+ {
+ 	int ret;
+@@ -868,6 +1808,7 @@ err:
+ 	lxc_terminal_delete(terminal);
+ 	return -ENODEV;
+ }
++#endif
+ 
+ int lxc_terminal_setup(struct lxc_conf *conf)
+ {
+@@ -883,6 +1824,18 @@ int lxc_terminal_setup(struct lxc_conf *conf)
+ 	if (ret < 0)
+ 		return -1;
+ 
++#ifdef HAVE_ISULAD
++        if (is_syslog(terminal->log_driver)) {
++                if (terminal->log_syslog_tag == NULL) {
++                        terminal->log_syslog_tag = malloc(16 * sizeof(char));
++                        (void)strlcpy(terminal->log_syslog_tag, conf->name, 16);
++                }
++                if (terminal->log_syslog_facility <= 0) {
++                        terminal->log_syslog_facility = LOG_DAEMON;
++                }
++                openlog(terminal->log_syslog_tag, LOG_PID, terminal->log_syslog_facility);
++        }
++#endif
+ 	ret = lxc_terminal_create_log_file(terminal);
+ 	if (ret < 0)
+ 		goto err;
+@@ -1120,9 +2073,15 @@ int lxc_terminal_prepare_login(int fd)
+ 	if (ret < 0)
+ 		return -1;
+ 
++#ifdef HAVE_ISULAD
++	ret = set_stdfds(fd);
++	if (ret < 0)
++		return -1;
++#else
+ 	ret = lxc_terminal_set_stdfds(fd);
+ 	if (ret < 0)
+ 		return -1;
++#endif
+ 
+ 	if (fd > STDERR_FILENO)
+ 		close(fd);
+@@ -1146,6 +2105,18 @@ void lxc_terminal_init(struct lxc_terminal *terminal)
+ 	terminal->peer = -EBADF;
+ 	terminal->log_fd = -EBADF;
+ 	lxc_terminal_info_init(&terminal->proxy);
++#ifdef HAVE_ISULAD
++	terminal->init_fifo[0] = NULL;
++	terminal->init_fifo[1] = NULL;
++	terminal->init_fifo[2] = NULL;
++	terminal->pipes[0][0] = -1;
++	terminal->pipes[0][1] = -1;
++	terminal->pipes[1][0] = -1;
++	terminal->pipes[1][1] = -1;
++	terminal->pipes[2][0] = -1;
++	terminal->pipes[2][1] = -1;
++	lxc_list_init(&terminal->fifos);
++#endif
+ }
+ 
+ void lxc_terminal_conf_free(struct lxc_terminal *terminal)
+@@ -1155,6 +2126,15 @@ void lxc_terminal_conf_free(struct lxc_terminal *terminal)
+ 	if (terminal->buffer_size > 0 && terminal->ringbuf.addr)
+ 		lxc_ringbuf_release(&terminal->ringbuf);
+ 	lxc_terminal_signal_fini(terminal);
++#ifdef HAVE_ISULAD
++	/*isulad: free console fifos */
++	free(terminal->init_fifo[0]);
++	free(terminal->init_fifo[1]);
++	free(terminal->init_fifo[2]);
++	lxc_terminal_delete_fifo(-1, &terminal->fifos);
++	free(terminal->log_driver);
++	free(terminal->log_syslog_tag);
++#endif
+ }
+ 
+ int lxc_terminal_map_ids(struct lxc_conf *c, struct lxc_terminal *terminal)
+@@ -1167,6 +2147,15 @@ int lxc_terminal_map_ids(struct lxc_conf *c, struct lxc_terminal *terminal)
+ 	if (strcmp(terminal->name, "") == 0)
+ 		return 0;
+ 
++#ifdef HAVE_ISULAD
++	ret = chown_mapped_root(terminal->name, c);
++	if (ret < 0) {
++		ERROR("Failed to chown terminal \"%s\"", terminal->name);
++		return -1;
++	}
++
++	TRACE("Chowned terminal \"%s\"", terminal->name);
++#else
+ 	ret = userns_exec_mapped_root(terminal->name, terminal->pts, c);
+ 	if (ret < 0) {
+ 		return log_error(-1, "Failed to chown terminal %d(%s)",
+@@ -1174,6 +2163,7 @@ int lxc_terminal_map_ids(struct lxc_conf *c, struct lxc_terminal *terminal)
+ 	}
+ 
+ 	TRACE("Chowned terminal %d(%s)", terminal->pts, terminal->name);
++#endif
+ 
+ 	return 0;
+ }
+diff --git a/src/tests/Makefile.am b/src/tests/Makefile.am
+index 11bba26..03bf439 100644
+--- a/src/tests/Makefile.am
++++ b/src/tests/Makefile.am
+@@ -58,6 +58,10 @@ AM_CFLAGS=-DLXCROOTFSMOUNT=\"$(LXCROOTFSMOUNT)\" \
+ 	  -I $(top_srcdir)/src/lxc/tools \
+ 	  -pthread
+ 
++if HAVE_ISULAD
++AM_CFLAGS += -I $(top_srcdir)/src/lxc/json
++endif
++
+ if ENABLE_APPARMOR
+ AM_CFLAGS += -DHAVE_APPARMOR
+ endif
+diff --git a/src/tests/attach.c b/src/tests/attach.c
+index 07e641d..f36caac 100644
+--- a/src/tests/attach.c
++++ b/src/tests/attach.c
+@@ -29,6 +29,9 @@
+ #include "lxctest.h"
+ #include "utils.h"
+ #include "lsm/lsm.h"
++#ifdef HAVE_ISULAD
++#include "config.h"
++#endif
+ 
+ #include <lxc/lxccontainer.h>
+ 
+@@ -76,7 +79,11 @@ static void test_attach_lsm_set_config(struct lxc_container *ct)
+ 	ct->save_config(ct, NULL);
+ }
+ 
++#ifdef HAVE_ISULAD
++static int test_attach_lsm_func_func(void* payload, int fd)
++#else
+ static int test_attach_lsm_func_func(void* payload)
++#endif
+ {
+ 	TSTOUT("%s", lsm_process_label_get(syscall(SYS_getpid)));
+ 	return 0;
+@@ -187,7 +194,11 @@ static int  test_attach_lsm_func(struct lxc_container *ct) { return 0; }
+ static int  test_attach_lsm_cmd(struct lxc_container *ct) { return 0; }
+ #endif /* HAVE_APPARMOR || HAVE_SELINUX */
+ 
++#ifdef HAVE_ISULAD
++static int test_attach_func_func(void* payload, int fd)
++#else
+ static int test_attach_func_func(void* payload)
++#endif
+ {
+ 	TSTOUT("%d", (int)syscall(SYS_getpid));
+ 	return 0;
+-- 
+2.25.1
+

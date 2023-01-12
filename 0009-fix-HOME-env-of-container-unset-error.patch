@@ -1,0 +1,316 @@
+From 043b2483585a2d8168e0fde8b37054733a31f263 Mon Sep 17 00:00:00 2001
+From: haozi007 <liuhao27@huawei.com>
+Date: Mon, 25 Jul 2022 15:36:23 +0800
+Subject: [PATCH] fix HOME env of container unset error
+
+Signed-off-by: haozi007 <liuhao27@huawei.com>
+---
+ src/lxc/isulad_utils.c | 210 ++++++++++++++++++++++++++++++++++++++++-
+ src/lxc/isulad_utils.h |   3 +
+ src/lxc/start.c        |  14 +--
+ 3 files changed, 216 insertions(+), 11 deletions(-)
+
+diff --git a/src/lxc/isulad_utils.c b/src/lxc/isulad_utils.c
+index 15d9323..cd7fca8 100644
+--- a/src/lxc/isulad_utils.c
++++ b/src/lxc/isulad_utils.c
+@@ -6,6 +6,10 @@
+  * Create: 2020-04-11
+ ******************************************************************************/
+ 
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE 1
++#endif
++
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/types.h>
+@@ -13,6 +17,10 @@
+ #include <fcntl.h>
+ #include <pwd.h>
+ #include <ctype.h>
++#include <stdio.h>
++#include <unistd.h>
++#include <errno.h>
++#include <stdio_ext.h>
+ 
+ #include "isulad_utils.h"
+ #include "log.h"
+@@ -244,20 +252,34 @@ out:
+ // isulad: set env home in container
+ int lxc_setup_env_home(uid_t uid)
+ {
++#define __PASSWD_FILE__ "/etc/passwd"
+ 	char *homedir = "/"; // default home dir is /
++	FILE *stream = NULL;
+ 	struct passwd pw, *pwbufp = NULL;
+ 	char buf[BUFSIZ];
+-	int ret;
+ 
+-	ret = getpwuid_r(uid, &pw, buf, sizeof(buf), &pwbufp);
+-	if ((ret == 0) && (pwbufp != NULL) && (pwbufp->pw_uid == uid)) {
+-		homedir = pwbufp->pw_dir;
++	stream = fopen_cloexec(__PASSWD_FILE__, "r");
++	if (stream == NULL) {
++		SYSWARN("Failed to open %s", __PASSWD_FILE__);
+ 		goto set_env;
+ 	}
+ 
++#if IS_BIONIC
++	while (util_getpwent_r(stream, &pw, buf, sizeof(buf), &pwbufp) == 0 && pwbufp != NULL) {
++#else
++	while (fgetpwent_r(stream, &pw, buf, sizeof(buf), &pwbufp) == 0 && pwbufp != NULL) {
++#endif
++		if (pwbufp->pw_uid == uid) {
++			homedir = pwbufp->pw_dir;
++			goto set_env;
++		}
++	}
+ 	WARN("User invalid, can not find user '%u'", uid);
+ 
+ set_env:
++	if (stream)
++		fclose(stream);
++
+ 	// if we didn't configure HOME, set it based on uid
+ 	if (setenv("HOME", homedir, 0) < 0) {
+ 		SYSERROR("Unable to set env 'HOME'");
+@@ -317,3 +339,183 @@ bool is_non_negative_num(const char *s)
+ 	}
+ 	return true;
+ }
++
++static int hold_int(const char delim, bool required, char **src, unsigned int *dst)
++{
++    unsigned long long int res = 0;
++    char *err_str = NULL;
++
++    // ensure *src not a empty string
++    if (**src == '\0') {
++        ERROR("Empty subject on given entrie is not allowed.");
++        return -1;
++    }
++
++    errno = 0;
++    // covert string to long long
++    res = strtoull(*src, &err_str, 0);
++    if (errno != 0 && errno != ERANGE) {
++        ERROR("Parse int from string failed.");
++        return -1;
++    }
++
++    // **src is not a digit
++    if (err_str == *src) {
++        if (!required) {
++            ERROR("Integer part is missing.");
++            return -1;
++        }
++        // if required, just set 0
++        *dst = 0;
++    } else {
++        if (sizeof(void *) > 4 && res > UINT_MAX) { // make sure 64-bit platform behave same as 32-bit
++            res = UINT_MAX;
++        }
++        res = res & UINT_MAX;
++        *dst = (uint32_t)res;
++    }
++
++    // normal case
++    if (*err_str == delim) {
++        err_str++;
++    } else if (*err_str != '\0') {
++        ERROR("Invalid digit string.");
++        return -1;
++    }
++
++    *src = err_str; // update src to next valid context in line.
++    return 0;
++}
++
++static void hold_string(const char delim, char **src, char **dst)
++{
++    for (*dst = *src; **src != delim; ++(*src)) {
++        if (**src == '\0') {
++            break;
++        }
++    }
++
++    if (**src == delim) {
++        **src = '\0';
++        ++(*src);
++    }
++}
++
++static int parse_line_pw(const char delim, char *line, struct passwd *result)
++{
++    int ret = 0;
++    bool required = false;
++    char *walker = NULL;
++
++    walker = strpbrk(line, "\n");
++    if (walker != NULL) {
++        // clear newline char
++        *walker = '\0';
++    }
++
++    hold_string(delim, &line, &result->pw_name);
++
++    required = (result->pw_name[0] == '+' || result->pw_name[0] == '-') ? true : false;
++
++    hold_string(delim, &line, &result->pw_passwd);
++
++    ret = hold_int(delim, required, &line, &result->pw_uid);
++    if (ret != 0) {
++        // a legitimate line must have uid
++        ERROR("Parse uid error.");
++        return ret;
++    }
++
++    ret = hold_int(delim, required, &line, &result->pw_gid);
++    if (ret != 0) {
++        // it's ok to not provide gid
++        ERROR("Parse gid error.");
++        return ret;
++    }
++
++    hold_string(delim, &line, &result->pw_gecos);
++
++    hold_string(delim, &line, &result->pw_dir);
++
++    result->pw_shell = line;
++    return 0;
++}
++
++char *util_left_trim_space(char *str)
++{
++    char *begin = str;
++    char *tmp = str;
++    while (isspace(*begin)) {
++        begin++;
++    }
++    while ((*tmp++ = *begin++)) {
++    }
++    return str;
++}
++
++int util_getpwent_r(FILE *stream, struct passwd *resbuf, char *buffer, size_t buflen, struct passwd **result)
++{
++    const char delim = ':';
++    char *buff_end = NULL;
++    char *walker = NULL;
++    bool got = false;
++    int ret = 0;
++
++    if (stream == NULL || resbuf == NULL || buffer == NULL || result == NULL) {
++        ERROR("Password obj, params is NULL.");
++        return -1;
++    }
++
++    if (buflen <= 1) {
++        ERROR("Inadequate buffer length was given.");
++        return -1;
++    }
++
++    buff_end = buffer + buflen - 1;
++    flockfile(stream);
++
++    while (1) {
++        *buff_end = '\xff';
++        walker = fgets_unlocked(buffer, buflen, stream);
++        // if get NULL string
++        if (walker == NULL) {
++            *result = NULL;
++            // reach end of file, return error
++            if (feof(stream)) {
++                ret = ENOENT;
++                goto out;
++            }
++            // overflow buffer
++            ret = ERANGE;
++            goto out;
++        }
++        // just overflow last char in buffer
++        if (*buff_end != '\xff') {
++            *result = NULL;
++            ret = ERANGE;
++            goto out;
++        }
++
++        (void)util_left_trim_space(buffer);
++        // skip comment line and empty line
++        if (walker[0] == '#' || walker[0] == '\0') {
++            continue;
++        }
++
++        if (parse_line_pw(delim, walker, resbuf) == 0) {
++            got = true;
++            break;
++        }
++    }
++    if (!got) {
++        *result = NULL;
++        ret = ERANGE;
++        goto out;
++    }
++
++    *result = resbuf;
++    ret = 0;
++out:
++    funlockfile(stream);
++    return ret;
++}
+\ No newline at end of file
+diff --git a/src/lxc/isulad_utils.h b/src/lxc/isulad_utils.h
+index 345f511..7a5eb89 100644
+--- a/src/lxc/isulad_utils.h
++++ b/src/lxc/isulad_utils.h
+@@ -10,6 +10,7 @@
+ 
+ #include <stdio.h>
+ #include <stdbool.h>
++#include <pwd.h>
+ 
+ /* isulad: replace space with SPACE_MAGIC_STR */
+ #define SPACE_MAGIC_STR "[#)"
+@@ -96,4 +97,6 @@ extern bool lxc_process_alive(pid_t pid, unsigned long long start_time);
+ 
+ extern bool is_non_negative_num(const char *s);
+ 
++int util_getpwent_r(FILE *stream, struct passwd *resbuf, char *buffer, size_t buflen, struct passwd **result);
++
+ #endif
+diff --git a/src/lxc/start.c b/src/lxc/start.c
+index f82df34..6fe1203 100644
+--- a/src/lxc/start.c
++++ b/src/lxc/start.c
+@@ -1727,6 +1727,13 @@ static int do_start(void *data)
+ 	new_uid = handler->conf->init_uid;
+ 	new_gid = handler->conf->init_gid;
+ 
++#ifdef HAVE_ISULAD
++	// isulad: set env home in container, must before "Avoid unnecessary syscalls."
++	if (lxc_setup_env_home(new_uid) < 0) {
++		goto out_warn_father;
++	}
++#endif
++
+ 	/* Avoid unnecessary syscalls. */
+ 	if (new_uid == nsuid)
+ 		new_uid = LXC_INVALID_UID;
+@@ -1734,13 +1741,6 @@ static int do_start(void *data)
+ 	if (new_gid == nsgid)
+ 		new_gid = LXC_INVALID_GID;
+ 
+-#ifdef HAVE_ISULAD
+-	// isulad: set env home in container
+-	if (lxc_setup_env_home(new_uid) < 0) {
+-		goto out_warn_father;
+-	}
+-#endif
+-
+ 	/* Make sure that the processes STDIO is correctly owned by the user that we are switching to */
+ 	ret = fix_stdio_permissions(new_uid);
+ 	if (ret)
+-- 
+2.25.1
+

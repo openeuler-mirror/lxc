@@ -1,0 +1,50 @@
+From 7273c6631f692872384cce83cc04b4084ee98f73 Mon Sep 17 00:00:00 2001
+From: haozi007 <liuhao27@huawei.com>
+Date: Tue, 9 Aug 2022 17:30:59 +0800
+Subject: [PATCH] only set user or image set non-empty HOME
+
+Signed-off-by: haozi007 <liuhao27@huawei.com>
+---
+ src/lxc/isulad_utils.c | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/src/lxc/isulad_utils.c b/src/lxc/isulad_utils.c
+index cd7fca8..067e1c9 100644
+--- a/src/lxc/isulad_utils.c
++++ b/src/lxc/isulad_utils.c
+@@ -257,6 +257,13 @@ int lxc_setup_env_home(uid_t uid)
+ 	FILE *stream = NULL;
+ 	struct passwd pw, *pwbufp = NULL;
+ 	char buf[BUFSIZ];
++	const char *curr_home = NULL;
++
++	curr_home = getenv("HOME");
++	// if user set or image set, just use it.
++	if (curr_home != NULL && strcmp(curr_home, "") != 0) {
++		return 0;
++	}
+ 
+ 	stream = fopen_cloexec(__PASSWD_FILE__, "r");
+ 	if (stream == NULL) {
+@@ -280,8 +287,9 @@ set_env:
+ 	if (stream)
+ 		fclose(stream);
+ 
+-	// if we didn't configure HOME, set it based on uid
+-	if (setenv("HOME", homedir, 0) < 0) {
++	// if we didn't configure HOME, set it based on uid;
++	// override it if reach here.
++	if (setenv("HOME", homedir, 1) < 0) {
+ 		SYSERROR("Unable to set env 'HOME'");
+ 		return -1;
+ 	}
+@@ -518,4 +526,4 @@ int util_getpwent_r(FILE *stream, struct passwd *resbuf, char *buffer, size_t bu
+ out:
+     funlockfile(stream);
+     return ret;
+-}
+\ No newline at end of file
++}
+-- 
+2.25.1
+

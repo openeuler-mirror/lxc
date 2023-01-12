@@ -1,0 +1,29 @@
+From bcc3084c9230486c3a7d40cff633d581f6a1a990 Mon Sep 17 00:00:00 2001
+From: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+Date: Tue, 26 Jul 2022 14:27:11 +0800
+Subject: [PATCH] drop security_context_t
+
+Signed-off-by: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+---
+ src/lxc/lsm/selinux.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/lxc/lsm/selinux.c b/src/lxc/lsm/selinux.c
+index bd4f449..c24d238 100644
+--- a/src/lxc/lsm/selinux.c
++++ b/src/lxc/lsm/selinux.c
+@@ -36,7 +36,11 @@ lxc_log_define(selinux, lsm);
+  */
+ static char *selinux_process_label_get(pid_t pid)
+ {
++#ifdef HAVE_ISULAD
++	char *ctx;
++#else
+ 	security_context_t ctx;
++#endif
+ 	char *label;
+ 
+ 	if (getpidcon_raw(pid, &ctx) < 0) {
+-- 
+2.25.1
+

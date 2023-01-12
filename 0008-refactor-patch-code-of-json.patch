@@ -1,1301 +1,42 @@
-From 4592fbcbd0be862cf37a3090f58a4491c430e71a Mon Sep 17 00:00:00 2001
-From: lifeng68 <lifeng68@huawei.com>
-Date: Mon, 2 Nov 2020 16:53:19 +0800
-Subject: [PATCH 09/10] cgroup: refact cgroup manager to single file
+From 4c68aefb92800112f48aa73a55f80b368b09c69f Mon Sep 17 00:00:00 2001
+From: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+Date: Wed, 20 Jul 2022 11:00:13 +0800
+Subject: [PATCH] refactor patch code of json
 
-Signed-off-by: lifeng68 <lifeng68@huawei.com>
+Signed-off-by: zhangxiaoyu <zhangxiaoyu58@huawei.com>
 ---
- src/lxc/Makefile.am             |    5 +-
- src/lxc/cgroups/cgfsng.c        | 1030 +---------
- src/lxc/cgroups/isulad_cgfsng.c | 3115 +++++++++++++++++++++++++++++++
- 3 files changed, 3147 insertions(+), 1003 deletions(-)
+ src/lxc/cgroups/isulad_cgfsng.c  | 3223 ++++++++++++++++++++++++++++++
+ src/lxc/json/defs.c              |  205 ++
+ src/lxc/json/defs.h              |   37 +
+ src/lxc/json/json_common.c       | 1153 +++++++++++
+ src/lxc/json/json_common.h       |  185 ++
+ src/lxc/json/logger_json_file.c  |  246 +++
+ src/lxc/json/logger_json_file.h  |   45 +
+ src/lxc/json/oci_runtime_hooks.c |   52 +
+ src/lxc/json/oci_runtime_hooks.h |   15 +
+ src/lxc/json/oci_runtime_spec.c  |  195 ++
+ src/lxc/json/oci_runtime_spec.h  |   37 +
+ src/lxc/json/read-file.h         |   11 +
+ 12 files changed, 5404 insertions(+)
  create mode 100644 src/lxc/cgroups/isulad_cgfsng.c
+ create mode 100644 src/lxc/json/defs.c
+ create mode 100644 src/lxc/json/defs.h
+ create mode 100755 src/lxc/json/json_common.c
+ create mode 100755 src/lxc/json/json_common.h
+ create mode 100644 src/lxc/json/logger_json_file.c
+ create mode 100644 src/lxc/json/logger_json_file.h
+ create mode 100644 src/lxc/json/oci_runtime_hooks.c
+ create mode 100644 src/lxc/json/oci_runtime_hooks.h
+ create mode 100644 src/lxc/json/oci_runtime_spec.c
+ create mode 100644 src/lxc/json/oci_runtime_spec.h
+ create mode 100644 src/lxc/json/read-file.h
 
-diff --git a/src/lxc/Makefile.am b/src/lxc/Makefile.am
-index 0e1ba8da9..dc49c7e22 100644
---- a/src/lxc/Makefile.am
-+++ b/src/lxc/Makefile.am
-@@ -107,7 +107,6 @@ liblxc_la_SOURCES = af_unix.c af_unix.h \
- 		    api_extensions.h \
- 		    attach.c attach.h \
- 		    caps.c caps.h \
--		    cgroups/cgfsng.c \
- 		    cgroups/cgroup.c cgroups/cgroup.h \
- 		    cgroups/cgroup2_devices.c cgroups/cgroup2_devices.h \
- 		    cgroups/cgroup_utils.c cgroups/cgroup_utils.h \
-@@ -174,7 +173,11 @@ liblxc_la_SOURCES += isulad_utils.c isulad_utils.h \
- 			json/logger_json_file.c json/logger_json_file.h \
- 			json/oci_runtime_spec.c json/oci_runtime_spec.h \
- 			json/read-file.c json/read-file.h \
-+			cgroups/isulad_cgfsng.c \
- 			exec_commands.c exec_commands.h
-+
-+else
-+liblxc_la_SOURCES += cgroups/cgfsng.c
- endif
- 
- if IS_BIONIC
-diff --git a/src/lxc/cgroups/cgfsng.c b/src/lxc/cgroups/cgfsng.c
-index 1ff3d9812..9b9aaf6c3 100644
---- a/src/lxc/cgroups/cgfsng.c
-+++ b/src/lxc/cgroups/cgfsng.c
-@@ -214,7 +214,6 @@ static char *read_file(const char *fnam)
- 	return move_ptr(buf);
- }
- 
--#ifndef HAVE_ISULAD
- /* Taken over modified from the kernel sources. */
- #define NBITS 32 /* bits in uint32_t */
- #define DIV_ROUND_UP(n, d) (((n) + (d)-1) / (d))
-@@ -477,14 +476,13 @@ static bool copy_parent_file(const char *parent_cgroup,
- 				       value, child_cgroup, file);
- 	return true;
- }
--#endif
-+
- 
- static inline bool is_unified_hierarchy(const struct hierarchy *h)
- {
- 	return h->version == CGROUP2_SUPER_MAGIC;
- }
- 
--#ifndef HAVE_ISULAD
- /*
-  * Initialize the cpuset hierarchy in first directory of @cgroup_leaf and set
-  * cgroup.clone_children so that children inherit settings. Since the
-@@ -564,7 +562,6 @@ static int cg_legacy_handle_cpuset_hierarchy(struct hierarchy *h,
- 
- 	return fret;
- }
--#endif
- 
- /* Given two null-terminated lists of strings, return true if any string is in
-  * both.
-@@ -958,107 +955,6 @@ struct generic_userns_exec_data {
- 	char *path;
- };
- 
--#ifdef HAVE_ISULAD
--
--static int isulad_cgroup_tree_remove(struct hierarchy **hierarchies,
--			const char *container_cgroup)
--{
--	if (!container_cgroup || !hierarchies)
--		return 0;
--
--	for (int i = 0; hierarchies[i]; i++) {
--		struct hierarchy *h = hierarchies[i];
--		int ret;
--
--		if (!h->container_full_path) {
--			h->container_full_path = must_make_path(h->mountpoint, h->container_base_path, container_cgroup, NULL);
--		}
--
--		ret = lxc_rm_rf(h->container_full_path);
--		if (ret < 0) {
--			SYSERROR("Failed to destroy \"%s\"", h->container_full_path);
--			return -1;
--		}
--
--		free_disarm(h->container_full_path);
--	}
--
--	return 0;
--}
--
--static int isulad_cgroup_tree_remove_wrapper(void *data)
--{
--	struct generic_userns_exec_data *arg = data;
--	uid_t nsuid = (arg->conf->root_nsuid_map != NULL) ? 0 : arg->conf->init_uid;
--	gid_t nsgid = (arg->conf->root_nsgid_map != NULL) ? 0 : arg->conf->init_gid;
--	int ret;
--
--	if (!lxc_setgroups(0, NULL) && errno != EPERM)
--		return log_error_errno(-1, errno, "Failed to setgroups(0, NULL)");
--
--	ret = setresgid(nsgid, nsgid, nsgid);
--	if (ret < 0)
--		return log_error_errno(-1, errno, "Failed to setresgid(%d, %d, %d)",
--				       (int)nsgid, (int)nsgid, (int)nsgid);
--
--	ret = setresuid(nsuid, nsuid, nsuid);
--	if (ret < 0)
--		return log_error_errno(-1, errno, "Failed to setresuid(%d, %d, %d)",
--				       (int)nsuid, (int)nsuid, (int)nsuid);
--
--	return isulad_cgroup_tree_remove(arg->hierarchies, arg->container_cgroup);
--}
--
--__cgfsng_ops static bool isulad_cgfsng_payload_destroy(struct cgroup_ops *ops,
--						struct lxc_handler *handler)
--{
--	int ret;
--
--	if (!ops) {
--		ERROR("Called with uninitialized cgroup operations");
--		return false;
--	}
--
--	if (!ops->hierarchies) {
--		return false;
--	}
--
--	if (!handler) {
--		ERROR("Called with uninitialized handler");
--		return false;
--	}
--
--	if (!handler->conf) {
--		ERROR("Called with uninitialized conf");
--		return false;
--	}
--
--#ifdef HAVE_STRUCT_BPF_CGROUP_DEV_CTX
--	ret = bpf_program_cgroup_detach(handler->conf->cgroup2_devices);
--	if (ret < 0)
--		WARN("Failed to detach bpf program from cgroup");
--#endif
--
--	if (handler->conf && !lxc_list_empty(&handler->conf->id_map)) {
--		struct generic_userns_exec_data wrap = {
--			.conf			= handler->conf,
--			.container_cgroup	= ops->container_cgroup,
--			.hierarchies		= ops->hierarchies,
--			.origuid		= 0,
--		};
--		ret = userns_exec_1(handler->conf, isulad_cgroup_tree_remove_wrapper,
--				    &wrap, "cgroup_tree_remove_wrapper");
--	} else {
--		ret = isulad_cgroup_tree_remove(ops->hierarchies, ops->container_cgroup);
--	}
--	if (ret < 0) {
--		SYSWARN("Failed to destroy cgroups");
--		return false;
--	}
--
--	return true;
--}
--#else
- static int cgroup_tree_remove(struct hierarchy **hierarchies,
- 			const char *container_cgroup)
- {
-@@ -1149,15 +1045,7 @@ __cgfsng_ops static void cgfsng_payload_destroy(struct cgroup_ops *ops,
- 	if (ret < 0)
- 		SYSWARN("Failed to destroy cgroups");
- }
--#endif
- 
--#ifdef HAVE_ISULAD
--__cgfsng_ops static void cgfsng_monitor_destroy(struct cgroup_ops *ops,
--						struct lxc_handler *handler)
--{
--	return;
--}
--#else
- __cgfsng_ops static void cgfsng_monitor_destroy(struct cgroup_ops *ops,
- 						struct lxc_handler *handler)
- {
-@@ -1230,15 +1118,6 @@ try_lxc_rm_rf:
- 			WARN("Failed to destroy \"%s\"", h->monitor_full_path);
- 	}
- }
--#endif
--
--#ifdef HAVE_ISULAD
--__cgfsng_ops static inline bool cgfsng_monitor_create(struct cgroup_ops *ops,
--						      struct lxc_handler *handler)
--{
--	return true;
--}
--#else
- 
- static int mkdir_eexist_on_last(const char *dir, mode_t mode)
- {
-@@ -1398,227 +1277,7 @@ __cgfsng_ops static inline bool cgfsng_monitor_create(struct cgroup_ops *ops,
- 	ops->monitor_cgroup = move_ptr(monitor_cgroup);
- 	return log_info(true, "The monitor process uses \"%s\" as cgroup", ops->monitor_cgroup);
- }
--#endif
--
--#ifdef HAVE_ISULAD
--
--static bool isulad_copy_parent_file(char *path, char *file)
--{
--	int ret;
--	int len = 0;
--	char *value = NULL;
--	char *current = NULL;
--	char *fpath = NULL;
--	char *lastslash = NULL;
--	char oldv;
--
--	fpath = must_make_path(path, file, NULL);
--	current = read_file(fpath);
--
--	if (current == NULL) {
--		SYSERROR("Failed to read file \"%s\"", fpath);
--		free(fpath);
--		return false;
--	}
--
--	if (strcmp(current, "\n") != 0) {
--		free(fpath);
--		free(current);
--		return true;
--	}
--
--	free(fpath);
--	free(current);
--
--	lastslash = strrchr(path, '/');
--	if (lastslash == NULL) {
--		ERROR("Failed to detect \"/\" in \"%s\"", path);
--		return false;
--	}
--	oldv = *lastslash;
--	*lastslash = '\0';
--	fpath = must_make_path(path, file, NULL);
--	*lastslash = oldv;
--	len = lxc_read_from_file(fpath, NULL, 0);
--	if (len <= 0)
--		goto on_error;
--
--	value = must_realloc(NULL, len + 1);
--	ret = lxc_read_from_file(fpath, value, len);
--	if (ret != len)
--		goto on_error;
--	free(fpath);
--
--	fpath = must_make_path(path, file, NULL);
--	ret = lxc_write_to_file(fpath, value, len, false, 0666);
--	if (ret < 0)
--		SYSERROR("Failed to write \"%s\" to file \"%s\"", value, fpath);
--	free(fpath);
--	free(value);
--	return ret >= 0;
--
--on_error:
--	SYSERROR("Failed to read file \"%s\"", fpath);
--	free(fpath);
--	free(value);
--	return false;
--}
--
--static bool build_sub_cpuset_cgroup_dir(char *cgpath)
--{
--	int ret;
--
--	ret = mkdir_p(cgpath, 0755);
--	if (ret < 0) {
--		if (errno != EEXIST) {
--			SYSERROR("Failed to create directory \"%s\"", cgpath);
--			return false;
--		}
--	}
--
--	/* copy parent's settings */
--	if (!isulad_copy_parent_file(cgpath, "cpuset.cpus")) {
--		SYSERROR("Failed to copy \"cpuset.cpus\" settings");
--		return false;
--	}
--
--	/* copy parent's settings */
--	if (!isulad_copy_parent_file(cgpath, "cpuset.mems")) {
--		SYSERROR("Failed to copy \"cpuset.mems\" settings");
--		return false;
--	}
--
--	return true;
--}
--
--static bool isulad_cg_legacy_handle_cpuset_hierarchy(struct hierarchy *h, char *cgname)
--{
--	char *cgpath, *slash;
--	bool sub_mk_success = false;
--
--	if (!string_in_list(h->controllers, "cpuset"))
--		return true;
--
--	cgname += strspn(cgname, "/");
--
--	slash = strchr(cgname, '/');
--
--	if (slash != NULL) {
--		while (slash) {
--			*slash = '\0';
--			cgpath = must_make_path(h->mountpoint, h->container_base_path, cgname, NULL);
--			sub_mk_success = build_sub_cpuset_cgroup_dir(cgpath);
--			free(cgpath);
--			*slash = '/';
--			if (!sub_mk_success) {
--				return false;
--			}
--			slash = strchr(slash + 1, '/');
--		}
--	}
--
--	cgpath = must_make_path(h->mountpoint, h->container_base_path, cgname, NULL);
--	sub_mk_success = build_sub_cpuset_cgroup_dir(cgpath);
--	free(cgpath);
--	if (!sub_mk_success) {
--		return false;
--	}
--
--	return true;
--}
--
--static int isulad_mkdir_eexist_on_last(const char *dir, mode_t mode)
--{
--	const char *tmp = dir;
--	const char *orig = dir;
--
--	do {
--		int ret;
--		size_t cur_len;
--		char *makeme;
--
--		dir = tmp + strspn(tmp, "/");
--		tmp = dir + strcspn(dir, "/");
--
--		errno = ENOMEM;
--		cur_len = dir - orig;
--		makeme = strndup(orig, cur_len);
--		if (!makeme)
--			return -1;
--
--		ret = mkdir(makeme, mode);
--		if (ret < 0) {
--			if (errno != EEXIST) {
--				SYSERROR("Failed to create directory \"%s\"", makeme);
--				free(makeme);
--				return -1;
--			}
--		}
--		free(makeme);
--
--	} while (tmp != dir);
- 
--	return 0;
--}
--
--static bool create_path_for_hierarchy(struct hierarchy *h, char *cgname, int errfd)
--{
--	int ret;
--	__do_free char *path = NULL;
--
--	path = must_make_path(h->mountpoint, h->container_base_path, cgname, NULL);
--
--	if (file_exists(path)) { // it must not already exist
--		ERROR("Cgroup path \"%s\" already exist.", path);
--		lxc_write_error_message(errfd, "%s:%d: Cgroup path \"%s\" already exist.",
--		                        __FILE__, __LINE__, path);
--		return false;
--	}
--
--	if (!isulad_cg_legacy_handle_cpuset_hierarchy(h, cgname)) {
--		ERROR("Failed to handle legacy cpuset controller");
--		return false;
--	}
--
--	ret = isulad_mkdir_eexist_on_last(path, 0755);
--	if (ret < 0) {
--		ERROR("Failed to create cgroup \"%s\"", path);
--		return false;
--	}
--
--	h->cgfd_con = lxc_open_dirfd(path);
--	if (h->cgfd_con < 0)
--		return log_error_errno(false, errno, "Failed to open %s", path);
--
--	if (h->container_full_path == NULL) {
--		h->container_full_path = move_ptr(path);
--	}
--
--	return true;
--}
--
--/* isulad: create hierarchies path, if fail, return the error */
--__cgfsng_ops static inline bool cgfsng_payload_create(struct cgroup_ops *ops,
--						      struct lxc_handler *handler)
--{
--	int i;
--	char *container_cgroup = ops->container_cgroup;
--
--	if (!container_cgroup) {
--		ERROR("cgfsng_create container_cgroup is invalid");
--		return false;
--	}
--
--	for (i = 0; ops->hierarchies[i]; i++) {
--		if (!create_path_for_hierarchy(ops->hierarchies[i], container_cgroup, ops->errfd)) {
--			SYSERROR("Failed to create %s", ops->hierarchies[i]->container_full_path);
--			return false;
--		}
--	}
--
--	return true;
--}
--#else
- /*
-  * Try to create the same cgroup in all hierarchies. Start with cgroup_pattern;
-  * next cgroup_pattern-1, -2, ..., -999.
-@@ -1698,15 +1357,7 @@ __cgfsng_ops static inline bool cgfsng_payload_create(struct cgroup_ops *ops,
- 	INFO("The container process uses \"%s\" as cgroup", ops->container_cgroup);
- 	return true;
- }
--#endif
- 
--#ifdef HAVE_ISULAD
--__cgfsng_ops static bool cgfsng_monitor_enter(struct cgroup_ops *ops,
--					      struct lxc_handler *handler)
--{
--	return true;
--}
--#else
- __cgfsng_ops static bool cgfsng_monitor_enter(struct cgroup_ops *ops,
- 					      struct lxc_handler *handler)
- {
-@@ -1758,58 +1409,7 @@ __cgfsng_ops static bool cgfsng_monitor_enter(struct cgroup_ops *ops,
- 
- 	return true;
- }
--#endif
- 
--#ifdef HAVE_ISULAD
--__cgfsng_ops static bool cgfsng_payload_enter(struct cgroup_ops *ops,
--					      struct lxc_handler *handler)
--{
--	int len;
--	char pidstr[INTTYPE_TO_STRLEN(pid_t)];
--
--	if (!ops)
--		return ret_set_errno(false, ENOENT);
--
--	if (!ops->hierarchies)
--		return true;
--
--	if (!ops->container_cgroup)
--		return ret_set_errno(false, ENOENT);
--
--	if (!handler || !handler->conf)
--		return ret_set_errno(false, EINVAL);
--
--	len = snprintf(pidstr, sizeof(pidstr), "%d", handler->pid);
--
--	for (int i = 0; ops->hierarchies[i]; i++) {
--		int ret;
--		char *fullpath;
--		int retry_count = 0;
--		int max_retry = 10;
--
--		fullpath = must_make_path(ops->hierarchies[i]->container_full_path,
--		                          "cgroup.procs", NULL);
--retry:
--		ret = lxc_write_to_file(fullpath, pidstr, len, false, 0666);
--		if (ret != 0) {
--			if (retry_count < max_retry) {
--				SYSERROR("Failed to enter cgroup \"%s\" with retry count:%d", fullpath, retry_count);
--				(void)isulad_cg_legacy_handle_cpuset_hierarchy(ops->hierarchies[i], ops->container_cgroup);
--				(void)isulad_mkdir_eexist_on_last(ops->hierarchies[i]->container_full_path, 0755);
--				usleep(100 * 1000); /* 100 millisecond */
--				retry_count++;
--				goto retry;
--			}
--			SYSERROR("Failed to enter cgroup \"%s\"", fullpath);
--			free(fullpath);
--			return false;
--		}
--		free(fullpath);
--	}
--
--	return true;
--}
--#else
- __cgfsng_ops static bool cgfsng_payload_enter(struct cgroup_ops *ops,
- 					      struct lxc_handler *handler)
- {
-@@ -1841,7 +1441,6 @@ __cgfsng_ops static bool cgfsng_payload_enter(struct cgroup_ops *ops,
- 
- 	return true;
- }
--#endif
- 
- static int fchowmodat(int dirfd, const char *path, uid_t chown_uid,
- 		      gid_t chown_gid, mode_t chmod_mode)
-@@ -2056,234 +1655,39 @@ static int __cg_mount_direct(int type, struct hierarchy *h,
- 	 flags |= MS_RELATIME;
- 
- 	 if (type == LXC_AUTO_CGROUP_RO || type == LXC_AUTO_CGROUP_FULL_RO)
--		 flags |= MS_RDONLY;
--
--	 if (h->version != CGROUP2_SUPER_MAGIC) {
--		 controllers = lxc_string_join(",", (const char **)h->controllers, false);
--		 if (!controllers)
--			 return -ENOMEM;
--		 fstype = "cgroup";
--	}
--
--	ret = mount("cgroup", controllerpath, fstype, flags, controllers);
--	if (ret < 0)
--		return log_error_errno(-1, errno, "Failed to mount \"%s\" with cgroup filesystem type %s",
--				       controllerpath, fstype);
--
--	DEBUG("Mounted \"%s\" with cgroup filesystem type %s", controllerpath, fstype);
--	return 0;
--}
--
--static inline int cg_mount_in_cgroup_namespace(int type, struct hierarchy *h,
--					       const char *controllerpath)
--{
--	return __cg_mount_direct(type, h, controllerpath);
--}
--
--static inline int cg_mount_cgroup_full(int type, struct hierarchy *h,
--				       const char *controllerpath)
--{
--	if (type < LXC_AUTO_CGROUP_FULL_RO || type > LXC_AUTO_CGROUP_FULL_MIXED)
--		return 0;
--
--	return __cg_mount_direct(type, h, controllerpath);
--}
--
--#ifdef HAVE_ISULAD
--__cgfsng_ops static bool cgfsng_mount(struct cgroup_ops *ops,
--                                      struct lxc_handler *handler,
--                                      const char *root, int type)
--{
--	int i, ret;
--	char *tmpfspath = NULL;
--	char *systemdpath = NULL;
--	char *unifiedpath = NULL;
--	bool has_cgns = false, retval = false, wants_force_mount = false;
--	char **merged = NULL;
--
--	if ((type & LXC_AUTO_CGROUP_MASK) == 0)
--		return true;
--
--	if (type & LXC_AUTO_CGROUP_FORCE) {
--		type &= ~LXC_AUTO_CGROUP_FORCE;
--		wants_force_mount = true;
--	}
--
--	if (!wants_force_mount) {
--		if (!lxc_list_empty(&handler->conf->keepcaps))
--			wants_force_mount = !in_caplist(CAP_SYS_ADMIN, &handler->conf->keepcaps);
--		else
--			wants_force_mount = in_caplist(CAP_SYS_ADMIN, &handler->conf->caps);
--	}
--
--	has_cgns = cgns_supported();
--	if (has_cgns && !wants_force_mount)
--		return true;
--
--	if (type == LXC_AUTO_CGROUP_NOSPEC)
--		type = LXC_AUTO_CGROUP_MIXED;
--	else if (type == LXC_AUTO_CGROUP_FULL_NOSPEC)
--		type = LXC_AUTO_CGROUP_FULL_MIXED;
--
--	/* Mount tmpfs */
--	tmpfspath = must_make_path(root, "/sys/fs/cgroup", NULL);
--	if (mkdir_p(tmpfspath, 0755) < 0) {
--		ERROR("Failed to create directory: %s", tmpfspath);
--		goto on_error;
--	}
--	ret = safe_mount(NULL, tmpfspath, "tmpfs",
--	                 MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME,
--	                 "size=10240k,mode=755", root, handler->conf->lsm_se_mount_context);
--	if (ret < 0)
--		goto on_error;
--
--	for (i = 0; ops->hierarchies[i]; i++) {
--		char *controllerpath = NULL;
--		char *path2 = NULL;
--		struct hierarchy *h = ops->hierarchies[i];
--		char *controller = strrchr(h->mountpoint, '/');
--
--		if (!controller)
--			continue;
--		controller++;
--
--		// isulad: symlink subcgroup
--		if (strchr(controller, ',') != NULL) {
--			int pret;
--			pret = lxc_append_string(&merged, controller);
--			if (pret < 0)
--				goto on_error;
--		}
--
--		controllerpath = must_make_path(tmpfspath, controller, NULL);
--		if (dir_exists(controllerpath)) {
--			free(controllerpath);
--			continue;
--		}
--
--		ret = mkdir(controllerpath, 0755);
--		if (ret < 0) {
--			SYSERROR("Error creating cgroup path: %s", controllerpath);
--			free(controllerpath);
--			goto on_error;
--		}
--
--		if (has_cgns && wants_force_mount) {
--			/* If cgroup namespaces are supported but the container
--			 * will not have CAP_SYS_ADMIN after it has started we
--			 * need to mount the cgroups manually.
--			 */
--			ret = cg_mount_in_cgroup_namespace(type, h, controllerpath);
--			free(controllerpath);
--			if (ret < 0)
--				goto on_error;
--
--			continue;
--		}
--
--		ret = cg_mount_cgroup_full(type, h, controllerpath);
--		if (ret < 0) {
--			free(controllerpath);
--			goto on_error;
--		}
--
--		if (!cg_mount_needs_subdirs(type)) {
--			free(controllerpath);
--			continue;
--		}
--
--		// isulad: ignore ops->container_cgroup so we will not see directory lxc after /sys/fs/cgroup/xxx in container,
--		// isulad: ignore h->container_base_path so we will not see subgroup of /sys/fs/cgroup/xxx/subgroup in container
--		path2 = must_make_path(controllerpath, NULL);
--		ret = mkdir_p(path2, 0755);
--		if (ret < 0) {
--			free(controllerpath);
--			free(path2);
--			goto on_error;
--		}
--
--		ret = cg_legacy_mount_controllers(type, h, controllerpath,
--		                                  path2, ops->container_cgroup);
--		free(controllerpath);
--		free(path2);
--		if (ret < 0)
--			goto on_error;
--	}
--
--	// isulad: symlink subcgroup
--	if (merged) {
--		char **mc = NULL;
--		for (mc = merged; *mc; mc++) {
--			char *token = NULL;
--			char *copy = must_copy_string(*mc);
--			lxc_iterate_parts(token, copy, ",") {
--				int mret;
--				char *link;
--				link = must_make_path(tmpfspath, token, NULL);
--				mret = symlink(*mc, link);
--				if (mret < 0 && errno != EEXIST) {
--					SYSERROR("Failed to create link %s for target %s", link, *mc);
--					free(copy);
--					free(link);
--					goto on_error;
--				}
--				free(link);
--			}
--			free(copy);
--		}
--	}
--
-+		 flags |= MS_RDONLY;
- 
--	// isulad: remount /sys/fs/cgroup to readonly
--	if (type == LXC_AUTO_CGROUP_FULL_RO || type == LXC_AUTO_CGROUP_RO) {
--		ret = mount(tmpfspath, tmpfspath, "bind",
--		            MS_NOSUID|MS_NODEV|MS_NOEXEC|MS_RELATIME|MS_RDONLY|MS_BIND|MS_REMOUNT, NULL);
--		if (ret < 0) {
--			SYSERROR("Failed to remount /sys/fs/cgroup.");
--			goto on_error;
--		}
-+	 if (h->version != CGROUP2_SUPER_MAGIC) {
-+		 controllers = lxc_string_join(",", (const char **)h->controllers, false);
-+		 if (!controllers)
-+			 return -ENOMEM;
-+		 fstype = "cgroup";
- 	}
- 
--	// isulad: remount /sys/fs/cgroup/systemd to readwrite for system container
--	if (handler->conf->systemd != NULL && strcmp(handler->conf->systemd, "true") == 0)
--	{
--		unifiedpath = must_make_path(root, "/sys/fs/cgroup/unified", NULL);
--		if (dir_exists(unifiedpath))
--		{
--			ret = umount2(unifiedpath, MNT_DETACH);
--			if (ret < 0)
--			{
--				SYSERROR("Failed to umount /sys/fs/cgroup/unified.");
--				goto on_error;
--			}
--		}
-+	ret = mount("cgroup", controllerpath, fstype, flags, controllers);
-+	if (ret < 0)
-+		return log_error_errno(-1, errno, "Failed to mount \"%s\" with cgroup filesystem type %s",
-+				       controllerpath, fstype);
- 
--		systemdpath = must_make_path(root, "/sys/fs/cgroup/systemd", NULL);
--		ret = mount(systemdpath, systemdpath, "bind",
--					MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME | MS_BIND | MS_REMOUNT, NULL);
--		if (ret < 0)
--		{
--			SYSERROR("Failed to remount /sys/fs/cgroup/systemd.");
--			goto on_error;
--		}
--	}
-+	DEBUG("Mounted \"%s\" with cgroup filesystem type %s", controllerpath, fstype);
-+	return 0;
-+}
- 
--	retval = true;
-+static inline int cg_mount_in_cgroup_namespace(int type, struct hierarchy *h,
-+					       const char *controllerpath)
-+{
-+	return __cg_mount_direct(type, h, controllerpath);
-+}
- 
--on_error:
--	free(tmpfspath);
--	if (systemdpath != NULL)
--	{
--		free(systemdpath);
--	}
--	if (unifiedpath != NULL)
--	{
--		free(unifiedpath);
--	}
--	lxc_free_array((void **)merged, free);
--	return retval;
-+static inline int cg_mount_cgroup_full(int type, struct hierarchy *h,
-+				       const char *controllerpath)
-+{
-+	if (type < LXC_AUTO_CGROUP_FULL_RO || type > LXC_AUTO_CGROUP_FULL_MIXED)
-+		return 0;
-+
-+	return __cg_mount_direct(type, h, controllerpath);
- }
--#else
-+
- __cgfsng_ops static bool cgfsng_mount(struct cgroup_ops *ops,
- 				      struct lxc_handler *handler,
- 				      const char *root, int type)
-@@ -2396,7 +1800,6 @@ __cgfsng_ops static bool cgfsng_mount(struct cgroup_ops *ops,
- 
- 	return true;
- }
--#endif
- 
- /* Only root needs to escape to the cgroup of its init. */
- __cgfsng_ops static bool cgfsng_escape(const struct cgroup_ops *ops,
-@@ -2647,34 +2050,11 @@ __cgfsng_ops static const char *cgfsng_get_cgroup(struct cgroup_ops *ops,
- 		return log_warn_errno(NULL, ENOENT, "Failed to find hierarchy for controller \"%s\"",
- 				      controller ? controller : "(null)");
- 
--#ifdef HAVE_ISULAD
--	if (!h->container_full_path)
--		h->container_full_path = must_make_path(h->mountpoint, h->container_base_path, ops->container_cgroup, NULL);
--#endif
--
- 	return h->container_full_path
- 		   ? h->container_full_path + strlen(h->mountpoint)
- 		   : NULL;
- }
- 
--#ifdef HAVE_ISULAD
--__cgfsng_ops static const char *cgfsng_get_cgroup_full_path(struct cgroup_ops *ops,
--						  const char *controller)
--{
--	struct hierarchy *h;
--
--	h = get_hierarchy(ops, controller);
--	if (!h)
--		return log_warn_errno(NULL, ENOENT, "Failed to find hierarchy for controller \"%s\"",
--				      controller ? controller : "(null)");
--
--	if (!h->container_full_path)
--		h->container_full_path = must_make_path(h->mountpoint, h->container_base_path, ops->container_cgroup, NULL);
--
--	return h->container_full_path;
--}
--#endif
--
- /* Given a cgroup path returned from lxc_cmd_get_cgroup_path, build a full path,
-  * which must be freed by the caller.
-  */
-@@ -2981,44 +2361,6 @@ __cgfsng_ops static bool cgfsng_attach(struct cgroup_ops *ops,
- 	return true;
- }
- 
--#ifdef HAVE_ISULAD
--__cgfsng_ops static int cgfsng_get(struct cgroup_ops *ops, const char *filename,
--                                   char *value, size_t len, const char *name,
--                                   const char *lxcpath)
--{
--	int ret = -1;
--	size_t controller_len;
--	char *controller, *p, *path;
--	struct hierarchy *h;
--
--	controller_len = strlen(filename);
--	controller = alloca(controller_len + 1);
--	(void)strlcpy(controller, filename, controller_len + 1);
--
--	p = strchr(controller, '.');
--	if (p)
--		*p = '\0';
--
--	const char *ori_path = ops->get_cgroup(ops, controller);
--	if (ori_path == NULL) {
--		ERROR("Failed to get cgroup path:%s", controller);
--		return -1;
--	}
--	path = safe_strdup(ori_path);
--
--	h = get_hierarchy(ops, controller);
--	if (h) {
--		char *fullpath;
--
--		fullpath = build_full_cgpath_from_monitorpath(h, path, filename);
--		ret = lxc_read_from_file(fullpath, value, len);
--		free(fullpath);
--	}
--	free(path);
--
--	return ret;
--}
--#else
- /* Called externally (i.e. from 'lxc-cgroup') to query cgroup limits.  Here we
-  * don't have a cgroup_data set up, so we ask the running container through the
-  * commands API for the cgroup path.
-@@ -3056,7 +2398,6 @@ __cgfsng_ops static int cgfsng_get(struct cgroup_ops *ops, const char *filename,
- 
- 	return ret;
- }
--#endif
- 
- static int device_cgroup_parse_access(struct device_item *device, const char *val)
- {
-@@ -3170,44 +2511,6 @@ int device_cgroup_rule_parse(struct device_item *device, const char *key,
- 	return device_cgroup_parse_access(device, ++val);
- }
- 
--#ifdef HAVE_ISULAD
--__cgfsng_ops static int cgfsng_set(struct cgroup_ops *ops,
--                                   const char *filename, const char *value,
--                                   const char *name, const char *lxcpath)
--{
--	int ret = -1;
--	size_t controller_len;
--	char *controller, *p, *path;
--	struct hierarchy *h;
--
--	controller_len = strlen(filename);
--	controller = alloca(controller_len + 1);
--	(void)strlcpy(controller, filename, controller_len + 1);
--
--	p = strchr(controller, '.');
--	if (p)
--		*p = '\0';
--
--	const char *ori_path = ops->get_cgroup(ops, controller);
--	if (ori_path == NULL) {
--		ERROR("Failed to get cgroup path:%s", controller);
--		return -1;
--	}
--	path = safe_strdup(ori_path);
--
--	h = get_hierarchy(ops, controller);
--	if (h) {
--		char *fullpath;
--
--		fullpath = build_full_cgpath_from_monitorpath(h, path, filename);
--		ret = lxc_write_to_file(fullpath, value, strlen(value), false, 0666);
--		free(fullpath);
--	}
--	free(path);
--
--	return ret;
--}
--#else
- /* Called externally (i.e. from 'lxc-cgroup') to set new cgroup limits.  Here we
-  * don't have a cgroup_data set up, so we ask the running container through the
-  * commands API for the cgroup path.
-@@ -3260,7 +2563,6 @@ __cgfsng_ops static int cgfsng_set(struct cgroup_ops *ops,
- 
- 	return ret;
- }
--#endif
- 
- /* take devices cgroup line
-  *    /dev/foo rwx
-@@ -3352,7 +2654,6 @@ static int convert_devpath(const char *invalue, char *dest)
- 	return 0;
- }
- 
--#ifndef HAVE_ISULAD
- /* Called from setup_limits - here we have the container's cgroup_data because
-  * we created the cgroups.
-  */
-@@ -3385,212 +2686,7 @@ static int cg_legacy_set_data(struct cgroup_ops *ops, const char *filename,
- 
- 	return lxc_write_openat(h->container_full_path, filename, value, strlen(value));
- }
--#endif
--
--#ifdef HAVE_ISULAD
--/* Called from setup_limits - here we have the container's cgroup_data because
-- * we created the cgroups.
-- */
--static int isulad_cg_legacy_get_data(struct cgroup_ops *ops, const char *filename,
--                              char *value, size_t len)
--{
--	char *fullpath = NULL;
--	char *p = NULL;
--	struct hierarchy *h = NULL;
--	int ret = 0;
--	char *controller = NULL;
--
--	len = strlen(filename);
--	if (SIZE_MAX - 1 < len) {
--		errno = EINVAL;
--		return -1;
--	}
--	controller = calloc(1, len + 1);
--	if (controller == NULL) {
--		errno = ENOMEM;
--		return -1;
--	}
--	(void)strlcpy(controller, filename, len + 1);
--
--	p = strchr(controller, '.');
--	if (p)
--		*p = '\0';
--
--
--	h = get_hierarchy(ops, controller);
--	if (!h) {
--		ERROR("Failed to setup limits for the \"%s\" controller. "
--		      "The controller seems to be unused by \"cgfsng\" cgroup "
--		      "driver or not enabled on the cgroup hierarchy",
--		      controller);
--		errno = ENOENT;
--		free(controller);
--		return -ENOENT;
--	}
--
--	fullpath = must_make_path(h->container_full_path, filename, NULL);
--	ret = lxc_read_from_file(fullpath, value, len);
--	free(fullpath);
--	free(controller);
--	return ret;
--}
--
--static int isulad_cg_legacy_set_data(struct cgroup_ops *ops, const char *filename,
--                              const char *value)
--{
--	size_t len;
--	char *fullpath, *p;
--	/* "b|c <2^64-1>:<2^64-1> r|w|m" = 47 chars max */
--	char converted_value[50];
--	struct hierarchy *h;
--	int ret = 0;
--	char *controller = NULL;
--	int retry_count = 0;
--	int max_retry = 10;
--	char *container_cgroup = ops->container_cgroup;
--
--	len = strlen(filename);
--	controller = alloca(len + 1);
--	(void)strlcpy(controller, filename, len + 1);
--
--	p = strchr(controller, '.');
--	if (p)
--		*p = '\0';
--
--	if (strcmp("devices.allow", filename) == 0 && value[0] == '/') {
--		ret = convert_devpath(value, converted_value);
--		if (ret < 0)
--			return ret;
--		value = converted_value;
--	}
--
--	h = get_hierarchy(ops, controller);
--	if (!h) {
--		ERROR("Failed to setup limits for the \"%s\" controller. "
--		      "The controller seems to be unused by \"cgfsng\" cgroup "
--		      "driver or not enabled on the cgroup hierarchy",
--		      controller);
--		errno = ENOENT;
--		return -ENOENT;
--	}
--
--	fullpath = must_make_path(h->container_full_path, filename, NULL);
--
--retry:
--	ret = lxc_write_to_file(fullpath, value, strlen(value), false, 0666);
--	if (ret != 0) {
--		if (retry_count < max_retry) {
--			SYSERROR("setting cgroup config for ready process caused \"failed to write %s to %s\".", value, fullpath);
--			(void)isulad_cg_legacy_handle_cpuset_hierarchy(h, container_cgroup);
--			(void)isulad_mkdir_eexist_on_last(h->container_full_path, 0755);
--			usleep(100 * 1000); /* 100 millisecond */
--			retry_count++;
--			goto retry;
--		}
--		lxc_write_error_message(ops->errfd,
--		                        "%s:%d: setting cgroup config for ready process caused \"failed to write %s to %s: %s\".",
--		                        __FILE__, __LINE__, value, fullpath, strerror(errno));
--	}
--	free(fullpath);
--	return ret;
--}
--
--__cgfsng_ops static bool cgfsng_setup_limits_legacy(struct cgroup_ops *ops,
--						    struct lxc_conf *conf,
--						    bool do_devices)
--{
--	__do_free struct lxc_list *sorted_cgroup_settings = NULL;
--	struct lxc_list *cgroup_settings = &conf->cgroup;
--	struct lxc_list *iterator, *next;
--	struct lxc_cgroup *cg;
--	bool ret = false;
--	char value[21 + 1] = { 0 };
--	long long int readvalue, setvalue;
--
--	if (!ops)
--		return ret_set_errno(false, ENOENT);
--
--	if (!conf)
--		return ret_set_errno(false, EINVAL);
--
--	cgroup_settings = &conf->cgroup;
--	if (lxc_list_empty(cgroup_settings))
--		return true;
--
--	if (!ops->hierarchies)
--		return ret_set_errno(false, EINVAL);
--
--	sorted_cgroup_settings = sort_cgroup_settings(cgroup_settings);
--	if (!sorted_cgroup_settings)
--		return false;
--
--	lxc_list_for_each(iterator, sorted_cgroup_settings) {
--		cg = iterator->elem;
--
--		if (do_devices == !strncmp("devices", cg->subsystem, 7)) {
--			const char *cgvalue = cg->value;
--			if (strcmp(cg->subsystem, "files.limit") == 0) {
--				if (lxc_safe_long_long(cgvalue, &setvalue) != 0) {
--					SYSERROR("Invalid integer value %s", cgvalue);
--					goto out;
--				}
--				if (setvalue <= 0) {
--					cgvalue = "max";
--				}
--			}
--			if (isulad_cg_legacy_set_data(ops, cg->subsystem, cgvalue)) {
--				if (do_devices && (errno == EACCES || errno == EPERM)) {
--					SYSWARN("Failed to set \"%s\" to \"%s\"", cg->subsystem, cgvalue);
--					continue;
--				}
--				SYSERROR("Failed to set \"%s\" to \"%s\"", cg->subsystem, cgvalue);
--				goto out;
--			}
--			DEBUG("Set controller \"%s\" set to \"%s\"", cg->subsystem, cgvalue);
--		}
--
--		// isulad: check cpu shares
--		if (strcmp(cg->subsystem, "cpu.shares") == 0) {
--			if (isulad_cg_legacy_get_data(ops, cg->subsystem, value, sizeof(value) - 1) < 0) {
--				SYSERROR("Error get %s", cg->subsystem);
--				goto out;
--			}
--			trim(value);
--			if (lxc_safe_long_long(cg->value, &setvalue) != 0) {
--				SYSERROR("Invalid value %s", cg->value);
--				goto out;
--			}
--			if (lxc_safe_long_long(value, &readvalue) != 0) {
--				SYSERROR("Invalid value %s", value);
--				goto out;
--			}
--			if (setvalue > readvalue) {
--				ERROR("The maximum allowed cpu-shares is %s", value);
--				lxc_write_error_message(ops->errfd,
--				                        "%s:%d: setting cgroup config for ready process caused \"The maximum allowed cpu-shares is %s\".",
--				                        __FILE__, __LINE__, value);
--				goto out;
--			} else if (setvalue < readvalue) {
--				ERROR("The minimum allowed cpu-shares is %s", value);
--				lxc_write_error_message(ops->errfd,
--				                        "%s:%d: setting cgroup config for ready process caused \"The minimum allowed cpu-shares is %s\".",
--				                        __FILE__, __LINE__, value);
--				goto out;
--			}
--		}
--	}
--
--	ret = true;
--	INFO("Limits for the legacy cgroup hierarchies have been setup");
--out:
--	lxc_list_for_each_safe(iterator, sorted_cgroup_settings, next) {
--		lxc_list_del(iterator);
--		free(iterator);
--	}
- 
--	return ret;
--}
--#else
- __cgfsng_ops static bool cgfsng_setup_limits_legacy(struct cgroup_ops *ops,
- 						    struct lxc_conf *conf,
- 						    bool do_devices)
-@@ -3644,7 +2740,6 @@ out:
- 
- 	return ret;
- }
--#endif
- 
- /*
-  * Some of the parsing logic comes from the original cgroup device v1
-@@ -3856,12 +2951,6 @@ bool __cgfsng_delegate_controllers(struct cgroup_ops *ops, const char *cgroup)
- 	return true;
- }
- 
--#ifdef HAVE_ISULAD
--__cgfsng_ops bool cgfsng_monitor_delegate_controllers(struct cgroup_ops *ops)
--{
--	return true;
--}
--#else
- __cgfsng_ops bool cgfsng_monitor_delegate_controllers(struct cgroup_ops *ops)
- {
- 	if (!ops)
-@@ -3869,7 +2958,6 @@ __cgfsng_ops bool cgfsng_monitor_delegate_controllers(struct cgroup_ops *ops)
- 
- 	return __cgfsng_delegate_controllers(ops, ops->monitor_cgroup);
- }
--#endif
- 
- __cgfsng_ops bool cgfsng_payload_delegate_controllers(struct cgroup_ops *ops)
- {
-@@ -4019,22 +3107,7 @@ static int cg_hybrid_init(struct cgroup_ops *ops, bool relative, bool unprivileg
- 
- 		trim(base_cgroup);
- 		prune_init_scope(base_cgroup);
--#ifdef HAVE_ISULAD
--		/* isulad: do not test writeable, if we run isulad in docker without cgroup namespace.
--		 * the base_cgroup will be docker/XXX.., mountpoint+base_cgroup may be not exist */
--
--		/*
--		 * reason:base cgroup may be started with /system.slice when cg_hybrid_init
--		 *	read /proc/1/cgroup on host, and cgroup init will set all containers
--		 *	cgroup path under /sys/fs/cgroup/<controller>/system.slice/xxx/lxc
--		 *	directory, this is not consistent with docker. The default cgroup path
--		 *	should be under /sys/fs/cgroup/<controller>/lxc directory.
--		 */
- 
--		if (strlen(base_cgroup) > 1 && base_cgroup[0] == '/') {
--			base_cgroup[1] = '\0';
--		}
--#else
- 		bool writeable;
- 		if (type == CGROUP2_SUPER_MAGIC)
- 			writeable = test_writeable_v2(mountpoint, base_cgroup);
-@@ -4044,7 +3117,7 @@ static int cg_hybrid_init(struct cgroup_ops *ops, bool relative, bool unprivileg
- 			TRACE("The %s group is not writeable", base_cgroup);
- 			continue;
- 		}
--#endif
-+
- 		if (type == CGROUP2_SUPER_MAGIC) {
- 			char *cgv2_ctrl_path;
- 
-@@ -4197,44 +3270,6 @@ static int cg_init(struct cgroup_ops *ops, struct lxc_conf *conf)
- 	return cg_hybrid_init(ops, relative, !lxc_list_empty(&conf->id_map));
- }
- 
--#ifdef HAVE_ISULAD
--__cgfsng_ops static int cgfsng_data_init(struct cgroup_ops *ops, struct lxc_conf *conf)
--{
--	const char *cgroup_pattern;
--	const char *cgroup_tree;
--	__do_free char *container_cgroup = NULL, *__cgroup_tree = NULL;
--	size_t len;
--
--	if (!ops)
--		return ret_set_errno(-1, ENOENT);
--
--	/* copy system-wide cgroup information */
--	cgroup_pattern = lxc_global_config_value("lxc.cgroup.pattern");
--	if (cgroup_pattern && strcmp(cgroup_pattern, "") != 0)
--		ops->cgroup_pattern = must_copy_string(cgroup_pattern);
--
--	if (conf->cgroup_meta.dir) {
--		cgroup_tree = conf->cgroup_meta.dir;
--		container_cgroup = must_concat(&len, cgroup_tree, "/", conf->name, NULL);
--	} else if (ops->cgroup_pattern) {
--		__cgroup_tree = lxc_string_replace("%n", conf->name, ops->cgroup_pattern);
--		if (!__cgroup_tree)
--			return ret_set_errno(-1, ENOMEM);
--
--		cgroup_tree = __cgroup_tree;
--		container_cgroup = must_concat(&len, cgroup_tree, NULL);
--	} else {
--		cgroup_tree = NULL;
--		container_cgroup = must_concat(&len, conf->name, NULL);
--	}
--	if (!container_cgroup)
--		return ret_set_errno(-1, ENOMEM);
--
--	ops->container_cgroup = move_ptr(container_cgroup);
--
--	return 0;
--}
--#else
- __cgfsng_ops static int cgfsng_data_init(struct cgroup_ops *ops, struct lxc_conf *conf)
- {
- 	const char *cgroup_pattern;
-@@ -4249,7 +3284,6 @@ __cgfsng_ops static int cgfsng_data_init(struct cgroup_ops *ops, struct lxc_conf
- 
- 	return 0;
- }
--#endif
- 
- struct cgroup_ops *cgfsng_ops_init(struct lxc_conf *conf)
- {
-@@ -4266,12 +3300,7 @@ struct cgroup_ops *cgfsng_ops_init(struct lxc_conf *conf)
- 		return NULL;
- 
- 	cgfsng_ops->data_init = cgfsng_data_init;
--#ifdef HAVE_ISULAD
--	cgfsng_ops->errfd = conf ? conf->errpipe[1] : -1;
--	cgfsng_ops->payload_destroy = isulad_cgfsng_payload_destroy;
--#else
- 	cgfsng_ops->payload_destroy = cgfsng_payload_destroy;
--#endif
- 	cgfsng_ops->monitor_destroy = cgfsng_monitor_destroy;
- 	cgfsng_ops->monitor_create = cgfsng_monitor_create;
- 	cgfsng_ops->monitor_enter = cgfsng_monitor_enter;
-@@ -4284,9 +3313,6 @@ struct cgroup_ops *cgfsng_ops_init(struct lxc_conf *conf)
- 	cgfsng_ops->num_hierarchies = cgfsng_num_hierarchies;
- 	cgfsng_ops->get_hierarchies = cgfsng_get_hierarchies;
- 	cgfsng_ops->get_cgroup = cgfsng_get_cgroup;
--#ifdef HAVE_ISULAD
--	cgfsng_ops->get_cgroup_full_path = cgfsng_get_cgroup_full_path;
--#endif
- 	cgfsng_ops->get = cgfsng_get;
- 	cgfsng_ops->set = cgfsng_set;
- 	cgfsng_ops->freeze = cgfsng_freeze;
 diff --git a/src/lxc/cgroups/isulad_cgfsng.c b/src/lxc/cgroups/isulad_cgfsng.c
 new file mode 100644
-index 000000000..82a4333f3
+index 0000000..8a9656a
 --- /dev/null
 +++ b/src/lxc/cgroups/isulad_cgfsng.c
-@@ -0,0 +1,3115 @@
+@@ -0,0 +1,3223 @@
 +/******************************************************************************
 + * Copyright (c) Huawei Technologies Co., Ltd. 2019. All rights reserved.
 + * Author: lifeng
@@ -1615,7 +356,7 @@ index 000000000..82a4333f3
 +	 * verify /sys/fs/cgroup/ in this field.
 +	 */
 +	if (strncmp(p, DEFAULT_CGROUP_MOUNTPOINT "/", 15) != 0)
-+		return log_error(NULL, "Found hierarchy not under " DEFAULT_CGROUP_MOUNTPOINT ": \"%s\"", p);
++		return log_warn(NULL, "Found hierarchy not under " DEFAULT_CGROUP_MOUNTPOINT ": \"%s\"", p);
 +
 +	p += 15;
 +	p2 = strchr(p, ' ');
@@ -1975,6 +716,13 @@ index 000000000..82a4333f3
 +		return false;
 +	}
 +
++#ifdef HAVE_ISULAD
++	if (ops->no_controller) {
++		DEBUG("no controller found, isgnore isulad_cgfsng_payload_destroy");
++		return true;
++	}
++#endif
++
 +	if (!ops->hierarchies) {
 +		return false;
 +	}
@@ -2121,6 +869,9 @@ index 000000000..82a4333f3
 +	char *cgpath, *slash;
 +	bool sub_mk_success = false;
 +
++	if (is_unified_hierarchy(h))
++		return true;
++
 +	if (!string_in_list(h->controllers, "cpuset"))
 +		return true;
 +
@@ -2229,6 +980,13 @@ index 000000000..82a4333f3
 +	int i;
 +	char *container_cgroup = ops->container_cgroup;
 +
++#ifdef HAVE_ISULAD
++	if (ops->no_controller) {
++		DEBUG("no controller found, isgnore isulad_cgfsng_payload_create");
++		return true;
++	}
++#endif
++
 +	if (!container_cgroup) {
 +		ERROR("cgfsng_create container_cgroup is invalid");
 +		return false;
@@ -2258,6 +1016,13 @@ index 000000000..82a4333f3
 +
 +	if (!ops)
 +		return ret_set_errno(false, ENOENT);
++
++#ifdef HAVE_ISULAD
++	if (ops->no_controller) {
++		DEBUG("no controller found, isgnore isulad_cgfsng_payload_enter");
++		return true;
++	}
++#endif
 +
 +	if (!ops->hierarchies)
 +		return true;
@@ -2415,6 +1180,13 @@ index 000000000..82a4333f3
 +{
 +	if (!ops)
 +		return;
++
++#ifdef HAVE_ISULAD
++	if (ops->no_controller) {
++		DEBUG("no controller found, isgnore isulad_cgfsng_payload_finalize");
++		return;
++	}
++#endif
 +
 +	if (!ops->hierarchies)
 +		return;
@@ -2586,6 +1358,20 @@ index 000000000..82a4333f3
 +		ERROR("Failed to create directory: %s", tmpfspath);
 +		goto on_error;
 +	}
++
++        if (ops->cgroup_layout == CGROUP_LAYOUT_UNIFIED) {
++                if (has_cgns && wants_force_mount) {
++                        /*
++                         * If cgroup namespaces are supported but the container
++                         * will not have CAP_SYS_ADMIN after it has started we
++                         * need to mount the cgroups manually.
++                         */
++                        return cg_mount_in_cgroup_namespace(type, ops->unified, tmpfspath) == 0;
++                }
++
++                return cg_mount_cgroup_full(type, ops->unified, tmpfspath) == 0;
++        }
++
 +	ret = safe_mount(NULL, tmpfspath, "tmpfs",
 +	                 MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME,
 +	                 "size=10240k,mode=755", root, handler->conf->lsm_se_mount_context);
@@ -3047,12 +1833,20 @@ index 000000000..82a4333f3
 +
 +	do {
 +		bool rm = false;
-+		char attach_cgroup[STRLITERALLEN(".lxc-1000/cgroup.procs") + 1];
++		char attach_cgroup[STRLITERALLEN(".lxc-/cgroup.procs") + INTTYPE_TO_STRLEN(int) + 1];
 +		char *slash;
 +
 +		ret = snprintf(attach_cgroup, sizeof(attach_cgroup), ".lxc-%d/cgroup.procs", idx);
 +		if (ret < 0 || (size_t)ret >= sizeof(attach_cgroup))
 +			return ret_errno(EIO);
++
++		/*
++		 * This shouldn't really happen but the compiler might complain
++		 * that a short write would cause a buffer overrun. So be on
++		 * the safe side.
++		 */
++		if (ret < STRLITERALLEN(".lxc-/cgroup.procs"))
++			return log_error_errno(-EINVAL, EINVAL, "Unexpected short write would cause buffer-overrun");
 +
 +		slash = &attach_cgroup[ret] - STRLITERALLEN("/cgroup.procs");
 +		*slash = '\0';
@@ -3283,6 +2077,13 @@ index 000000000..82a4333f3
 +	if (!ops)
 +		return ret_set_errno(false, ENOENT);
 +
++#ifdef HAVE_ISULAD
++	if (ops->no_controller) {
++		DEBUG("no controller found, isgnore isulad_cgfsng_attach");
++		return true;
++	}
++#endif
++
 +	if (!ops->hierarchies)
 +		return true;
 +
@@ -3494,8 +2295,16 @@ index 000000000..82a4333f3
 +	h = get_hierarchy(ops, controller);
 +	if (h) {
 +		char *fullpath;
-+
 +		fullpath = build_full_cgpath_from_monitorpath(h, path, filename);
++
++		if (strcmp(filename, "io.weight") == 0 || strcmp(filename, "io.bfq.weight") == 0) {
++			if (!file_exists(fullpath)) {
++				free(path);
++				free(fullpath);
++				return 0;
++			}
++		}
++
 +		ret = lxc_write_to_file(fullpath, value, strlen(value), false, 0666);
 +		free(fullpath);
 +	}
@@ -3726,6 +2535,9 @@ index 000000000..82a4333f3
 +	if (!ops->hierarchies)
 +		return ret_set_errno(false, EINVAL);
 +
++	if (pure_unified_layout(ops))
++		return true;
++
 +	sorted_cgroup_settings = sort_cgroup_settings(cgroup_settings);
 +	if (!sorted_cgroup_settings)
 +		return false;
@@ -3826,6 +2638,7 @@ index 000000000..82a4333f3
 +__cgfsng_ops static bool isulad_cgfsng_setup_limits(struct cgroup_ops *ops,
 +					     struct lxc_handler *handler)
 +{
++	__do_free char *path = NULL;
 +	struct lxc_list *cgroup_settings, *iterator;
 +	struct hierarchy *h;
 +	struct lxc_conf *conf;
@@ -3847,6 +2660,9 @@ index 000000000..82a4333f3
 +		return true;
 +	cgroup_settings = &conf->cgroup2;
 +
++	if (!pure_unified_layout(ops))
++		return true;
++
 +	if (!ops->unified)
 +		return false;
 +	h = ops->unified;
@@ -3858,7 +2674,29 @@ index 000000000..82a4333f3
 +		if (strncmp("devices", cg->subsystem, 7) == 0) {
 +			ret = bpf_device_cgroup_prepare(ops, conf, cg->subsystem,
 +							cg->value);
++		} else if (strcmp(cg->subsystem, "files.limit") == 0) {
++			long long int setvalue = 0;
++			const char *cgvalue = cg->value;
++
++			if (lxc_safe_long_long(cgvalue, &setvalue) != 0)
++				return log_error(false, "Invalid integer value %s", cgvalue);
++
++			if (setvalue <= 0)
++				cgvalue = "max";
++
++			ret = lxc_write_openat(h->container_full_path,
++					       cg->subsystem, cgvalue,
++					       strlen(cgvalue));
++			if (ret < 0)
++				return log_error_errno(false, errno, "Failed to set \"%s\" to \"%s\"",
++						       cg->subsystem, cgvalue);
 +		} else {
++			if (strcmp(cg->subsystem, "io.weight") == 0 || strcmp(cg->subsystem, "io.bfq.weight") == 0) {
++				path = must_make_path(h->container_full_path, cg->subsystem, NULL);
++				if (!file_exists(path)) {
++					continue;
++				}
++			}
 +			ret = lxc_write_openat(h->container_full_path,
 +					       cg->subsystem, cg->value,
 +					       strlen(cg->value));
@@ -4017,6 +2855,13 @@ index 000000000..82a4333f3
 +	if (!ops)
 +		return ret_set_errno(false, ENOENT);
 +
++#ifdef HAVE_ISULAD
++	if (ops->no_controller) {
++		DEBUG("no controller found, isgnore isulad_cgfsng_payload_delegate_controllers");
++		return true;
++	}
++#endif
++
 +	return __cgfsng_delegate_controllers(ops, ops->container_cgroup);
 +}
 +
@@ -4145,7 +2990,7 @@ index 000000000..82a4333f3
 +
 +		mountpoint = cg_hybrid_get_mountpoint(line);
 +		if (!mountpoint) {
-+			ERROR("Failed parsing mountpoint from \"%s\"", line);
++			WARN("Failed parsing mountpoint from \"%s\"", line);
 +			continue;
 +		}
 +
@@ -4154,7 +2999,7 @@ index 000000000..82a4333f3
 +		else
 +			base_cgroup = cg_hybrid_get_current_cgroup(basecginfo, NULL, CGROUP2_SUPER_MAGIC);
 +		if (!base_cgroup) {
-+			ERROR("Failed to find current cgroup");
++			WARN("Failed to find current cgroup");
 +			continue;
 +		}
 +
@@ -4277,8 +3122,12 @@ index 000000000..82a4333f3
 +	delegatable = cg_unified_get_controllers(subtree_path);
 +	if (!delegatable)
 +		delegatable = cg_unified_make_empty_controller();
-+	if (!delegatable[0])
++	if (!delegatable[0]) {
 +		TRACE("No controllers are enabled for delegation");
++#ifdef HAVE_ISULAD
++		ops->no_controller = true;
++#endif
++	}
 +
 +	/* TODO: If the user requested specific controllers via lxc.cgroup.use
 +	 * we should verify here. The reason I'm not doing it right is that I'm
@@ -4411,6 +3260,2254 @@ index 000000000..82a4333f3
 +
 +	return move_ptr(cgfsng_ops);
 +}
+diff --git a/src/lxc/json/defs.c b/src/lxc/json/defs.c
+new file mode 100644
+index 0000000..4bf569a
+--- /dev/null
++++ b/src/lxc/json/defs.c
+@@ -0,0 +1,205 @@
++// Generated from defs.json. Do not edit!
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include <string.h>
++#include <read-file.h>
++#include "defs.h"
++
++defs_hook *make_defs_hook(yajl_val tree, struct parser_context *ctx, parser_error *err) {
++    defs_hook *ret = NULL;
++    *err = 0;
++    if (tree == NULL)
++        return ret;
++    ret = safe_malloc(sizeof(*ret));
++    {
++        yajl_val val = get_val(tree, "path", yajl_t_string);
++        if (val != NULL) {
++            char *str = YAJL_GET_STRING(val);
++            ret->path = safe_strdup(str ? str : "");
++        }
++    }
++    {
++        yajl_val tmp = get_val(tree, "args", yajl_t_array);
++        if (tmp != NULL && YAJL_GET_ARRAY(tmp) != NULL && YAJL_GET_ARRAY(tmp)->len > 0) {
++            size_t i;
++            ret->args_len = YAJL_GET_ARRAY(tmp)->len;
++            if (YAJL_GET_ARRAY(tmp)->len > SIZE_MAX / sizeof(*ret->args) - 1) {
++                free_defs_hook(ret);
++                return NULL;
++            }
++            ret->args = safe_malloc((YAJL_GET_ARRAY(tmp)->len + 1) * sizeof(*ret->args));
++            for (i = 0; i < YAJL_GET_ARRAY(tmp)->len; i++) {
++                yajl_val val = YAJL_GET_ARRAY(tmp)->values[i];
++                if (val != NULL) {
++                    char *str = YAJL_GET_STRING(val);
++                    ret->args[i] = safe_strdup(str ? str : "");
++                }
++            }
++        }
++    }
++    {
++        yajl_val tmp = get_val(tree, "env", yajl_t_array);
++        if (tmp != NULL && YAJL_GET_ARRAY(tmp) != NULL && YAJL_GET_ARRAY(tmp)->len > 0) {
++            size_t i;
++            ret->env_len = YAJL_GET_ARRAY(tmp)->len;
++            if (YAJL_GET_ARRAY(tmp)->len > SIZE_MAX / sizeof(*ret->env) - 1) {
++                free_defs_hook(ret);
++                return NULL;
++            }
++            ret->env = safe_malloc((YAJL_GET_ARRAY(tmp)->len + 1) * sizeof(*ret->env));
++            for (i = 0; i < YAJL_GET_ARRAY(tmp)->len; i++) {
++                yajl_val val = YAJL_GET_ARRAY(tmp)->values[i];
++                if (val != NULL) {
++                    char *str = YAJL_GET_STRING(val);
++                    ret->env[i] = safe_strdup(str ? str : "");
++                }
++            }
++        }
++    }
++    {
++        yajl_val val = get_val(tree, "timeout", yajl_t_number);
++        if (val != NULL) {
++            int invalid = common_safe_int(YAJL_GET_NUMBER(val), (int *)&ret->timeout);
++            if (invalid) {
++                if (asprintf(err, "Invalid value '%s' with type 'integer' for key 'timeout': %s", YAJL_GET_NUMBER(val), strerror(-invalid)) < 0)
++                    *err = safe_strdup("error allocating memory");
++                free_defs_hook(ret);
++                return NULL;
++            }
++        }
++    }
++    if (ret->path == NULL) {
++        if (asprintf(err, "Required field '%s' not present", "path") < 0)
++            *err = safe_strdup("error allocating memory");
++        free_defs_hook(ret);
++        return NULL;
++    }
++
++    if (tree->type == yajl_t_object && (ctx->options & PARSE_OPTIONS_STRICT)) {
++        int i;
++        for (i = 0; i < tree->u.object.len; i++)
++            if (strcmp(tree->u.object.keys[i], "path") &&
++                strcmp(tree->u.object.keys[i], "args") &&
++                strcmp(tree->u.object.keys[i], "env") &&
++                strcmp(tree->u.object.keys[i], "timeout")) {
++                if (ctx->stderr > 0)
++                    fprintf(ctx->stderr, "WARNING: unknown key found: %s\n", tree->u.object.keys[i]);
++            }
++        }
++    return ret;
++}
++
++void free_defs_hook(defs_hook *ptr) {
++    if (ptr == NULL)
++        return;
++    free(ptr->path);
++    ptr->path = NULL;
++    if (ptr->args != NULL) {
++        size_t i;
++        for (i = 0; i < ptr->args_len; i++) {
++            if (ptr->args[i] != NULL) {
++                free(ptr->args[i]);
++                ptr->args[i] = NULL;
++            }
++        }
++        free(ptr->args);
++        ptr->args = NULL;
++    }
++    if (ptr->env != NULL) {
++        size_t i;
++        for (i = 0; i < ptr->env_len; i++) {
++            if (ptr->env[i] != NULL) {
++                free(ptr->env[i]);
++                ptr->env[i] = NULL;
++            }
++        }
++        free(ptr->env);
++        ptr->env = NULL;
++    }
++    free(ptr);
++}
++
++yajl_gen_status gen_defs_hook(yajl_gen g, defs_hook *ptr, struct parser_context *ctx, parser_error *err) {
++    yajl_gen_status stat = yajl_gen_status_ok;
++    *err = 0;
++    stat = reformat_start_map(g);
++    if (yajl_gen_status_ok != stat)
++        GEN_SET_ERROR_AND_RETURN(stat, err);
++    if ((ctx->options & GEN_OPTIONS_ALLKEYVALUE) ||(ptr != NULL && ptr->path != NULL)) {
++        char *str = "";
++        stat = reformat_map_key(g, "path", strlen("path"));
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        if (ptr != NULL && ptr->path != NULL) {
++            str = ptr->path;
++        }
++        stat = reformat_string(g, str, strlen(str));
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++    }
++    if ((ctx->options & GEN_OPTIONS_ALLKEYVALUE) || (ptr != NULL && ptr->args != NULL)) {
++        size_t len = 0, i;
++        stat = reformat_map_key(g, "args", strlen("args"));
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        if (ptr != NULL && ptr->args != NULL) {
++            len = ptr->args_len;
++        }
++        if (!len && !(ctx->options & GEN_OPTIONS_SIMPLIFY))
++            yajl_gen_config(g, yajl_gen_beautify, 0);
++        stat = reformat_start_array(g);
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        for (i = 0; i < len; i++) {
++            stat = reformat_string(g, ptr->args[i], strlen(ptr->args[i]));
++            if (yajl_gen_status_ok != stat)
++                GEN_SET_ERROR_AND_RETURN(stat, err);
++        }
++        stat = reformat_end_array(g);
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        if (!len && !(ctx->options & GEN_OPTIONS_SIMPLIFY))
++            yajl_gen_config(g, yajl_gen_beautify, 1);
++    }
++    if ((ctx->options & GEN_OPTIONS_ALLKEYVALUE) || (ptr != NULL && ptr->env != NULL)) {
++        size_t len = 0, i;
++        stat = reformat_map_key(g, "env", strlen("env"));
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        if (ptr != NULL && ptr->env != NULL) {
++            len = ptr->env_len;
++        }
++        if (!len && !(ctx->options & GEN_OPTIONS_SIMPLIFY))
++            yajl_gen_config(g, yajl_gen_beautify, 0);
++        stat = reformat_start_array(g);
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        for (i = 0; i < len; i++) {
++            stat = reformat_string(g, ptr->env[i], strlen(ptr->env[i]));
++            if (yajl_gen_status_ok != stat)
++                GEN_SET_ERROR_AND_RETURN(stat, err);
++        }
++        stat = reformat_end_array(g);
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        if (!len && !(ctx->options & GEN_OPTIONS_SIMPLIFY))
++            yajl_gen_config(g, yajl_gen_beautify, 1);
++    }
++    if ((ctx->options & GEN_OPTIONS_ALLKEYVALUE) ||(ptr != NULL && ptr->timeout)) {
++        long long int num = 0;
++        stat = reformat_map_key(g, "timeout", strlen("timeout"));
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        if (ptr != NULL && ptr->timeout) {
++            num = (long long int)ptr->timeout;
++        }
++        stat = reformat_int(g, num);
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++    }
++    stat = reformat_end_map(g);
++    if (yajl_gen_status_ok != stat)
++        GEN_SET_ERROR_AND_RETURN(stat, err);
++    return yajl_gen_status_ok;
++}
+diff --git a/src/lxc/json/defs.h b/src/lxc/json/defs.h
+new file mode 100644
+index 0000000..0bbd8ac
+--- /dev/null
++++ b/src/lxc/json/defs.h
+@@ -0,0 +1,37 @@
++// Generated from defs.json. Do not edit!
++#ifndef DEFS_SCHEMA_H
++#define DEFS_SCHEMA_H
++
++#include <sys/types.h>
++#include <stdint.h>
++#include "json_common.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct {
++    char *path;
++
++    char **args;
++    size_t args_len;
++
++    char **env;
++    size_t env_len;
++
++    int timeout;
++
++}
++defs_hook;
++
++void free_defs_hook(defs_hook *ptr);
++
++defs_hook *make_defs_hook(yajl_val tree, struct parser_context *ctx, parser_error *err);
++
++yajl_gen_status gen_defs_hook(yajl_gen g, defs_hook *ptr, struct parser_context *ctx, parser_error *err);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/lxc/json/json_common.c b/src/lxc/json/json_common.c
+new file mode 100755
+index 0000000..ec20c59
+--- /dev/null
++++ b/src/lxc/json/json_common.c
+@@ -0,0 +1,1153 @@
++// Auto generated file. Do not edit!
++#define _GNU_SOURCE
++#include <stdio.h>
++#include <errno.h>
++#include <limits.h>
++#include "json_common.h"
++
++#define MAX_NUM_STR_LEN 21
++
++yajl_gen_status reformat_number(void *ctx, const char *str, size_t len) {
++    yajl_gen g = (yajl_gen) ctx;
++    return yajl_gen_number(g, str, len);
++}
++
++yajl_gen_status reformat_uint(void *ctx, long long unsigned int num) {
++    char numstr[MAX_NUM_STR_LEN];
++    int ret;
++
++    ret = snprintf(numstr, MAX_NUM_STR_LEN, "%llu", num);
++    if (ret < 0 || ret >= MAX_NUM_STR_LEN) {
++        return yajl_gen_in_error_state;
++    }
++    return reformat_number(ctx, (const char *)numstr, strlen(numstr));
++}
++
++yajl_gen_status reformat_int(void *ctx, long long int num) {
++    char numstr[MAX_NUM_STR_LEN];
++    int ret;
++
++    ret = snprintf(numstr, MAX_NUM_STR_LEN, "%lld", num);
++    if (ret < 0 || ret >= MAX_NUM_STR_LEN) {
++        return yajl_gen_in_error_state;
++    }
++    return reformat_number(ctx, (const char *)numstr, strlen(numstr));
++}
++
++yajl_gen_status reformat_double(void *ctx, double num) {
++    yajl_gen g = (yajl_gen) ctx;
++    return yajl_gen_double(g, num);
++}
++
++yajl_gen_status reformat_string(void *ctx, const char *str, size_t len) {
++    yajl_gen g = (yajl_gen) ctx;
++    return yajl_gen_string(g, (const unsigned char *)str, len);
++}
++
++yajl_gen_status reformat_null(void *ctx) {
++    yajl_gen g = (yajl_gen) ctx;
++    return yajl_gen_null(g);
++}
++
++yajl_gen_status reformat_bool(void *ctx, int boolean) {
++    yajl_gen g = (yajl_gen) ctx;
++    return yajl_gen_bool(g, boolean);
++}
++
++yajl_gen_status reformat_map_key(void *ctx, const char *str, size_t len) {
++    yajl_gen g = (yajl_gen) ctx;
++    return yajl_gen_string(g, (const unsigned char *)str, len);
++}
++
++yajl_gen_status reformat_start_map(void *ctx) {
++    yajl_gen g = (yajl_gen) ctx;
++    return yajl_gen_map_open(g);
++}
++
++yajl_gen_status reformat_end_map(void *ctx) {
++    yajl_gen g = (yajl_gen) ctx;
++    return yajl_gen_map_close(g);
++}
++
++yajl_gen_status reformat_start_array(void *ctx) {
++    yajl_gen g = (yajl_gen) ctx;
++    return yajl_gen_array_open(g);
++}
++
++yajl_gen_status reformat_end_array(void *ctx) {
++    yajl_gen g = (yajl_gen) ctx;
++    return yajl_gen_array_close(g);
++}
++
++bool json_gen_init(yajl_gen *g, struct parser_context *ctx) {
++    *g = yajl_gen_alloc(NULL);
++    if (NULL == *g) {
++        return false;
++
++    }
++    yajl_gen_config(*g, yajl_gen_beautify, !(ctx->options & GEN_OPTIONS_SIMPLIFY));
++    yajl_gen_config(*g, yajl_gen_validate_utf8, !(ctx->options & GEN_OPTIONS_NOT_VALIDATE_UTF8));
++    return true;
++}
++
++yajl_val get_val(yajl_val tree, const char *name, yajl_type type) {
++    const char *path[] = { name, NULL };
++    return yajl_tree_get(tree, path, type);
++}
++
++void *safe_malloc(size_t size) {
++    void *ret = NULL;
++    if (size == 0) {
++        abort();
++    }
++    ret = calloc(1, size);
++    if (ret == NULL) {
++        abort();
++    }
++    return ret;
++}
++
++int common_safe_double(const char *numstr, double *converted) {
++    char *err_str = NULL;
++    double d;
++
++    if (numstr == NULL) {
++        return -EINVAL;
++    }
++
++    errno = 0;
++    d = strtod(numstr, &err_str);
++    if (errno > 0) {
++        return -errno;
++    }
++
++    if (err_str == NULL || err_str == numstr || *err_str != '\0') {
++        return -EINVAL;
++    }
++
++    *converted = d;
++    return 0;
++}
++
++int common_safe_uint8(const char *numstr, uint8_t *converted) {
++    char *err = NULL;
++    unsigned long int uli;
++
++    if (numstr == NULL) {
++        return -EINVAL;
++    }
++
++    errno = 0;
++    uli = strtoul(numstr, &err, 0);
++    if (errno > 0) {
++        return -errno;
++    }
++
++    if (err == NULL || err == numstr || *err != '\0') {
++        return -EINVAL;
++    }
++
++    if (uli > UINT8_MAX) {
++        return -ERANGE;
++    }
++
++    *converted = (uint8_t)uli;
++    return 0;
++}
++
++int common_safe_uint16(const char *numstr, uint16_t *converted) {
++    char *err = NULL;
++    unsigned long int uli;
++
++    if (numstr == NULL) {
++        return -EINVAL;
++    }
++
++    errno = 0;
++    uli = strtoul(numstr, &err, 0);
++    if (errno > 0) {
++        return -errno;
++    }
++
++    if (err == NULL || err == numstr || *err != '\0') {
++        return -EINVAL;
++    }
++
++    if (uli > UINT16_MAX) {
++        return -ERANGE;
++    }
++
++    *converted = (uint16_t)uli;
++    return 0;
++}
++
++int common_safe_uint32(const char *numstr, uint32_t *converted) {
++    char *err = NULL;
++    unsigned long long int ull;
++
++    if (numstr == NULL) {
++        return -EINVAL;
++    }
++
++    errno = 0;
++    ull = strtoull(numstr, &err, 0);
++    if (errno > 0) {
++        return -errno;
++    }
++
++    if (err == NULL || err == numstr || *err != '\0') {
++        return -EINVAL;
++    }
++
++    if (ull > UINT32_MAX) {
++        return -ERANGE;
++    }
++
++    *converted = (uint32_t)ull;
++    return 0;
++}
++
++int common_safe_uint64(const char *numstr, uint64_t *converted) {
++    char *err = NULL;
++    unsigned long long int ull;
++
++    if (numstr == NULL) {
++        return -EINVAL;
++    }
++
++    errno = 0;
++    ull = strtoull(numstr, &err, 0);
++    if (errno > 0) {
++        return -errno;
++    }
++
++    if (err == NULL || err == numstr || *err != '\0') {
++        return -EINVAL;
++    }
++
++    *converted = (uint64_t)ull;
++    return 0;
++}
++
++int common_safe_uint(const char *numstr, unsigned int *converted) {
++    char *err = NULL;
++    unsigned long long int ull;
++
++    if (numstr == NULL) {
++        return -EINVAL;
++    }
++
++    errno = 0;
++    ull = strtoull(numstr, &err, 0);
++    if (errno > 0) {
++        return -errno;
++    }
++
++    if (err == NULL || err == numstr || *err != '\0') {
++        return -EINVAL;
++    }
++
++    if (ull > UINT_MAX) {
++        return -ERANGE;
++    }
++
++    *converted = (unsigned int)ull;
++    return 0;
++}
++
++int common_safe_int8(const char *numstr, int8_t *converted) {
++    char *err = NULL;
++    long int li;
++
++    if (numstr == NULL) {
++        return -EINVAL;
++    }
++
++    errno = 0;
++    li = strtol(numstr, &err, 0);
++    if (errno > 0) {
++        return -errno;
++    }
++
++    if (err == NULL || err == numstr || *err != '\0') {
++        return -EINVAL;
++    }
++
++    if (li > INT8_MAX || li < INT8_MIN) {
++        return -ERANGE;
++    }
++
++    *converted = (int8_t)li;
++    return 0;
++}
++
++int common_safe_int16(const char *numstr, int16_t *converted) {
++    char *err = NULL;
++    long int li;
++
++    if (numstr == NULL) {
++        return -EINVAL;
++    }
++
++    errno = 0;
++    li = strtol(numstr, &err, 0);
++    if (errno > 0) {
++        return -errno;
++    }
++
++    if (err == NULL || err == numstr || *err != '\0') {
++        return -EINVAL;
++    }
++
++    if (li > INT16_MAX || li < INT16_MIN) {
++        return -ERANGE;
++    }
++
++    *converted = (int16_t)li;
++    return 0;
++}
++
++int common_safe_int32(const char *numstr, int32_t *converted) {
++    char *err = NULL;
++    long long int lli;
++
++    if (numstr == NULL) {
++        return -EINVAL;
++    }
++
++    errno = 0;
++    lli = strtol(numstr, &err, 0);
++    if (errno > 0) {
++        return -errno;
++    }
++
++    if (err == NULL || err == numstr || *err != '\0') {
++        return -EINVAL;
++    }
++
++    if (lli > INT32_MAX || lli < INT32_MIN) {
++        return -ERANGE;
++    }
++
++    *converted = (int32_t)lli;
++    return 0;
++}
++
++int common_safe_int64(const char *numstr, int64_t *converted) {
++    char *err = NULL;
++    long long int lli;
++
++    if (numstr == NULL) {
++        return -EINVAL;
++    }
++
++    errno = 0;
++    lli = strtoll(numstr, &err, 0);
++    if (errno > 0) {
++        return -errno;
++    }
++
++    if (err == NULL || err == numstr || *err != '\0') {
++        return -EINVAL;
++    }
++
++    *converted = (int64_t)lli;
++    return 0;
++}
++
++int common_safe_int(const char *numstr, int *converted) {
++    char *err = NULL;
++    long long int lli;
++
++    if (numstr == NULL) {
++        return -EINVAL;
++    }
++
++    errno = 0;
++    lli = strtol(numstr, &err, 0);
++    if (errno > 0) {
++        return -errno;
++    }
++
++    if (err == NULL || err == numstr || *err != '\0') {
++        return -EINVAL;
++    }
++
++    if (lli > INT_MAX || lli < INT_MIN) {
++        return -ERANGE;
++    }
++
++    *converted = (int)lli;
++    return 0;
++}
++
++yajl_gen_status gen_json_map_int_int(void *ctx, json_map_int_int *map, struct parser_context *ptx, parser_error *err) {
++    yajl_gen_status stat = yajl_gen_status_ok;
++    yajl_gen g = (yajl_gen) ctx;
++    size_t len = 0, i = 0;
++    if (map != NULL) {
++        len = map->len;
++    }
++    if (!len && !(ptx->options & GEN_OPTIONS_SIMPLIFY)) {
++        yajl_gen_config(g, yajl_gen_beautify, 0);
++    }
++    stat = reformat_start_map(g);
++    if (yajl_gen_status_ok != stat) {
++        GEN_SET_ERROR_AND_RETURN(stat, err);
++
++    }
++    for (i = 0; i < len; i++) {
++        char numstr[MAX_NUM_STR_LEN];
++        int nret;
++        nret = snprintf(numstr, MAX_NUM_STR_LEN, "%lld", (long long int)map->keys[i]);
++        if (nret < 0 || nret >= MAX_NUM_STR_LEN) {
++            if (!*err && asprintf(err, "Error to print string") < 0) {
++                *(err) = safe_strdup("error allocating memory");
++            }
++            return yajl_gen_in_error_state;
++        }
++        stat = reformat_string(g, numstr, strlen(numstr));
++        if (yajl_gen_status_ok != stat) {
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        }
++        stat = reformat_int(g, map->values[i]);
++        if (yajl_gen_status_ok != stat) {
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        }
++    }
++
++    stat = reformat_end_map(g);
++    if (yajl_gen_status_ok != stat) {
++        GEN_SET_ERROR_AND_RETURN(stat, err);
++    }
++    if (!len && !(ptx->options & GEN_OPTIONS_SIMPLIFY)) {
++        yajl_gen_config(g, yajl_gen_beautify, 1);
++    }
++    return yajl_gen_status_ok;
++}
++
++void free_json_map_int_int(json_map_int_int *map) {
++    if (map != NULL) {
++        size_t i;
++        for (i = 0; i < map->len; i++) {
++            // No need to free key for type int
++            // No need to free value for type int
++        }
++        free(map->keys);
++        map->keys = NULL;
++        free(map->values);
++        map->values = NULL;
++        free(map);
++    }
++}
++json_map_int_int *make_json_map_int_int(yajl_val src, struct parser_context *ctx, parser_error *err) {
++    json_map_int_int *ret = NULL;
++    if (src != NULL && YAJL_GET_OBJECT(src) != NULL) {
++        size_t i;
++        size_t len = YAJL_GET_OBJECT(src)->len;
++        if (len > SIZE_MAX / sizeof(int) - 1) {
++            return NULL;
++        }
++        ret = safe_malloc(sizeof(*ret));
++        ret->len = len;
++        ret->keys = safe_malloc((len + 1) * sizeof(int));
++        ret->values = safe_malloc((len + 1) * sizeof(int));
++        for (i = 0; i < len; i++) {
++            const char *srckey = YAJL_GET_OBJECT(src)->keys[i];
++            yajl_val srcval = YAJL_GET_OBJECT(src)->values[i];
++
++            if (srckey != NULL) {
++                int invalid;
++                invalid = common_safe_int(srckey, &(ret->keys[i]));
++                if (invalid) {
++                    if (*err == NULL && asprintf(err, "Invalid key '%s' with type 'int': %s", srckey, strerror(-invalid)) < 0) {
++                        *(err) = safe_strdup("error allocating memory");
++                    }
++                    free_json_map_int_int(ret);
++                    return NULL;
++                }
++            }
++
++            if (srcval != NULL) {
++                int invalid;
++                if (!YAJL_IS_NUMBER(srcval)) {
++                    if (*err == NULL && asprintf(err, "Invalid value with type 'int' for key '%s'", srckey) < 0) {
++                        *(err) = safe_strdup("error allocating memory");
++                    }
++                    free_json_map_int_int(ret);
++                    return NULL;
++                }
++                invalid = common_safe_int(YAJL_GET_NUMBER(srcval), &(ret->values[i]));
++                if (invalid) {
++                    if (*err == NULL && asprintf(err, "Invalid value with type 'int' for key '%s': %s", srckey, strerror(-invalid)) < 0) {
++                        *(err) = safe_strdup("error allocating memory");
++                    }
++                    free_json_map_int_int(ret);
++                    return NULL;
++                }
++            }
++        }
++    }
++    return ret;
++}
++int append_json_map_int_int(json_map_int_int *map, int key, int val) {
++    size_t len;
++    int *keys = NULL;
++    int *vals = NULL;
++
++    if (map == NULL) {
++        return -1;
++    }
++
++    if ((SIZE_MAX / sizeof(int) - 1) < map->len) {
++        return -1;
++    }
++
++    len = map->len + 1;
++    keys = safe_malloc(len * sizeof(int));
++    vals = safe_malloc(len * sizeof(int));
++
++    if (map->len) {
++        (void)memcpy(keys, map->keys, map->len * sizeof(int));
++        (void)memcpy(vals, map->values, map->len * sizeof(int));
++    }
++    free(map->keys);
++    map->keys = keys;
++    free(map->values);
++    map->values = vals;
++    map->keys[map->len] = key;
++    map->values[map->len] = val;
++
++    map->len++;
++    return 0;
++}
++
++yajl_gen_status gen_json_map_int_bool(void *ctx, json_map_int_bool *map, struct parser_context *ptx, parser_error *err) {
++    yajl_gen_status stat = yajl_gen_status_ok;
++    yajl_gen g = (yajl_gen) ctx;
++    size_t len = 0, i = 0;
++    if (map != NULL) {
++        len = map->len;
++    }
++    if (!len && !(ptx->options & GEN_OPTIONS_SIMPLIFY)) {
++        yajl_gen_config(g, yajl_gen_beautify, 0);
++    }
++    stat = reformat_start_map(g);
++    if (yajl_gen_status_ok != stat) {
++        GEN_SET_ERROR_AND_RETURN(stat, err);
++
++    }
++    for (i = 0; i < len; i++) {
++        char numstr[MAX_NUM_STR_LEN];
++        int nret;
++        nret = snprintf(numstr, MAX_NUM_STR_LEN, "%lld", (long long int)map->keys[i]);
++        if (nret < 0 || nret >= MAX_NUM_STR_LEN) {
++            if (!*err && asprintf(err, "Error to print string") < 0) {
++                *(err) = safe_strdup("error allocating memory");
++            }
++            return yajl_gen_in_error_state;
++        }
++        stat = reformat_string(g, numstr, strlen(numstr));
++        if (yajl_gen_status_ok != stat) {
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        }
++        stat = reformat_bool(g, map->values[i]);
++        if (yajl_gen_status_ok != stat) {
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        }
++    }
++
++    stat = reformat_end_map(g);
++    if (yajl_gen_status_ok != stat) {
++        GEN_SET_ERROR_AND_RETURN(stat, err);
++    }
++    if (!len && !(ptx->options & GEN_OPTIONS_SIMPLIFY)) {
++        yajl_gen_config(g, yajl_gen_beautify, 1);
++    }
++    return yajl_gen_status_ok;
++}
++
++void free_json_map_int_bool(json_map_int_bool *map) {
++    if (map != NULL) {
++        free(map->keys);
++        map->keys = NULL;
++        free(map->values);
++        map->values = NULL;
++        free(map);
++    }
++}
++json_map_int_bool *make_json_map_int_bool(yajl_val src, struct parser_context *ctx, parser_error *err) {
++    json_map_int_bool *ret = NULL;
++    if (src != NULL && YAJL_GET_OBJECT(src) != NULL) {
++        size_t i;
++        size_t len = YAJL_GET_OBJECT(src)->len;
++        if (len > SIZE_MAX / sizeof(int) - 1) {
++            return NULL;
++        }
++        ret = safe_malloc(sizeof(*ret));
++        ret->len = len;
++        ret->keys = safe_malloc((len + 1) * sizeof(int));
++        ret->values = safe_malloc((len + 1) * sizeof(bool));
++        for (i = 0; i < len; i++) {
++            const char *srckey = YAJL_GET_OBJECT(src)->keys[i];
++            yajl_val srcval = YAJL_GET_OBJECT(src)->values[i];
++
++            if (srckey != NULL) {
++                int invalid;
++                invalid = common_safe_int(srckey, &(ret->keys[i]));
++                if (invalid) {
++                    if (*err == NULL && asprintf(err, "Invalid key '%s' with type 'int': %s", srckey, strerror(-invalid)) < 0) {
++                        *(err) = safe_strdup("error allocating memory");
++                    }
++                    free_json_map_int_bool(ret);
++                    return NULL;
++                }
++            }
++
++            if (srcval != NULL) {
++                if (YAJL_IS_TRUE(srcval)) {
++                    ret->values[i] = true;
++                } else if (YAJL_IS_FALSE(srcval)) {
++                    ret->values[i] = false;
++                } else {
++                    if (*err == NULL && asprintf(err, "Invalid value with type 'bool' for key '%s'", srckey) < 0) {
++                        *(err) = safe_strdup("error allocating memory");
++                    }
++                    free_json_map_int_bool(ret);
++                    return NULL;
++                }
++            }
++        }
++    }
++    return ret;
++}
++int append_json_map_int_bool(json_map_int_bool *map, int key, bool val) {
++    size_t len;
++    int *keys = NULL;
++    bool *vals = NULL;
++
++    if (map == NULL) {
++        return -1;
++    }
++
++    if ((SIZE_MAX / sizeof(int) - 1) < map->len || (SIZE_MAX / sizeof(bool) - 1) < map->len) {
++        return -1;
++    }
++
++    len = map->len + 1;
++    keys = safe_malloc(len * sizeof(int));
++    vals = safe_malloc(len * sizeof(bool));
++
++    if (map->len) {
++        (void)memcpy(keys, map->keys, map->len * sizeof(int));
++        (void)memcpy(vals, map->values, map->len * sizeof(bool));
++    }
++    free(map->keys);
++    map->keys = keys;
++    free(map->values);
++    map->values = vals;
++    map->keys[map->len] = key;
++    map->values[map->len] = val;
++
++    map->len++;
++    return 0;
++}
++
++yajl_gen_status gen_json_map_int_string(void *ctx, json_map_int_string *map, struct parser_context *ptx, parser_error *err) {
++    yajl_gen_status stat = yajl_gen_status_ok;
++    yajl_gen g = (yajl_gen) ctx;
++    size_t len = 0, i = 0;
++    if (map != NULL) {
++        len = map->len;
++    }
++    if (!len && !(ptx->options & GEN_OPTIONS_SIMPLIFY)) {
++        yajl_gen_config(g, yajl_gen_beautify, 0);
++    }
++    stat = reformat_start_map(g);
++    if (yajl_gen_status_ok != stat) {
++        GEN_SET_ERROR_AND_RETURN(stat, err);
++
++    }
++    for (i = 0; i < len; i++) {
++        char numstr[MAX_NUM_STR_LEN];
++        int nret;
++        nret = snprintf(numstr, MAX_NUM_STR_LEN, "%lld", (long long int)map->keys[i]);
++        if (nret < 0 || nret >= MAX_NUM_STR_LEN) {
++            if (!*err && asprintf(err, "Error to print string") < 0) {
++                *(err) = safe_strdup("error allocating memory");
++            }
++            return yajl_gen_in_error_state;
++        }
++        stat = reformat_string(g, numstr, strlen(numstr));
++        if (yajl_gen_status_ok != stat) {
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        }
++        stat = reformat_string(g, map->values[i], strlen(map->values[i]));;
++        if (yajl_gen_status_ok != stat) {
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        }
++    }
++
++    stat = reformat_end_map(g);
++    if (yajl_gen_status_ok != stat) {
++        GEN_SET_ERROR_AND_RETURN(stat, err);
++    }
++    if (!len && !(ptx->options & GEN_OPTIONS_SIMPLIFY)) {
++        yajl_gen_config(g, yajl_gen_beautify, 1);
++    }
++    return yajl_gen_status_ok;
++}
++
++void free_json_map_int_string(json_map_int_string *map) {
++    if (map != NULL) {
++        size_t i;
++        for (i = 0; i < map->len; i++) {
++            // No need to free key for type int
++            free(map->values[i]);
++            map->values[i] = NULL;
++        }
++        free(map->keys);
++        map->keys = NULL;
++        free(map->values);
++        map->values = NULL;
++        free(map);
++    }
++}
++json_map_int_string *make_json_map_int_string(yajl_val src, struct parser_context *ctx, parser_error *err) {
++    json_map_int_string *ret = NULL;
++    if (src != NULL && YAJL_GET_OBJECT(src) != NULL) {
++        size_t i;
++        size_t len = YAJL_GET_OBJECT(src)->len;
++        if (len > SIZE_MAX / sizeof(char *) - 1) {
++            return NULL;
++        }
++        ret = safe_malloc(sizeof(*ret));
++        ret->len = len;
++        ret->keys = safe_malloc((len + 1) * sizeof(int));
++        ret->values = safe_malloc((len + 1) * sizeof(char *));
++        for (i = 0; i < len; i++) {
++            const char *srckey = YAJL_GET_OBJECT(src)->keys[i];
++            yajl_val srcval = YAJL_GET_OBJECT(src)->values[i];
++
++            if (srckey != NULL) {
++                int invalid;
++                invalid = common_safe_int(srckey, &(ret->keys[i]));
++                if (invalid) {
++                    if (*err == NULL && asprintf(err, "Invalid key '%s' with type 'int': %s", srckey, strerror(-invalid)) < 0) {
++                        *(err) = safe_strdup("error allocating memory");
++                    }
++                    free_json_map_int_string(ret);
++                    return NULL;
++                }
++            }
++
++            if (srcval != NULL) {
++                if (!YAJL_IS_STRING(srcval)) {
++                    if (*err == NULL && asprintf(err, "Invalid value with type 'string' for key '%s'", srckey) < 0) {
++                        *(err) = safe_strdup("error allocating memory");
++                    }
++                    free_json_map_int_string(ret);
++                    return NULL;
++                }
++                char *str = YAJL_GET_STRING(srcval);
++                ret->values[i] = safe_strdup(str ? str : "");
++            }
++        }
++    }
++    return ret;
++}
++int append_json_map_int_string(json_map_int_string *map, int key, const char *val) {
++    size_t len;
++    int *keys = NULL;
++    char **vals = NULL;
++
++    if (map == NULL) {
++        return -1;
++    }
++
++    if ((SIZE_MAX / sizeof(int) - 1) < map->len || (SIZE_MAX / sizeof(char *) - 1) < map->len) {
++        return -1;
++    }
++
++    len = map->len + 1;
++    keys = safe_malloc(len * sizeof(int));
++    vals = safe_malloc(len * sizeof(char *));
++
++    if (map->len) {
++        (void)memcpy(keys, map->keys, map->len * sizeof(int));
++        (void)memcpy(vals, map->values, map->len * sizeof(char *));
++    }
++    free(map->keys);
++    map->keys = keys;
++    free(map->values);
++    map->values = vals;
++    map->keys[map->len] = key;
++    map->values[map->len] = safe_strdup(val ? val : "");
++
++    map->len++;
++    return 0;
++}
++
++yajl_gen_status gen_json_map_string_int(void *ctx, json_map_string_int *map, struct parser_context *ptx, parser_error *err) {
++    yajl_gen_status stat = yajl_gen_status_ok;
++    yajl_gen g = (yajl_gen) ctx;
++    size_t len = 0, i = 0;
++    if (map != NULL) {
++        len = map->len;
++    }
++    if (!len && !(ptx->options & GEN_OPTIONS_SIMPLIFY)) {
++        yajl_gen_config(g, yajl_gen_beautify, 0);
++    }
++    stat = reformat_start_map(g);
++    if (yajl_gen_status_ok != stat) {
++        GEN_SET_ERROR_AND_RETURN(stat, err);
++
++    }
++    for (i = 0; i < len; i++) {
++        stat = reformat_string(g, map->keys[i], strlen(map->keys[i]));
++        if (yajl_gen_status_ok != stat) {
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        }
++        stat = reformat_int(g, map->values[i]);
++        if (yajl_gen_status_ok != stat) {
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        }
++    }
++
++    stat = reformat_end_map(g);
++    if (yajl_gen_status_ok != stat) {
++        GEN_SET_ERROR_AND_RETURN(stat, err);
++    }
++    if (!len && !(ptx->options & GEN_OPTIONS_SIMPLIFY)) {
++        yajl_gen_config(g, yajl_gen_beautify, 1);
++    }
++    return yajl_gen_status_ok;
++}
++
++void free_json_map_string_int(json_map_string_int *map) {
++    if (map != NULL) {
++        size_t i;
++        for (i = 0; i < map->len; i++) {
++            free(map->keys[i]);
++            map->keys[i] = NULL;
++            // No need to free value for type int
++        }
++        free(map->keys);
++        map->keys = NULL;
++        free(map->values);
++        map->values = NULL;
++        free(map);
++    }
++}
++json_map_string_int *make_json_map_string_int(yajl_val src, struct parser_context *ctx, parser_error *err) {
++    json_map_string_int *ret = NULL;
++    if (src != NULL && YAJL_GET_OBJECT(src) != NULL) {
++        size_t i;
++        size_t len = YAJL_GET_OBJECT(src)->len;
++        if (len > SIZE_MAX / sizeof(char *) - 1) {
++            return NULL;
++        }
++        ret = safe_malloc(sizeof(*ret));
++        ret->len = len;
++        ret->keys = safe_malloc((len + 1) * sizeof(char *));
++        ret->values = safe_malloc((len + 1) * sizeof(int));
++        for (i = 0; i < len; i++) {
++            const char *srckey = YAJL_GET_OBJECT(src)->keys[i];
++            yajl_val srcval = YAJL_GET_OBJECT(src)->values[i];
++            ret->keys[i] = safe_strdup(srckey ? srckey : "");
++
++            if (srcval != NULL) {
++                int invalid;
++                if (!YAJL_IS_NUMBER(srcval)) {
++                    if (*err == NULL && asprintf(err, "Invalid value with type 'int' for key '%s'", srckey) < 0) {
++                        *(err) = safe_strdup("error allocating memory");
++                    }
++                    free_json_map_string_int(ret);
++                    return NULL;
++                }
++                invalid = common_safe_int(YAJL_GET_NUMBER(srcval), &(ret->values[i]));
++                if (invalid) {
++                    if (*err == NULL && asprintf(err, "Invalid value with type 'int' for key '%s': %s", srckey, strerror(-invalid)) < 0) {
++                        *(err) = safe_strdup("error allocating memory");
++                    }
++                    free_json_map_string_int(ret);
++                    return NULL;
++                }
++            }
++        }
++    }
++    return ret;
++}
++int append_json_map_string_int(json_map_string_int *map, const char *key, int val) {
++    size_t len;
++    char **keys = NULL;
++    int *vals = NULL;
++
++    if (map == NULL) {
++        return -1;
++    }
++
++    if ((SIZE_MAX / sizeof(char *) - 1) < map->len || (SIZE_MAX / sizeof(int) - 1) < map->len) {
++        return -1;
++    }
++
++    len = map->len + 1;
++    keys = safe_malloc(len * sizeof(char *));
++    vals = safe_malloc(len * sizeof(int));
++
++    if (map->len) {
++        (void)memcpy(keys, map->keys, map->len * sizeof(char *));
++        (void)memcpy(vals, map->values, map->len * sizeof(int));
++    }
++    free(map->keys);
++    map->keys = keys;
++    free(map->values);
++    map->values = vals;
++    map->keys[map->len] = safe_strdup(key ? key : "");
++    map->values[map->len] = val;
++
++    map->len++;
++    return 0;
++}
++
++yajl_gen_status gen_json_map_string_bool(void *ctx, json_map_string_bool *map, struct parser_context *ptx, parser_error *err) {
++    yajl_gen_status stat = yajl_gen_status_ok;
++    yajl_gen g = (yajl_gen) ctx;
++    size_t len = 0, i = 0;
++    if (map != NULL) {
++        len = map->len;
++    }
++    if (!len && !(ptx->options & GEN_OPTIONS_SIMPLIFY)) {
++        yajl_gen_config(g, yajl_gen_beautify, 0);
++    }
++    stat = reformat_start_map(g);
++    if (yajl_gen_status_ok != stat) {
++        GEN_SET_ERROR_AND_RETURN(stat, err);
++
++    }
++    for (i = 0; i < len; i++) {
++        stat = reformat_string(g, map->keys[i], strlen(map->keys[i]));
++        if (yajl_gen_status_ok != stat) {
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        }
++        stat = reformat_bool(g, map->values[i]);
++        if (yajl_gen_status_ok != stat) {
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        }
++    }
++
++    stat = reformat_end_map(g);
++    if (yajl_gen_status_ok != stat) {
++        GEN_SET_ERROR_AND_RETURN(stat, err);
++    }
++    if (!len && !(ptx->options & GEN_OPTIONS_SIMPLIFY)) {
++        yajl_gen_config(g, yajl_gen_beautify, 1);
++    }
++    return yajl_gen_status_ok;
++}
++
++void free_json_map_string_bool(json_map_string_bool *map) {
++    if (map != NULL) {
++        size_t i;
++        for (i = 0; i < map->len; i++) {
++            free(map->keys[i]);
++            map->keys[i] = NULL;
++            // No need to free value for type bool
++        }
++        free(map->keys);
++        map->keys = NULL;
++        free(map->values);
++        map->values = NULL;
++        free(map);
++    }
++}
++json_map_string_bool *make_json_map_string_bool(yajl_val src, struct parser_context *ctx, parser_error *err) {
++    json_map_string_bool *ret = NULL;
++    if (src != NULL && YAJL_GET_OBJECT(src) != NULL) {
++        size_t i;
++        size_t len = YAJL_GET_OBJECT(src)->len;
++        if (len > SIZE_MAX / sizeof(char *) - 1) {
++            return NULL;
++        }
++        ret = safe_malloc(sizeof(*ret));
++        ret->len = len;
++        ret->keys = safe_malloc((len + 1) * sizeof(char *));
++        ret->values = safe_malloc((len + 1) * sizeof(bool));
++        for (i = 0; i < len; i++) {
++            const char *srckey = YAJL_GET_OBJECT(src)->keys[i];
++            yajl_val srcval = YAJL_GET_OBJECT(src)->values[i];
++            ret->keys[i] = safe_strdup(srckey ? srckey : "");
++
++            if (srcval != NULL) {
++                if (YAJL_IS_TRUE(srcval)) {
++                    ret->values[i] = true;
++                } else if (YAJL_IS_FALSE(srcval)) {
++                    ret->values[i] = false;
++                } else {
++                    if (*err == NULL && asprintf(err, "Invalid value with type 'bool' for key '%s'", srckey) < 0) {
++                        *(err) = safe_strdup("error allocating memory");
++                    }
++                    free_json_map_string_bool(ret);
++                    return NULL;
++                }
++            }
++        }
++    }
++    return ret;
++}
++
++int append_json_map_string_bool(json_map_string_bool *map, const char *key, bool val) {
++    size_t len;
++    char **keys = NULL;
++    bool *vals = NULL;
++
++    if (map == NULL) {
++        return -1;
++    }
++
++    if ((SIZE_MAX / sizeof(char *) - 1) < map->len || (SIZE_MAX / sizeof(bool) - 1) < map->len) {
++        return -1;
++    }
++
++    len = map->len + 1;
++    keys = safe_malloc(len * sizeof(char *));
++    vals = safe_malloc(len * sizeof(bool));
++
++    if (map->len) {
++        (void)memcpy(keys, map->keys, map->len * sizeof(char *));
++        (void)memcpy(vals, map->values, map->len * sizeof(bool));
++    }
++    free(map->keys);
++    map->keys = keys;
++    free(map->values);
++    map->values = vals;
++    map->keys[map->len] = safe_strdup(key ? key : "");
++    map->values[map->len] = val;
++
++    map->len++;
++    return 0;
++}
++
++yajl_gen_status gen_json_map_string_string(void *ctx, json_map_string_string *map, struct parser_context *ptx, parser_error *err) {
++    yajl_gen_status stat = yajl_gen_status_ok;
++    yajl_gen g = (yajl_gen) ctx;
++    size_t len = 0, i = 0;
++    if (map != NULL) {
++        len = map->len;
++    }
++    if (!len && !(ptx->options & GEN_OPTIONS_SIMPLIFY)) {
++        yajl_gen_config(g, yajl_gen_beautify, 0);
++    }
++    stat = reformat_start_map(g);
++    if (yajl_gen_status_ok != stat) {
++        GEN_SET_ERROR_AND_RETURN(stat, err);
++
++    }
++    for (i = 0; i < len; i++) {
++        stat = reformat_string(g, map->keys[i], strlen(map->keys[i]));
++        if (yajl_gen_status_ok != stat) {
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        }
++        stat = reformat_string(g, map->values[i], strlen(map->values[i]));;
++        if (yajl_gen_status_ok != stat) {
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        }
++    }
++
++    stat = reformat_end_map(g);
++    if (yajl_gen_status_ok != stat) {
++        GEN_SET_ERROR_AND_RETURN(stat, err);
++    }
++    if (!len && !(ptx->options & GEN_OPTIONS_SIMPLIFY)) {
++        yajl_gen_config(g, yajl_gen_beautify, 1);
++    }
++    return yajl_gen_status_ok;
++}
++
++void free_json_map_string_string(json_map_string_string *map) {
++    if (map != NULL) {
++        size_t i;
++        for (i = 0; i < map->len; i++) {
++            free(map->keys[i]);
++            map->keys[i] = NULL;
++            free(map->values[i]);
++            map->values[i] = NULL;
++        }
++        free(map->keys);
++        map->keys = NULL;
++        free(map->values);
++        map->values = NULL;
++        free(map);
++    }
++}
++json_map_string_string *make_json_map_string_string(yajl_val src, struct parser_context *ctx, parser_error *err) {
++    json_map_string_string *ret = NULL;
++    if (src != NULL && YAJL_GET_OBJECT(src) != NULL) {
++        size_t i;
++        size_t len = YAJL_GET_OBJECT(src)->len;
++        if (len > SIZE_MAX / sizeof(char *) - 1) {
++            return NULL;
++        }
++        ret = safe_malloc(sizeof(*ret));
++        ret->len = len;
++        ret->keys = safe_malloc((len + 1) * sizeof(char *));
++        ret->values = safe_malloc((len + 1) * sizeof(char *));
++        for (i = 0; i < len; i++) {
++            const char *srckey = YAJL_GET_OBJECT(src)->keys[i];
++            yajl_val srcval = YAJL_GET_OBJECT(src)->values[i];
++            ret->keys[i] = safe_strdup(srckey ? srckey : "");
++
++            if (srcval != NULL) {
++                if (!YAJL_IS_STRING(srcval)) {
++                    if (*err == NULL && asprintf(err, "Invalid value with type 'string' for key '%s'", srckey) < 0) {
++                        *(err) = safe_strdup("error allocating memory");
++                    }
++                    free_json_map_string_string(ret);
++                    return NULL;
++                }
++                char *str = YAJL_GET_STRING(srcval);
++                ret->values[i] = safe_strdup(str ? str : "");
++            }
++        }
++    }
++    return ret;
++}
++int append_json_map_string_string(json_map_string_string *map, const char *key, const char *val) {
++    size_t len, i;
++    char **keys = NULL;
++    char **vals = NULL;
++
++    if (map == NULL) {
++        return -1;
++    }
++
++    for (i = 0; i < map->len; i++) {
++        if (strcmp(map->keys[i], key) == 0) {
++            free(map->values[i]);
++            map->values[i] = safe_strdup(val ? val : "");
++            return 0;
++        }
++    }
++
++    if ((SIZE_MAX / sizeof(char *) - 1) < map->len) {
++        return -1;
++    }
++
++    len = map->len + 1;
++    keys = safe_malloc(len * sizeof(char *));
++    vals = safe_malloc(len * sizeof(char *));
++
++    if (map->len) {
++        (void)memcpy(keys, map->keys, map->len * sizeof(char *));
++        (void)memcpy(vals, map->values, map->len * sizeof(char *));
++    }
++    free(map->keys);
++    map->keys = keys;
++    free(map->values);
++    map->values = vals;
++    map->keys[map->len] = safe_strdup(key ? key : "");
++    map->values[map->len] = safe_strdup(val ? val : "");
++
++    map->len++;
++    return 0;
++}
+diff --git a/src/lxc/json/json_common.h b/src/lxc/json/json_common.h
+new file mode 100755
+index 0000000..60aa5fd
+--- /dev/null
++++ b/src/lxc/json/json_common.h
+@@ -0,0 +1,185 @@
++// Auto generated file. Do not edit!
++#ifndef _JSON_COMMON_H
++#define _JSON_COMMON_H
++
++#include <stdbool.h>
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <yajl/yajl_tree.h>
++#include <yajl/yajl_gen.h>
++#include "utils.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++# undef linux
++
++//options to report error if there is unknown key found in json
++# define PARSE_OPTIONS_STRICT 0x01
++//options to generate all key and value
++# define GEN_OPTIONS_ALLKEYVALUE 0x02
++//options to generate simplify(no indent) json string
++# define GEN_OPTIONS_SIMPLIFY 0x04
++//options not to validate utf8 data
++# define GEN_OPTIONS_NOT_VALIDATE_UTF8 0x08
++
++#define GEN_SET_ERROR_AND_RETURN(stat, err) { \
++        if (*(err) == NULL) {\
++            if (asprintf(err, "%s: %s: %d: error generating json, errcode: %d", __FILE__, __func__, __LINE__, stat) < 0) { \
++                *(err) = safe_strdup("error allocating memory"); \
++            } \
++        }\
++        return stat; \
++    }
++
++typedef char *parser_error;
++
++struct parser_context {
++    unsigned int options;
++    FILE *stderr;
++};
++
++yajl_gen_status reformat_number(void *ctx, const char *str, size_t len);
++
++yajl_gen_status reformat_uint(void *ctx, long long unsigned int num);
++
++yajl_gen_status reformat_int(void *ctx, long long int num);
++
++yajl_gen_status reformat_double(void *ctx, double num);
++
++yajl_gen_status reformat_string(void *ctx, const char *str, size_t len);
++
++yajl_gen_status reformat_null(void *ctx);
++
++yajl_gen_status reformat_bool(void *ctx, int boolean);
++
++yajl_gen_status reformat_map_key(void *ctx, const char *str, size_t len);
++
++yajl_gen_status reformat_start_map(void *ctx);
++
++yajl_gen_status reformat_end_map(void *ctx);
++
++yajl_gen_status reformat_start_array(void *ctx);
++
++yajl_gen_status reformat_end_array(void *ctx);
++
++bool json_gen_init(yajl_gen *g, struct parser_context *ctx);
++
++yajl_val get_val(yajl_val tree, const char *name, yajl_type type);
++
++void *safe_malloc(size_t size);
++
++int common_safe_double(const char *numstr, double *converted);
++
++int common_safe_uint8(const char *numstr, uint8_t *converted);
++
++int common_safe_uint16(const char *numstr, uint16_t *converted);
++
++int common_safe_uint32(const char *numstr, uint32_t *converted);
++
++int common_safe_uint64(const char *numstr, uint64_t *converted);
++
++int common_safe_uint(const char *numstr, unsigned int *converted);
++
++int common_safe_int8(const char *numstr, int8_t *converted);
++
++int common_safe_int16(const char *numstr, int16_t *converted);
++
++int common_safe_int32(const char *numstr, int32_t *converted);
++
++int common_safe_int64(const char *numstr, int64_t *converted);
++
++int common_safe_int(const char *numstr, int *converted);
++
++typedef struct {
++    int *keys;
++    int *values;
++    size_t len;
++} json_map_int_int;
++
++void free_json_map_int_int(json_map_int_int *map);
++
++json_map_int_int *make_json_map_int_int(yajl_val src, struct parser_context *ctx, parser_error *err);
++
++yajl_gen_status gen_json_map_int_int(void *ctx, json_map_int_int *map, struct parser_context *ptx, parser_error *err);
++
++int append_json_map_int_int(json_map_int_int *map, int key, int val);
++
++typedef struct {
++    int *keys;
++    bool *values;
++    size_t len;
++} json_map_int_bool;
++
++void free_json_map_int_bool(json_map_int_bool *map);
++
++json_map_int_bool *make_json_map_int_bool(yajl_val src, struct parser_context *ctx, parser_error *err);
++
++yajl_gen_status gen_json_map_int_bool(void *ctx, json_map_int_bool *map, struct parser_context *ptx, parser_error *err);
++
++int append_json_map_int_bool(json_map_int_bool *map, int key, bool val);
++
++typedef struct {
++    int *keys;
++    char **values;
++    size_t len;
++} json_map_int_string;
++
++void free_json_map_int_string(json_map_int_string *map);
++
++json_map_int_string *make_json_map_int_string(yajl_val src, struct parser_context *ctx, parser_error *err);
++
++yajl_gen_status gen_json_map_int_string(void *ctx, json_map_int_string *map, struct parser_context *ptx, parser_error *err);
++
++int append_json_map_int_string(json_map_int_string *map, int key, const char *val);
++
++typedef struct {
++    char **keys;
++    int *values;
++    size_t len;
++} json_map_string_int;
++
++void free_json_map_string_int(json_map_string_int *map);
++
++json_map_string_int *make_json_map_string_int(yajl_val src, struct parser_context *ctx, parser_error *err);
++
++yajl_gen_status gen_json_map_string_int(void *ctx, json_map_string_int *map, struct parser_context *ptx, parser_error *err);
++
++int append_json_map_string_int(json_map_string_int *map, const char *key, int val);
++
++typedef struct {
++    char **keys;
++    bool *values;
++    size_t len;
++} json_map_string_bool;
++
++void free_json_map_string_bool(json_map_string_bool *map);
++
++json_map_string_bool *make_json_map_string_bool(yajl_val src, struct parser_context *ctx, parser_error *err);
++
++yajl_gen_status gen_json_map_string_bool(void *ctx, json_map_string_bool *map, struct parser_context *ptx, parser_error *err);
++
++int append_json_map_string_bool(json_map_string_bool *map, const char *key, bool val);
++
++typedef struct {
++    char **keys;
++    char **values;
++    size_t len;
++} json_map_string_string;
++
++void free_json_map_string_string(json_map_string_string *map);
++
++json_map_string_string *make_json_map_string_string(yajl_val src, struct parser_context *ctx, parser_error *err);
++
++yajl_gen_status gen_json_map_string_string(void *ctx, json_map_string_string *map, struct parser_context *ptx, parser_error *err);
++
++int append_json_map_string_string(json_map_string_string *map, const char *key, const char *val);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+\ No newline at end of file
+diff --git a/src/lxc/json/logger_json_file.c b/src/lxc/json/logger_json_file.c
+new file mode 100644
+index 0000000..6abeef4
+--- /dev/null
++++ b/src/lxc/json/logger_json_file.c
+@@ -0,0 +1,246 @@
++// Generated from json-file.json. Do not edit!
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include <string.h>
++#include <read-file.h>
++#include "logger_json_file.h"
++
++logger_json_file *make_logger_json_file(yajl_val tree, struct parser_context *ctx, parser_error *err) {
++	logger_json_file *ret = NULL;
++	*err = 0;
++	if (tree == NULL)
++		return ret;
++	ret = safe_malloc(sizeof(*ret));
++	{
++		yajl_val tmp = get_val(tree, "log", yajl_t_string);
++		if (tmp != NULL) {
++			char *str = YAJL_GET_STRING(tmp);
++			ret->log = (uint8_t *)safe_strdup(str ? str : "");
++			ret->log_len = str != NULL ? strlen(str) : 0;
++		}
++	}
++	{
++		yajl_val val = get_val(tree, "stream", yajl_t_string);
++		if (val != NULL) {
++			char *str = YAJL_GET_STRING(val);
++			ret->stream = safe_strdup(str ? str : "");
++		}
++	}
++	{
++		yajl_val val = get_val(tree, "time", yajl_t_string);
++		if (val != NULL) {
++			char *str = YAJL_GET_STRING(val);
++			ret->time = safe_strdup(str ? str : "");
++		}
++	}
++	{
++		yajl_val tmp = get_val(tree, "attrs", yajl_t_string);
++		if (tmp != NULL) {
++			char *str = YAJL_GET_STRING(tmp);
++			ret->attrs = (uint8_t *)safe_strdup(str ? str : "");
++			ret->attrs_len = str != NULL ? strlen(str) : 0;
++		}
++	}
++
++	if (tree->type == yajl_t_object && (ctx->options & PARSE_OPTIONS_STRICT)) {
++		int i;
++		for (i = 0; i < tree->u.object.len; i++)
++			if (strcmp(tree->u.object.keys[i], "log") &&
++			                strcmp(tree->u.object.keys[i], "stream") &&
++			                strcmp(tree->u.object.keys[i], "time") &&
++			                strcmp(tree->u.object.keys[i], "attrs")) {
++				if (ctx->stderr > 0)
++					fprintf(ctx->stderr, "WARNING: unknown key found: %s\n", tree->u.object.keys[i]);
++			}
++	}
++	return ret;
++}
++
++void free_logger_json_file(logger_json_file *ptr) {
++	if (ptr == NULL)
++		return;
++	free(ptr->log);
++	ptr->log = NULL;
++	free(ptr->stream);
++	ptr->stream = NULL;
++	free(ptr->time);
++	ptr->time = NULL;
++	free(ptr->attrs);
++	ptr->attrs = NULL;
++	free(ptr);
++}
++
++yajl_gen_status gen_logger_json_file(yajl_gen g, logger_json_file *ptr, struct parser_context *ctx, parser_error *err) {
++	yajl_gen_status stat = yajl_gen_status_ok;
++	*err = 0;
++	stat = reformat_start_map(g);
++	if (yajl_gen_status_ok != stat)
++		GEN_SET_ERROR_AND_RETURN(stat, err);
++	if ((ctx->options & GEN_OPTIONS_ALLKEYVALUE) || (ptr != NULL && ptr->log != NULL && ptr->log_len)) {
++		const char *str = "";
++		size_t len = 0;
++		stat = reformat_map_key(g, "log", strlen("log"));
++		if (yajl_gen_status_ok != stat)
++			GEN_SET_ERROR_AND_RETURN(stat, err);
++		if (ptr != NULL && ptr->log != NULL) {
++			str = (const char *)ptr->log;
++			len = ptr->log_len;
++		}
++		stat = reformat_string(g, str, len);
++		if (yajl_gen_status_ok != stat)
++			GEN_SET_ERROR_AND_RETURN(stat, err);
++	}
++	if ((ctx->options & GEN_OPTIONS_ALLKEYVALUE) ||(ptr != NULL && ptr->stream != NULL)) {
++		char *str = "";
++		stat = reformat_map_key(g, "stream", strlen("stream"));
++		if (yajl_gen_status_ok != stat)
++			GEN_SET_ERROR_AND_RETURN(stat, err);
++		if (ptr != NULL && ptr->stream != NULL) {
++			str = ptr->stream;
++		}
++		stat = reformat_string(g, str, strlen(str));
++		if (yajl_gen_status_ok != stat)
++			GEN_SET_ERROR_AND_RETURN(stat, err);
++	}
++	if ((ctx->options & GEN_OPTIONS_ALLKEYVALUE) ||(ptr != NULL && ptr->time != NULL)) {
++		char *str = "";
++		stat = reformat_map_key(g, "time", strlen("time"));
++		if (yajl_gen_status_ok != stat)
++			GEN_SET_ERROR_AND_RETURN(stat, err);
++		if (ptr != NULL && ptr->time != NULL) {
++			str = ptr->time;
++		}
++		stat = reformat_string(g, str, strlen(str));
++		if (yajl_gen_status_ok != stat)
++			GEN_SET_ERROR_AND_RETURN(stat, err);
++	}
++	if ((ctx->options & GEN_OPTIONS_ALLKEYVALUE) || (ptr != NULL && ptr->attrs != NULL && ptr->attrs_len)) {
++		const char *str = "";
++		size_t len = 0;
++		stat = reformat_map_key(g, "attrs", strlen("attrs"));
++		if (yajl_gen_status_ok != stat)
++			GEN_SET_ERROR_AND_RETURN(stat, err);
++		if (ptr != NULL && ptr->attrs != NULL) {
++			str = (const char *)ptr->attrs;
++			len = ptr->attrs_len;
++		}
++		stat = reformat_string(g, str, len);
++		if (yajl_gen_status_ok != stat)
++			GEN_SET_ERROR_AND_RETURN(stat, err);
++	}
++	stat = reformat_end_map(g);
++	if (yajl_gen_status_ok != stat)
++		GEN_SET_ERROR_AND_RETURN(stat, err);
++	return yajl_gen_status_ok;
++}
++
++
++logger_json_file *logger_json_file_parse_file(const char *filename, struct parser_context *ctx, parser_error *err) {
++	logger_json_file *ptr = NULL;
++	size_t filesize;
++	char *content = NULL;
++
++	if (filename == NULL || err == NULL)
++		return NULL;
++
++	*err = NULL;
++	content = read_file(filename, &filesize);
++	if (content == NULL) {
++		if (asprintf(err, "cannot read the file: %s", filename) < 0)
++			*err = safe_strdup("error allocating memory");
++		return NULL;
++	}
++	ptr = logger_json_file_parse_data(content, ctx, err);
++	free(content);
++	return ptr;
++}
++
++logger_json_file *logger_json_file_parse_file_stream(FILE *stream, struct parser_context *ctx, parser_error *err) {
++	logger_json_file *ptr = NULL;
++	size_t filesize;
++	char *content = NULL ;
++
++	if (stream == NULL || err == NULL)
++		return NULL;
++
++	*err = NULL;
++	content = fread_file(stream, &filesize);
++	if (content == NULL) {
++		*err = safe_strdup("cannot read the file");
++		return NULL;
++	}
++	ptr = logger_json_file_parse_data(content, ctx, err);
++	free(content);
++	return ptr;
++}
++
++logger_json_file *logger_json_file_parse_data(const char *jsondata, struct parser_context *ctx, parser_error *err) {
++	logger_json_file *ptr  = NULL;
++	yajl_val tree;
++	char errbuf[1024];
++	struct parser_context tmp_ctx;
++
++	if (jsondata == NULL || err == NULL)
++		return NULL;
++
++	*err = NULL;
++	if (ctx == NULL) {
++		ctx = &tmp_ctx;
++		memset(&tmp_ctx, 0, sizeof(tmp_ctx));
++	}
++	tree = yajl_tree_parse(jsondata, errbuf, sizeof(errbuf));
++	if (tree == NULL) {
++		if (asprintf(err, "cannot parse the data: %s", errbuf) < 0)
++			*err = safe_strdup("error allocating memory");
++		return NULL;
++	}
++	ptr = make_logger_json_file(tree, ctx, err);
++	yajl_tree_free(tree);
++	return ptr;
++}
++char *logger_json_file_generate_json(logger_json_file *ptr, struct parser_context *ctx, parser_error *err) {
++	yajl_gen g = NULL;
++	struct parser_context tmp_ctx;
++	const unsigned char *gen_buf = NULL;
++	char *json_buf = NULL;
++	size_t gen_len = 0;
++
++	if (ptr == NULL || err == NULL)
++		return NULL;
++
++	*err = NULL;
++	if (ctx == NULL) {
++		ctx = &tmp_ctx;
++		memset(&tmp_ctx, 0, sizeof(tmp_ctx));
++	}
++
++	if (!json_gen_init(&g, ctx)) {
++		*err = safe_strdup("Json_gen init failed");
++		goto out;
++	}
++	if (yajl_gen_status_ok != gen_logger_json_file(g, ptr, ctx, err)) {
++		if (*err == NULL)
++			*err = safe_strdup("Failed to generate json");
++		goto free_out;
++	}
++	yajl_gen_get_buf(g, &gen_buf, &gen_len);
++	if (gen_buf == NULL) {
++		*err = safe_strdup("Error to get generated json");
++		goto free_out;
++	}
++
++	if (gen_len == SIZE_MAX) {
++		*err = safe_strdup("Invalid buffer length");
++		goto free_out;
++	}
++	json_buf = safe_malloc(gen_len + 1);
++	(void)memcpy(json_buf, gen_buf, gen_len);
++	json_buf[gen_len] = '\0';
++
++free_out:
++	yajl_gen_clear(g);
++	yajl_gen_free(g);
++out:
++	return json_buf;
++}
+diff --git a/src/lxc/json/logger_json_file.h b/src/lxc/json/logger_json_file.h
+new file mode 100644
+index 0000000..ad5af7b
+--- /dev/null
++++ b/src/lxc/json/logger_json_file.h
+@@ -0,0 +1,45 @@
++// Generated from json-file.json. Do not edit!
++#ifndef LOGGER_JSON_FILE_SCHEMA_H
++#define LOGGER_JSON_FILE_SCHEMA_H
++
++#include <sys/types.h>
++#include <stdint.h>
++#include "json_common.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct {
++    uint8_t *log;
++    size_t log_len;
++
++    char *stream;
++
++    char *time;
++
++    uint8_t *attrs;
++    size_t attrs_len;
++
++}
++logger_json_file;
++
++void free_logger_json_file(logger_json_file *ptr);
++
++logger_json_file *make_logger_json_file(yajl_val tree, struct parser_context *ctx, parser_error *err);
++
++yajl_gen_status gen_logger_json_file(yajl_gen g, logger_json_file *ptr, struct parser_context *ctx, parser_error *err);
++
++logger_json_file *logger_json_file_parse_file(const char *filename, struct parser_context *ctx, parser_error *err);
++
++logger_json_file *logger_json_file_parse_file_stream(FILE *stream, struct parser_context *ctx, parser_error *err);
++
++logger_json_file *logger_json_file_parse_data(const char *jsondata, struct parser_context *ctx, parser_error *err);
++
++char *logger_json_file_generate_json(logger_json_file *ptr, struct parser_context *ctx, parser_error *err);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/lxc/json/oci_runtime_hooks.c b/src/lxc/json/oci_runtime_hooks.c
+new file mode 100644
+index 0000000..41ddb67
+--- /dev/null
++++ b/src/lxc/json/oci_runtime_hooks.c
+@@ -0,0 +1,52 @@
++/******************************************************************************
++ * Copyright (C), 1988-1999, Huawei Tech. Co., Ltd.
++ * FileName: oci_runtime_hooks.c
++ * Author: maoweiyong   Version: 0.1   Date: 2018-11-07
++ * Explanation: provide oci runtime hooks functions
++ ******************************************************************************/
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include <read-file.h>
++#include "oci_runtime_hooks.h"
++
++#include "log.h"
++#include "utils.h"
++
++#define PARSE_ERR_BUFFER_SIZE 1024
++
++oci_runtime_spec_hooks *oci_runtime_spec_hooks_parse_file(const char *filename,
++                                                          struct parser_context *ctx, parser_error *err)
++{
++    yajl_val tree;
++    size_t filesize;
++
++    if (!filename || !err) {
++        return NULL;
++    }
++    *err = NULL;
++    struct parser_context tmp_ctx;
++    if (!ctx) {
++        ctx = &tmp_ctx;
++        memset(&tmp_ctx, 0, sizeof(tmp_ctx));
++    }
++    char *content = read_file(filename, &filesize);
++    char errbuf[PARSE_ERR_BUFFER_SIZE];
++    if (content == NULL) {
++        if (asprintf(err, "cannot read the file: %s", filename) < 0) {
++            *err = safe_strdup("error allocating memory");
++        }
++        return NULL;
++    }
++    tree = yajl_tree_parse(content, errbuf, sizeof(errbuf));
++    free(content);
++    if (tree == NULL) {
++        if (asprintf(err, "cannot parse the file: %s", errbuf) < 0) {
++            *err = safe_strdup("error allocating memory");
++        }
++        return NULL;
++    }
++    oci_runtime_spec_hooks *ptr = make_oci_runtime_spec_hooks(tree, ctx, err);
++    yajl_tree_free(tree);
++    return ptr;
++}
+diff --git a/src/lxc/json/oci_runtime_hooks.h b/src/lxc/json/oci_runtime_hooks.h
+new file mode 100644
+index 0000000..bf570c9
+--- /dev/null
++++ b/src/lxc/json/oci_runtime_hooks.h
+@@ -0,0 +1,15 @@
++/******************************************************************************
++ * Copyright (C), 1988-1999, Huawei Tech. Co., Ltd.
++ * FileName: oci_runtime_hooks.h
++ * Author: tanyifeng  Version: 0.1   Date: 2018-11-08
++ * Explanation: provide container oci runtime hooks function definition
++ ******************************************************************************/
++#ifndef _CONTAINER_HOOKS_H
++# define _CONTAINER_HOOKS_H
++
++# include "oci_runtime_spec.h"
++
++oci_runtime_spec_hooks *oci_runtime_spec_hooks_parse_file(const char *filename,
++                                                          struct parser_context *ctx, parser_error *err);
++
++#endif
+diff --git a/src/lxc/json/oci_runtime_spec.c b/src/lxc/json/oci_runtime_spec.c
+new file mode 100644
+index 0000000..fd342de
+--- /dev/null
++++ b/src/lxc/json/oci_runtime_spec.c
+@@ -0,0 +1,195 @@
++// Generated from spec.json. Do not edit!
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include <string.h>
++#include <read-file.h>
++#include "oci_runtime_spec.h"
++
++oci_runtime_spec_hooks *make_oci_runtime_spec_hooks(yajl_val tree, struct parser_context *ctx, parser_error *err) {
++    oci_runtime_spec_hooks *ret = NULL;
++    *err = 0;
++    if (tree == NULL)
++        return ret;
++    ret = safe_malloc(sizeof(*ret));
++    {
++        yajl_val tmp = get_val(tree, "prestart", yajl_t_array);
++        if (tmp != NULL && YAJL_GET_ARRAY(tmp) != NULL && YAJL_GET_ARRAY(tmp)->len > 0) {
++            size_t i;
++            ret->prestart_len = YAJL_GET_ARRAY(tmp)->len;
++            ret->prestart = safe_malloc((YAJL_GET_ARRAY(tmp)->len + 1) * sizeof(*ret->prestart));
++            for (i = 0; i < YAJL_GET_ARRAY(tmp)->len; i++) {
++                yajl_val val = YAJL_GET_ARRAY(tmp)->values[i];
++                ret->prestart[i] = make_defs_hook(val, ctx, err);
++                if (ret->prestart[i] == NULL) {
++                    free_oci_runtime_spec_hooks(ret);
++                    return NULL;
++                }
++            }
++        }
++    }
++    {
++        yajl_val tmp = get_val(tree, "poststart", yajl_t_array);
++        if (tmp != NULL && YAJL_GET_ARRAY(tmp) != NULL && YAJL_GET_ARRAY(tmp)->len > 0) {
++            size_t i;
++            ret->poststart_len = YAJL_GET_ARRAY(tmp)->len;
++            ret->poststart = safe_malloc((YAJL_GET_ARRAY(tmp)->len + 1) * sizeof(*ret->poststart));
++            for (i = 0; i < YAJL_GET_ARRAY(tmp)->len; i++) {
++                yajl_val val = YAJL_GET_ARRAY(tmp)->values[i];
++                ret->poststart[i] = make_defs_hook(val, ctx, err);
++                if (ret->poststart[i] == NULL) {
++                    free_oci_runtime_spec_hooks(ret);
++                    return NULL;
++                }
++            }
++        }
++    }
++    {
++        yajl_val tmp = get_val(tree, "poststop", yajl_t_array);
++        if (tmp != NULL && YAJL_GET_ARRAY(tmp) != NULL && YAJL_GET_ARRAY(tmp)->len > 0) {
++            size_t i;
++            ret->poststop_len = YAJL_GET_ARRAY(tmp)->len;
++            ret->poststop = safe_malloc((YAJL_GET_ARRAY(tmp)->len + 1) * sizeof(*ret->poststop));
++            for (i = 0; i < YAJL_GET_ARRAY(tmp)->len; i++) {
++                yajl_val val = YAJL_GET_ARRAY(tmp)->values[i];
++                ret->poststop[i] = make_defs_hook(val, ctx, err);
++                if (ret->poststop[i] == NULL) {
++                    free_oci_runtime_spec_hooks(ret);
++                    return NULL;
++                }
++            }
++        }
++    }
++
++    if (tree->type == yajl_t_object && (ctx->options & PARSE_OPTIONS_STRICT)) {
++        int i;
++        for (i = 0; i < tree->u.object.len; i++)
++            if (strcmp(tree->u.object.keys[i], "prestart") &&
++                strcmp(tree->u.object.keys[i], "poststart") &&
++                strcmp(tree->u.object.keys[i], "poststop")) {
++                if (ctx->stderr > 0)
++                    fprintf(ctx->stderr, "WARNING: unknown key found: %s\n", tree->u.object.keys[i]);
++            }
++        }
++    return ret;
++}
++
++void free_oci_runtime_spec_hooks(oci_runtime_spec_hooks *ptr) {
++    if (ptr == NULL)
++        return;
++    if (ptr->prestart != NULL) {
++        size_t i;
++        for (i = 0; i < ptr->prestart_len; i++)
++            if (ptr->prestart[i] != NULL) {
++                free_defs_hook(ptr->prestart[i]);
++                ptr->prestart[i] = NULL;
++            }
++        free(ptr->prestart);
++        ptr->prestart = NULL;
++    }
++    if (ptr->poststart != NULL) {
++        size_t i;
++        for (i = 0; i < ptr->poststart_len; i++)
++            if (ptr->poststart[i] != NULL) {
++                free_defs_hook(ptr->poststart[i]);
++                ptr->poststart[i] = NULL;
++            }
++        free(ptr->poststart);
++        ptr->poststart = NULL;
++    }
++    if (ptr->poststop != NULL) {
++        size_t i;
++        for (i = 0; i < ptr->poststop_len; i++)
++            if (ptr->poststop[i] != NULL) {
++                free_defs_hook(ptr->poststop[i]);
++                ptr->poststop[i] = NULL;
++            }
++        free(ptr->poststop);
++        ptr->poststop = NULL;
++    }
++    free(ptr);
++}
++
++yajl_gen_status gen_oci_runtime_spec_hooks(yajl_gen g, oci_runtime_spec_hooks *ptr, struct parser_context *ctx, parser_error *err) {
++    yajl_gen_status stat = yajl_gen_status_ok;
++    *err = 0;
++    stat = reformat_start_map(g);
++    if (yajl_gen_status_ok != stat)
++        GEN_SET_ERROR_AND_RETURN(stat, err);
++    if ((ctx->options & GEN_OPTIONS_ALLKEYVALUE) ||(ptr != NULL && ptr->prestart != NULL)) {
++        size_t len = 0, i;
++        stat = reformat_map_key(g, "prestart", strlen("prestart"));
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        if (ptr != NULL && ptr->prestart != NULL) {
++            len = ptr->prestart_len;
++        }
++        if (!len && !(ctx->options & GEN_OPTIONS_SIMPLIFY))
++            yajl_gen_config(g, yajl_gen_beautify, 0);
++        stat = reformat_start_array(g);
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        for (i = 0; i < len; i++) {
++            stat = gen_defs_hook(g, ptr->prestart[i], ctx, err);
++            if (yajl_gen_status_ok != stat)
++                GEN_SET_ERROR_AND_RETURN(stat, err);
++        }
++        stat = reformat_end_array(g);
++        if (!len && !(ctx->options & GEN_OPTIONS_SIMPLIFY))
++            yajl_gen_config(g, yajl_gen_beautify, 1);
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++    }
++    if ((ctx->options & GEN_OPTIONS_ALLKEYVALUE) ||(ptr != NULL && ptr->poststart != NULL)) {
++        size_t len = 0, i;
++        stat = reformat_map_key(g, "poststart", strlen("poststart"));
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        if (ptr != NULL && ptr->poststart != NULL) {
++            len = ptr->poststart_len;
++        }
++        if (!len && !(ctx->options & GEN_OPTIONS_SIMPLIFY))
++            yajl_gen_config(g, yajl_gen_beautify, 0);
++        stat = reformat_start_array(g);
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        for (i = 0; i < len; i++) {
++            stat = gen_defs_hook(g, ptr->poststart[i], ctx, err);
++            if (yajl_gen_status_ok != stat)
++                GEN_SET_ERROR_AND_RETURN(stat, err);
++        }
++        stat = reformat_end_array(g);
++        if (!len && !(ctx->options & GEN_OPTIONS_SIMPLIFY))
++            yajl_gen_config(g, yajl_gen_beautify, 1);
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++    }
++    if ((ctx->options & GEN_OPTIONS_ALLKEYVALUE) ||(ptr != NULL && ptr->poststop != NULL)) {
++        size_t len = 0, i;
++        stat = reformat_map_key(g, "poststop", strlen("poststop"));
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        if (ptr != NULL && ptr->poststop != NULL) {
++            len = ptr->poststop_len;
++        }
++        if (!len && !(ctx->options & GEN_OPTIONS_SIMPLIFY))
++            yajl_gen_config(g, yajl_gen_beautify, 0);
++        stat = reformat_start_array(g);
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++        for (i = 0; i < len; i++) {
++            stat = gen_defs_hook(g, ptr->poststop[i], ctx, err);
++            if (yajl_gen_status_ok != stat)
++                GEN_SET_ERROR_AND_RETURN(stat, err);
++        }
++        stat = reformat_end_array(g);
++        if (!len && !(ctx->options & GEN_OPTIONS_SIMPLIFY))
++            yajl_gen_config(g, yajl_gen_beautify, 1);
++        if (yajl_gen_status_ok != stat)
++            GEN_SET_ERROR_AND_RETURN(stat, err);
++    }
++    stat = reformat_end_map(g);
++    if (yajl_gen_status_ok != stat)
++        GEN_SET_ERROR_AND_RETURN(stat, err);
++    return yajl_gen_status_ok;
++}
+diff --git a/src/lxc/json/oci_runtime_spec.h b/src/lxc/json/oci_runtime_spec.h
+new file mode 100644
+index 0000000..ef3f161
+--- /dev/null
++++ b/src/lxc/json/oci_runtime_spec.h
+@@ -0,0 +1,37 @@
++// Generated from spec.json. Do not edit!
++#ifndef OCI_RUNTIME_SPEC_SCHEMA_H
++#define OCI_RUNTIME_SPEC_SCHEMA_H
++
++#include <sys/types.h>
++#include <stdint.h>
++#include "json_common.h"
++#include "defs.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct {
++    defs_hook **prestart;
++    size_t prestart_len;
++
++    defs_hook **poststart;
++    size_t poststart_len;
++
++    defs_hook **poststop;
++    size_t poststop_len;
++
++}
++oci_runtime_spec_hooks;
++
++void free_oci_runtime_spec_hooks(oci_runtime_spec_hooks *ptr);
++
++oci_runtime_spec_hooks *make_oci_runtime_spec_hooks(yajl_val tree, struct parser_context *ctx, parser_error *err);
++
++yajl_gen_status gen_oci_runtime_spec_hooks(yajl_gen g, oci_runtime_spec_hooks *ptr, struct parser_context *ctx, parser_error *err);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/lxc/json/read-file.h b/src/lxc/json/read-file.h
+new file mode 100644
+index 0000000..5d6e0eb
+--- /dev/null
++++ b/src/lxc/json/read-file.h
+@@ -0,0 +1,11 @@
++#ifndef READ_FILE_H
++#define READ_FILE_H
++
++#include <stddef.h>
++#include <stdio.h>
++
++extern char *fread_file(FILE *stream, size_t *length);
++
++extern char *read_file(const char *path, size_t *length);
++
++#endif
 -- 
 2.25.1
 

@@ -1,0 +1,1164 @@
+From 2b4dbd3fc30be08459b8ab34f84935e37ceb34ec Mon Sep 17 00:00:00 2001
+From: "Neil.wrz" <wangrunze13@huawei.com>
+Date: Tue, 19 Jul 2022 04:02:57 -0700
+Subject: [PATCH] refactor patch about namespace log terminal
+
+Signed-off-by: Neil.wrz <wangrunze13@huawei.com>
+---
+ configure.ac                    | 30 ++++++++++-
+ src/lxc/Makefile.am             | 44 ++++++++++++++-
+ src/lxc/af_unix.c               | 89 ++++++++++++++++++++++++++++++
+ src/lxc/commands_utils.c        | 57 ++++++++++++++++++++
+ src/lxc/exec_commands.h         | 77 ++++++++++++++++++++++++++
+ src/lxc/file_utils.h            |  4 ++
+ src/lxc/json/read-file.c        | 95 +++++++++++++++++++++++++++++++++
+ src/lxc/log.c                   | 56 +++++++++++++++++++
+ src/lxc/path.h                  | 65 ++++++++++++++++++++++
+ src/lxc/start.h                 | 30 +++++++++++
+ src/lxc/storage/block.c         | 86 +++++++++++++++++++++++++++++
+ src/lxc/storage/block.h         | 41 ++++++++++++++
+ src/lxc/storage/storage_utils.c | 60 +++++++++++++++++++++
+ src/lxc/terminal.h              | 35 ++++++++++++
+ 14 files changed, 766 insertions(+), 3 deletions(-)
+ create mode 100644 src/lxc/exec_commands.h
+ create mode 100644 src/lxc/json/read-file.c
+ create mode 100644 src/lxc/path.h
+ create mode 100644 src/lxc/storage/block.c
+ create mode 100644 src/lxc/storage/block.h
+
+diff --git a/configure.ac b/configure.ac
+index 059d57d..ce8854e 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -43,6 +43,7 @@ AM_INIT_AUTOMAKE([-Wall -Werror -Wno-portability subdir-objects])
+ AC_CANONICAL_HOST
+ AM_PROG_CC_C_O
+ AC_USE_SYSTEM_EXTENSIONS
++CFLAGS=`echo "${CFLAGS#\-g}"`
+ 
+ # Test if we have a new enough compiler.
+ AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+@@ -119,6 +120,9 @@ AM_CONDITIONAL([DISTRO_UBUNTU], [test "x$with_distro" = "xubuntu"])
+ 
+ AC_CONFIG_LINKS([config/etc/default.conf:config/etc/${distroconf}])
+ 
++# Check yajl
++PKG_CHECK_MODULES([YAJL], [yajl >= 2],[],[AC_MSG_ERROR([You must install yajl >= 2])])
++
+ # Check for init system type
+ AC_MSG_CHECKING([for init system type])
+ AC_ARG_WITH([init-script],
+@@ -187,6 +191,11 @@ AC_ARG_ENABLE([werror],
+ 	[AS_HELP_STRING([--disable-werror], [do not treat warnings as errors])],
+ 	[enable_werror=$enableval], [enable_werror=yes])
+ 
++AC_ARG_ENABLE([debug],
++	[AC_HELP_STRING([--enable-debug],
++	[set -g into cflags [default=no]])],
++	[], [enable_debug=no])
++
+ # Allow disabling rpath
+ AC_ARG_ENABLE([rpath],
+ 	[AS_HELP_STRING([--enable-rpath], [set rpath in executables [default=no]])],
+@@ -756,6 +765,7 @@ AX_CHECK_COMPILE_FLAG([-Wnested-externs], [CFLAGS="$CFLAGS -Wnested-externs"],,[
+ AX_CHECK_COMPILE_FLAG([-fasynchronous-unwind-tables], [CFLAGS="$CFLAGS -fasynchronous-unwind-tables"],,[-Werror])
+ AX_CHECK_COMPILE_FLAG([-pipe], [CFLAGS="$CFLAGS -pipe"],,[-Werror])
+ AX_CHECK_COMPILE_FLAG([-fexceptions], [CFLAGS="$CFLAGS -fexceptions"],,[-Werror])
++AX_CHECK_COMPILE_FLAG([-g], [CFLAGS="$CFLAGS -g"],,[-Werror])
+ AX_CHECK_COMPILE_FLAG([-Warray-bounds], [CFLAGS="$CFLAGS -Warray-bounds"],,[-Werror])
+ AX_CHECK_COMPILE_FLAG([-Wrestrict], [CFLAGS="$CFLAGS -Wrestrict"],,[-Werror])
+ AX_CHECK_COMPILE_FLAG([-Wreturn-local-addr], [CFLAGS="$CFLAGS -Wreturn-local-addr"],,[-Werror])
+@@ -763,12 +773,18 @@ AX_CHECK_COMPILE_FLAG([-Wstringop-overflow], [CFLAGS="$CFLAGS -Wstringop-overflo
+ 
+ AX_CHECK_LINK_FLAG([-z relro], [LDFLAGS="$LDFLAGS -z relro"],,[])
+ AX_CHECK_LINK_FLAG([-z now], [LDFLAGS="$LDFLAGS -z now"],,[])
++AX_CHECK_LINK_FLAG([-z noexecstack], [LDFLAGS="$LDFLAGS -z noexecstack"],,[])
+ 
+-CFLAGS="$CFLAGS -Wvla -std=gnu11 -fms-extensions"
++CFLAGS="$CFLAGS -Wvla -std=gnu11 -D_FORTIFY_SOURCE=2 -Wall -fPIC -fPIE"
++LDFLAGS="$LDFLAGS -pie"
+ if test "x$enable_werror" = "xyes"; then
+ 	CFLAGS="$CFLAGS -Werror"
+ fi
+ 
++if test "x$enable_debug" = "xyes"; then
++    CFLAGS="$CFLAGS -g"
++fi
++
+ AC_ARG_ENABLE([thread-safety],
+ 	[AS_HELP_STRING([--enable-thread-safety], [enforce thread-safety otherwise fail the build [default=yes]])],
+ 	[enable_thread_safety=$enableval], [enable_thread_safety=yes])
+@@ -815,6 +831,18 @@ else
+ 	AC_MSG_RESULT([no])
+ fi
+ 
++AC_MSG_CHECKING([Whether adapt to iSulad])
++AC_ARG_ENABLE([isulad],
++	[AC_HELP_STRING([--enable-isulad], [enable adapt to iSulad [default=yes]])],
++	[adapt_isulad=$enableval], [adapt_isulad=yes])
++AM_CONDITIONAL([HAVE_ISULAD], [test "x$adapt_isulad" = "xyes"])
++if test "x$adapt_isulad" = "xyes"; then
++	AC_DEFINE([HAVE_ISULAD], 1, [adapt to iSulad])
++	AC_MSG_RESULT([yes])
++else
++	AC_MSG_RESULT([no])
++fi
++
+ # Files requiring some variable expansion
+ AC_CONFIG_FILES([
+ 	Makefile
+diff --git a/src/lxc/Makefile.am b/src/lxc/Makefile.am
+index d1e2364..b9a8750 100644
+--- a/src/lxc/Makefile.am
++++ b/src/lxc/Makefile.am
+@@ -52,6 +52,16 @@ noinst_HEADERS = api_extensions.h \
+ 		 utils.h \
+ 		 uuid.h
+ 
++if HAVE_ISULAD
++noinst_HEADERS += isulad_utils.h path.h \
++				  json/json_common.h json/defs.h \
++				  json/oci_runtime_hooks.h \
++				  json/logger_json_file.h \
++				  json/oci_runtime_spec.h \
++				  json/read-file.h \
++				  exec_commands.h
++endif
++
+ if IS_BIONIC
+ noinst_HEADERS += ../include/fexecve.h \
+ 		  ../include/lxcmntent.h \
+@@ -97,7 +107,6 @@ liblxc_la_SOURCES = af_unix.c af_unix.h \
+ 		    api_extensions.h \
+ 		    attach.c attach.h \
+ 		    caps.c caps.h \
+-		    cgroups/cgfsng.c \
+ 		    cgroups/cgroup.c cgroups/cgroup.h \
+ 		    cgroups/cgroup2_devices.c cgroups/cgroup2_devices.h \
+ 		    cgroups/cgroup_utils.c cgroups/cgroup_utils.h \
+@@ -154,6 +163,22 @@ liblxc_la_SOURCES = af_unix.c af_unix.h \
+ 		    version.h \
+ 		    $(LSM_SOURCES)
+ 
++if HAVE_ISULAD
++liblxc_la_SOURCES += isulad_utils.c isulad_utils.h \
++			storage/block.c storage/block.h \
++			path.c path.h \
++			json/json_common.c json/json_common.h \
++			json/defs.h json/defs.c \
++			json/oci_runtime_hooks.c json/oci_runtime_hooks.h \
++			json/logger_json_file.c json/logger_json_file.h \
++			json/oci_runtime_spec.c json/oci_runtime_spec.h \
++			json/read-file.c json/read-file.h \
++			cgroups/isulad_cgfsng.c \
++			exec_commands.c exec_commands.h
++else
++liblxc_la_SOURCES += cgroups/cgfsng.c
++endif
++
+ if IS_BIONIC
+ liblxc_la_SOURCES += ../include/fexecve.c ../include/fexecve.h \
+ 		     ../include/lxcmntent.c ../include/lxcmntent.h \
+@@ -212,6 +237,10 @@ AM_CFLAGS = -DLXCROOTFSMOUNT=\"$(LXCROOTFSMOUNT)\" \
+ 	    -I $(top_srcdir)/src/lxc/storage \
+ 	    -I $(top_srcdir)/src/lxc/cgroups
+ 
++if HAVE_ISULAD
++AM_CFLAGS += -I $(top_srcdir)/src/lxc/json
++AM_CFLAGS += -DHAVE_ISULAD
++endif
+ if ENABLE_APPARMOR
+ AM_CFLAGS += -DHAVE_APPARMOR
+ endif
+@@ -249,6 +278,10 @@ liblxc_la_CFLAGS += -fsanitize=address \
+ 		    -fno-omit-frame-pointer
+ endif
+ 
++if HAVE_ISULAD
++liblxc_la_CFLAGS += -D_FORTIFY_SOURCE=2 -Wall
++endif
++
+ if ENABLE_UBSAN
+ liblxc_la_CFLAGS += -fsanitize=undefined
+ endif
+@@ -258,6 +291,12 @@ liblxc_la_LDFLAGS = -pthread \
+ 		    -Wl,-soname,liblxc.so.$(firstword $(subst ., ,@LXC_ABI@)) \
+ 		    -version-info @LXC_ABI_MAJOR@
+ 
++if HAVE_ISULAD
++liblxc_la_LDFLAGS += @YAJL_LIBS@ -Wl,-z,relro \
++		    -Wl,-z,now \
++		    -Wl,-z,noexecstack
++endif
++
+ liblxc_la_LIBADD = $(CAP_LIBS) \
+ 		   $(OPENSSL_LIBS) \
+ 		   $(SELINUX_LIBS) \
+@@ -321,7 +360,8 @@ LDADD = liblxc.la \
+ 	@OPENSSL_LIBS@ \
+ 	@SECCOMP_LIBS@ \
+ 	@SELINUX_LIBS@ \
+-	@DLOG_LIBS@
++	@DLOG_LIBS@ \
++	@YAJL_LIBS@
+ 
+ if ENABLE_TOOLS
+ lxc_attach_SOURCES = tools/lxc_attach.c \
+diff --git a/src/lxc/af_unix.c b/src/lxc/af_unix.c
+index 5cf5491..cb4233e 100644
+--- a/src/lxc/af_unix.c
++++ b/src/lxc/af_unix.c
+@@ -167,8 +167,13 @@ int lxc_unix_send_fds(int fd, int *sendfds, int num_sendfds, void *data,
+ 	return lxc_abstract_unix_send_fds(fd, sendfds, num_sendfds, data, size);
+ }
+ 
++#ifdef HAVE_ISULAD
++static int lxc_abstract_unix_recv_fds_iov(int fd, int *recvfds, int num_recvfds,
++			          struct iovec *iov, size_t iovlen, unsigned int timeout)
++#else 
+ static int lxc_abstract_unix_recv_fds_iov(int fd, int *recvfds, int num_recvfds,
+ 					  struct iovec *iov, size_t iovlen)
++#endif 
+ {
+ 	__do_free char *cmsgbuf = NULL;
+ 	int ret;
+@@ -188,6 +193,22 @@ static int lxc_abstract_unix_recv_fds_iov(int fd, int *recvfds, int num_recvfds,
+ 	msg.msg_iov = iov;
+ 	msg.msg_iovlen = iovlen;
+ 
++#ifdef HAVE_ISULAD
++	struct timeval out;
++	if (timeout > 0) {
++		memset(&out, 0, sizeof(out));
++		out.tv_sec = timeout / 1000000;
++		out.tv_usec = timeout % 1000000;
++		ret = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
++		                 (const void *)&out, sizeof(out));
++		if (ret < 0) {
++			ERROR("Failed to set %u timeout on containter "
++			      "state socket", timeout);
++			return ret;
++		}
++	}
++#endif
++
+ 	do {
+ 		ret = recvmsg(fd, &msg, MSG_CMSG_CLOEXEC);
+ 	} while (ret < 0 && errno == EINTR);
+@@ -220,8 +241,25 @@ int lxc_abstract_unix_recv_fds(int fd, int *recvfds, int num_recvfds,
+ 		.iov_base = data ? data : buf,
+ 		.iov_len = data ? size : sizeof(buf),
+ 	};
++#ifdef HAVE_ISULAD
++	return lxc_abstract_unix_recv_fds_iov(fd, recvfds, num_recvfds, &iov, 1, 0);
++#else
+ 	return lxc_abstract_unix_recv_fds_iov(fd, recvfds, num_recvfds, &iov, 1);
++#endif 
++}
++
++#ifdef HAVE_ISULAD
++int lxc_abstract_unix_recv_fds_timeout(int fd, int *recvfds, int num_recvfds,
++                                       void *data, size_t size, unsigned int timeout)
++{
++	char buf[1] = {0};
++	struct iovec iov = {
++		.iov_base = data ? data : buf,
++		.iov_len = data ? size : sizeof(buf),
++	};
++	return lxc_abstract_unix_recv_fds_iov(fd, recvfds, num_recvfds, &iov, 1, timeout);
+ }
++#endif
+ 
+ int lxc_abstract_unix_send_credential(int fd, void *data, size_t size)
+ {
+@@ -343,12 +381,63 @@ int lxc_unix_connect_type(struct sockaddr_un *addr, int type)
+ 	ret = connect(fd, (struct sockaddr *)addr,
+ 		      offsetof(struct sockaddr_un, sun_path) + len);
+ 	if (ret < 0)
++#ifdef HAVE_ISULAD
++		return log_error_errno(-1, errno,
++				       "Failed to connect new AF_UNIX socket");
++#else
+ 		return log_error_errno(-1, errno,
+ 				       "Failed to bind new AF_UNIX socket");
++#endif
+ 
+ 	return move_fd(fd);
+ }
+ 
++#ifdef HAVE_ISULAD
++int lxc_named_unix_open(const char *path, int type, int flags)
++{
++	__do_close int fd = -EBADF;
++	int ret;
++	ssize_t len;
++	struct sockaddr_un addr;
++
++	fd = socket(PF_UNIX, type | SOCK_CLOEXEC, 0);
++	if (fd < 0)
++		return -1;
++
++	if (!path)
++		return move_fd(fd);
++
++	len = lxc_unix_sockaddr(&addr, path);
++	if (len < 0)
++		return -1;
++
++	ret = bind(fd, (struct sockaddr *)&addr, len);
++	if (ret < 0)
++		return -1;
++
++	if (chmod(path, 0600) < 0)
++		return -1;
++
++	if (type == SOCK_STREAM) {
++		ret = listen(fd, 100);
++		if (ret < 0)
++			return -1;
++	}
++
++	return move_fd(fd);
++}
++
++int lxc_named_unix_connect(const char *path)
++{
++	struct sockaddr_un addr;
++
++	if (lxc_unix_sockaddr(&addr, path) < 0)
++		return -1;
++
++	return lxc_unix_connect_type(&addr, SOCK_STREAM);
++}
++#endif
++
+ int lxc_unix_connect(struct sockaddr_un *addr, int type)
+ {
+ 	return lxc_unix_connect_type(addr, SOCK_STREAM);
+diff --git a/src/lxc/commands_utils.c b/src/lxc/commands_utils.c
+index 2af722c..9de9a84 100644
+--- a/src/lxc/commands_utils.c
++++ b/src/lxc/commands_utils.c
+@@ -140,12 +140,69 @@ int lxc_make_abstract_socket_name(char *path, size_t pathlen,
+ 	return 0;
+ }
+ 
++#ifdef HAVE_ISULAD
++char *generate_named_unix_sock_dir(const char *name)
++{
++	__do_free char *exec_sock_dir = NULL;
++	__do_free char *rundir = NULL;
++
++	rundir = get_rundir();
++	if (!rundir)
++		rundir = strdup("/var/run");
++
++	if (asprintf(&exec_sock_dir, "%s/lxc/%s", rundir, name) < 0) {
++		return log_error_errno(NULL, errno, "Failed to allocate memory");
++	}
++
++	return move_ptr(exec_sock_dir);
++}
++
++int generate_named_unix_sock_path(const char *container_name, const char *sock_name,
++				char *out_path, size_t len)
++{
++#define MAX_SOCK_NAME_LENGTH 12
++	int ret;
++	__do_free char *sock_dir = NULL;
++	__do_free char *short_sock_name = NULL;
++
++	if (container_name == NULL || sock_name == NULL)
++		return -1;
++
++	sock_dir = generate_named_unix_sock_dir(container_name);
++	if (sock_dir == NULL)
++		return -1;
++
++	short_sock_name = strdup(sock_name);
++	if (strlen(short_sock_name) > MAX_SOCK_NAME_LENGTH)
++		short_sock_name[MAX_SOCK_NAME_LENGTH] = '\0';
++
++	ret = snprintf(out_path, len, "%s/%s.sock", sock_dir, short_sock_name);
++	if (ret < 0 || (size_t)ret >= len)
++		return log_error_errno(-1, errno, "Failed to allocate memory");
++
++	return 0;
++}
++#endif
++
+ int lxc_cmd_connect(const char *name, const char *lxcpath,
+ 		    const char *hashed_sock_name, const char *suffix)
+ {
+ 	int ret, client_fd;
+ 	char path[LXC_AUDS_ADDR_LEN] = {0};
+ 
++#ifdef HAVE_ISULAD
++	if (generate_named_unix_sock_path(name, suffix, path, sizeof(path)) != 0)
++		return -1;
++
++	if (file_exists(path)) {
++		client_fd = lxc_named_unix_connect(path);
++		if (client_fd < 0)
++			return -1;
++
++		return client_fd;
++	}
++#endif
++
+ 	ret = lxc_make_abstract_socket_name(path, sizeof(path), name, lxcpath,
+ 					    hashed_sock_name, suffix);
+ 	if (ret < 0)
+diff --git a/src/lxc/exec_commands.h b/src/lxc/exec_commands.h
+new file mode 100644
+index 0000000..3ec2a22
+--- /dev/null
++++ b/src/lxc/exec_commands.h
+@@ -0,0 +1,77 @@
++/******************************************************************************
++ * Copyright (c) Huawei Technologies Co., Ltd. 2019. All rights reserved.
++ * Author: lifeng
++ * Create: 2019-12-08
++ * Description: provide container definition
++ * lxc: linux Container library
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++  ******************************************************************************/
++
++#ifndef __LXC_EXEC_COMMANDS_H
++#define __LXC_EXEC_COMMANDS_H
++
++#include <stdio.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#include "lxccontainer.h"
++#include "macro.h"
++#include "state.h"
++#include "terminal.h"
++
++struct lxc_exec_command_handler {
++	int maincmd_fd;
++	struct lxc_terminal *terminal;
++};
++
++typedef enum {
++	LXC_EXEC_CMD_SET_TERMINAL_WINCH,
++	LXC_EXEC_CMD_MAX,
++} lxc_exec_cmd_t;
++
++struct lxc_exec_cmd_req {
++	lxc_exec_cmd_t cmd;
++	int datalen;
++	const void *data;
++};
++
++struct lxc_exec_cmd_rsp {
++	int ret; /* 0 on success, -errno on failure */
++	int datalen;
++	void *data;
++};
++
++struct lxc_exec_cmd_rr {
++	struct lxc_exec_cmd_req req;
++	struct lxc_exec_cmd_rsp rsp;
++};
++
++struct lxc_exec_cmd_set_terminal_winch_request {
++	unsigned int height;
++	unsigned int width;
++};
++
++struct lxc_epoll_descr;
++struct lxc_handler;
++
++extern int lxc_exec_cmd_init(const char *name, const char *lxcpath, const char *suffix);
++extern int lxc_exec_cmd_mainloop_add(struct lxc_epoll_descr *descr, struct lxc_exec_command_handler *handler);
++extern int lxc_exec_cmd_set_terminal_winch(const char *name, const char *lxcpath, const char *suffix, unsigned int height, unsigned int width);
++
++#ifdef HAVE_ISULAD
++extern int lxc_exec_unix_sock_delete(const char *name, const char *suffix);
++#endif
++
++#endif /* __exec_commands_h */
+diff --git a/src/lxc/file_utils.h b/src/lxc/file_utils.h
+index f9c8abe..37cd79e 100644
+--- a/src/lxc/file_utils.h
++++ b/src/lxc/file_utils.h
+@@ -83,4 +83,8 @@ extern FILE *fdopen_cached(int fd, const char *mode, void **caller_freed_buffer)
+ extern FILE *fopen_cached(const char *path, const char *mode,
+ 			  void **caller_freed_buffer);
+ 
++#ifdef HAVE_ISULAD
++extern ssize_t lxc_write_nointr_for_fifo(int fd, const char *buf, size_t count);
++#endif
++
+ #endif /* __LXC_FILE_UTILS_H */
+diff --git a/src/lxc/json/read-file.c b/src/lxc/json/read-file.c
+new file mode 100644
+index 0000000..34ebeed
+--- /dev/null
++++ b/src/lxc/json/read-file.c
+@@ -0,0 +1,95 @@
++#include <unistd.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <errno.h>
++#include <stdlib.h>
++#include <string.h>
++#include <limits.h>
++
++#include <config.h>
++#include "read-file.h"
++
++#ifndef O_CLOEXEC
++#define O_CLOEXEC 02000000
++#endif
++
++char *fread_file(FILE *stream, size_t *length)
++{
++	char *buf = NULL, *tmpbuf = NULL;
++	size_t off = 0;
++
++	while (1) {
++		size_t ret, newsize;
++
++		newsize = off + BUFSIZ + 1;
++		tmpbuf = (char *)calloc(1, newsize);
++		if (tmpbuf == NULL) {
++			goto out;
++		}
++
++		if (buf) {
++			memcpy(tmpbuf, buf, off);
++
++			memset(buf, 0, off);
++
++			free(buf);
++		}
++
++		buf = tmpbuf;
++		ret = fread(buf + off, 1, BUFSIZ, stream);
++		if (!ret && ferror(stream)) {
++			tmpbuf = NULL;
++			goto out;
++		}
++		if (ret < BUFSIZ || feof(stream)) {
++			*length = off + ret + 1;
++			buf[*length - 1] = '\0';
++			return buf;
++		}
++		off += BUFSIZ;
++	}
++out:
++	if (buf) {
++		free(buf);
++	}
++	if (tmpbuf) {
++		free(tmpbuf);
++	}
++	return NULL;
++
++}
++
++char *read_file(const char *path, size_t *length)
++{
++	char *buf = NULL;
++	char rpath[PATH_MAX + 1] = {0};
++	int fd = -1;
++	int tmperrno;
++	FILE *fp = NULL;
++
++	if (!path || !length) {
++		return NULL;
++	}
++
++	if (strlen(path) > PATH_MAX || NULL == realpath(path, rpath)) {
++		return NULL;
++	}
++
++	fd = open(rpath, O_RDONLY | O_CLOEXEC);
++	if (fd < 0) {
++		return NULL;
++	}
++
++	fp = fdopen(fd, "r");
++	tmperrno = errno;
++	if (!fp) {
++		close(fd);
++		errno = tmperrno;
++		return NULL;
++	}
++
++	buf = fread_file(fp, length);
++	fclose(fp);
++	return buf;
++}
+diff --git a/src/lxc/log.c b/src/lxc/log.c
+index 59644aa..e643f26 100644
+--- a/src/lxc/log.c
++++ b/src/lxc/log.c
+@@ -55,6 +55,38 @@ static char *log_vmname = NULL;
+ 
+ lxc_log_define(log, lxc);
+ 
++#ifdef HAVE_ISULAD
++static inline const char *isulad_get_fifo_path(const char *file)
++{
++#define ISULAD_FIFO_PREFIX "fifo:"
++
++	if (strncmp(file, ISULAD_FIFO_PREFIX, strlen(ISULAD_FIFO_PREFIX)) == 0) {
++		return (file + strlen(ISULAD_FIFO_PREFIX));
++	}
++	return NULL;
++}
++
++static int isulad_open_fifo(const char *file_path)
++{
++#define LOG_FIFO_SIZE (1024 * 1024)
++	int fd;
++
++	fd = lxc_unpriv(open(file_path, O_RDWR | O_NONBLOCK | O_CLOEXEC));
++	if (fd == -1) {
++		fprintf(stderr, "Open fifo %s failed: %s\n", file_path, strerror(errno));
++		return -1;
++	}
++
++	if (fcntl(fd, F_SETPIPE_SZ, LOG_FIFO_SIZE) == -1) {
++		printf("Set fifo buffer size failed: %s", strerror(errno));
++		close(fd);
++		return -1;
++	}
++
++	return fd;
++}
++#endif
++
+ static int lxc_log_priority_to_syslog(int priority)
+ {
+ 	switch (priority) {
+@@ -321,6 +353,12 @@ static int log_append_logfile(const struct lxc_log_appender *appender,
+ #endif
+ 
+ 	log_container_name = lxc_log_get_container_name();
++#ifdef HAVE_ISULAD
++	/* use isulad log format */
++	if (log_container_name != NULL && strlen(log_container_name) > 15) {
++		log_container_name = log_container_name + (strlen(log_container_name) - 15);
++	}
++#endif
+ 
+ 	if (fd_to_use < 0)
+ 		fd_to_use = lxc_log_fd;
+@@ -333,9 +371,13 @@ static int log_append_logfile(const struct lxc_log_appender *appender,
+ 		return ret;
+ 
+ 	n = snprintf(buffer, sizeof(buffer),
++#ifdef HAVE_ISULAD
++			 "%15s %s %-8s %s - %s:%s:%d -",
++#else
+ 		     "%s%s%s %s %-8s %s - %s:%s:%d - ",
+ 		     log_prefix,
+ 		     log_container_name ? " " : "",
++#endif
+ 		     log_container_name ? log_container_name : "",
+ 		     date_time,
+ 		     lxc_log_priority_to_string(event->priority),
+@@ -589,6 +631,13 @@ static int __lxc_log_set_file(const char *fname, int create_dirs)
+ 		return ret_errno(EINVAL);
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	fname = isulad_get_fifo_path(fname);
++	if (fname == NULL) {
++		return ret_errno(EINVAL);
++	}
++#endif
++
+ #if USE_CONFIGPATH_LOGS
+ 	/* We don't build_dir for the default if the default is i.e.
+ 	 * /var/lib/lxc/$container/$container.log.
+@@ -598,7 +647,11 @@ static int __lxc_log_set_file(const char *fname, int create_dirs)
+ 	if (build_dir(fname))
+ 		return log_error_errno(-errno, errno, "Failed to create dir for log file \"%s\"", fname);
+ 
++#ifdef HAVE_ISULAD
++	lxc_log_fd = isulad_open_fifo(fname);
++#else
+ 	lxc_log_fd = log_open(fname);
++#endif
+ 	if (lxc_log_fd < 0)
+ 		return lxc_log_fd;
+ 
+@@ -694,6 +747,9 @@ int lxc_log_init(struct lxc_log *log)
+ 
+ 	if (lxc_log_fd >= 0) {
+ 		lxc_log_category_lxc.appender = &log_appender_logfile;
++#ifdef HAVE_ISULAD
++	if (!lxc_quiet_specified && !log->quiet)
++#endif
+ 		lxc_log_category_lxc.appender->next = &log_appender_stderr;
+ 	}
+ 
+diff --git a/src/lxc/path.h b/src/lxc/path.h
+new file mode 100644
+index 0000000..2c60fb9
+--- /dev/null
++++ b/src/lxc/path.h
+@@ -0,0 +1,65 @@
++/* SPDX-License-Identifier: LGPL-2.1+ */
++/******************************************************************************
++ * Copyright (c) Huawei Technologies Co., Ltd. 2020. Allrights reserved
++ * Description: isulad utils
++ * Author: lifeng
++ * Create: 2020-04-11
++******************************************************************************/
++#ifndef __ISULAD_PATH_H_
++#define __ISULAD_PATH_H_
++
++#include <stdbool.h>
++
++bool specify_current_dir(const char *path);
++
++bool has_traling_path_separator(const char *path);
++
++// PreserveTrailingDotOrSeparator returns the given cleaned path
++// and appends a trailing `/.` or `/` if its corresponding  original
++// path ends with a trailing `/.` or `/`. If the cleaned
++// path already ends in a `.` path segment, then another is not added. If the
++// clean path already ends in a path separator, then another is not added.
++char *preserve_trailing_dot_or_separator(const char *cleanedpath,
++                const char *originalpath);
++
++
++// Split splits path immediately following the final Separator,
++// separating it into a directory and file name component.
++// If there is no Separator in path, Split returns an empty dir
++// and file set to path.
++// The returned values have the property that path = dir+file.
++bool filepath_split(const char *path, char **dir, char **base);
++
++/*
++ * cleanpath is similar to realpath of glibc, but not expands symbolic links,
++ * and not check the existence of components of the path.
++ */
++char *cleanpath(const char *path, char *realpath, size_t realpath_len);
++
++
++// FollowSymlinkInScope is a wrapper around evalSymlinksInScope that returns an
++// absolute path. This function handles paths in a platform-agnostic manner.
++char *follow_symlink_in_scope(const char *fullpath, const char *rootpath);
++
++// GetResourcePath evaluates `path` in the scope of the container's rootpath, with proper path
++// sanitisation. Symlinks are all scoped to the rootpath of the container, as
++// though the container's rootpath was `/`.
++//
++// The BaseFS of a container is the host-facing path which is bind-mounted as
++// `/` inside the container. This method is essentially used to access a
++// particular path inside the container as though you were a process in that
++// container.
++int get_resource_path(const char *rootpath, const char *path,
++                      char **scopepath);
++
++// Rel returns a relative path that is lexically equivalent to targpath when
++// joined to basepath with an intervening separator. That is,
++// Join(basepath, Rel(basepath, targpath)) is equivalent to targpath itself.
++// On success, the returned path will always be relative to basepath,
++// even if basepath and targpath share no elements.
++// An error is returned if targpath can't be made relative to basepath or if
++// knowing the current working directory would be necessary to compute it.
++// Rel calls Clean on the result.
++char *path_relative(const char *basepath, const char *targpath);
++
++#endif
+diff --git a/src/lxc/start.h b/src/lxc/start.h
+index ece4aac..c7a0a55 100644
+--- a/src/lxc/start.h
++++ b/src/lxc/start.h
+@@ -124,8 +124,17 @@ struct lxc_handler {
+ 
+ 	struct cgroup_ops *cgroup_ops;
+ 
++#ifdef HAVE_ISULAD
++	int exit_code;/* isulad: record the exit code of container */
++	/* Indicates whether should we using pipes or pty dup to std{in,out,err} for console log. */
++	bool disable_pty;
++	/* Indicates whether should we keep stdin active. */
++	bool open_stdin;
++	bool image_type_oci;
++#else
+ 	/* Internal fds that always need to stay open. */
+ 	int keep_fds[3];
++#endif
+ };
+ 
+ struct execute_args {
+@@ -136,7 +145,11 @@ struct execute_args {
+ };
+ 
+ struct lxc_operations {
++#ifdef HAVE_ISULAD
++	int (*start)(struct lxc_handler *, void *, int);
++#else
+ 	int (*start)(struct lxc_handler *, void *);
++#endif
+ 	int (*post_start)(struct lxc_handler *, void *);
+ };
+ 
+@@ -164,14 +177,31 @@ extern void lxc_end(struct lxc_handler *handler);
+  */
+ extern int lxc_check_inherited(struct lxc_conf *conf, bool closeall,
+ 			       int *fds_to_ignore, size_t len_fds);
++#ifndef HAVE_ISULAD
+ static inline int inherit_fds(struct lxc_handler *handler, bool closeall)
+ {
+ 	return lxc_check_inherited(handler->conf, closeall, handler->keep_fds,
+ 				   ARRAY_SIZE(handler->keep_fds));
+ }
++#endif
++
++#ifdef HAVE_ISULAD
++extern int __lxc_start(struct lxc_handler *handler,
++		struct lxc_operations* ops, void *data, const char *lxcpath,
++		bool daemonize, int *error_num, unsigned int start_timeout);
++#else
+ extern int __lxc_start(struct lxc_handler *, struct lxc_operations *, void *,
+ 		       const char *, bool, int *);
+ 
++#endif
+ extern int resolve_clone_flags(struct lxc_handler *handler);
+ 
++#ifdef HAVE_ISULAD
++/*isulad: do_lxcapi_clean_resource */
++extern int do_lxcapi_clean_resource(char *name, char *lxcpath, struct lxc_conf *conf, pid_t pid);
++
++/*isulad: do_lxcapi_get_pids */
++extern int do_lxcapi_get_pids(char *name, char *lxcpath, struct lxc_conf *conf, pid_t **pids,size_t *pids_len);
++#endif
++
+ #endif
+diff --git a/src/lxc/storage/block.c b/src/lxc/storage/block.c
+new file mode 100644
+index 0000000..eb75e70
+--- /dev/null
++++ b/src/lxc/storage/block.c
+@@ -0,0 +1,86 @@
++/*
++ * lxc: linux Container library
++ *
++ * (C) Copyright IBM Corp. 2007, 2008
++ *
++ * Authors:
++ * Daniel Lezcano <daniel.lezcano at free.fr>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE 1
++#endif
++#include <stdint.h>
++#include <string.h>
++
++#include "config.h"
++#include "log.h"
++#include "storage.h"
++#include "storage_utils.h"
++#include "utils.h"
++
++lxc_log_define(blk, lxc);
++
++int blk_destroy(struct lxc_storage *orig)
++{
++	return 0;
++}
++
++bool blk_detect(const char *path)
++{
++	struct stat statbuf;
++	int ret;
++
++	if (!strncmp(path, "blk:", 4))
++		return true;
++
++	ret = stat(path, &statbuf);
++	if (ret == -1 && errno == EPERM) {
++		SYSERROR("blk_detect: failed to look at \"%s\"", path);
++		return false;
++	}
++
++	if (ret == 0 && S_ISBLK(statbuf.st_mode))
++		return true;
++
++	return false;
++}
++
++int blk_mount(struct lxc_storage *bdev)
++{
++	const char *src;
++	if (strcmp(bdev->type, "blk"))
++		return -22;
++
++	if (!bdev->src || !bdev->dest)
++		return -22;
++
++	src = lxc_storage_get_path(bdev->src, bdev->type);
++
++	return mount_unknown_fs(src, bdev->dest, bdev->mntopts);
++}
++
++int blk_umount(struct lxc_storage *bdev)
++{
++	if (strcmp(bdev->type, "blk"))
++		return -22;
++
++	if (!bdev->src || !bdev->dest)
++		return -22;
++
++	return umount(bdev->dest);
++}
+diff --git a/src/lxc/storage/block.h b/src/lxc/storage/block.h
+new file mode 100644
+index 0000000..2fa7565
+--- /dev/null
++++ b/src/lxc/storage/block.h
+@@ -0,0 +1,41 @@
++/*
++ * lxc: linux Container library
++ *
++ * (C) Copyright IBM Corp. 2007, 2008
++ *
++ * Authors:
++ * Daniel Lezcano <daniel.lezcano at free.fr>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef __LXC_BLK_H
++#define __LXC_BLK_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++struct lxc_storage;
++
++struct bdev_specs;
++
++struct lxc_conf;
++
++extern int blk_destroy(struct lxc_storage *orig);
++extern bool blk_detect(const char *path);
++extern int blk_mount(struct lxc_storage *bdev);
++extern int blk_umount(struct lxc_storage *bdev);
++
++#endif /* __LXC_BLK_H */
+diff --git a/src/lxc/storage/storage_utils.c b/src/lxc/storage/storage_utils.c
+index f96bd52..696c6e5 100644
+--- a/src/lxc/storage/storage_utils.c
++++ b/src/lxc/storage/storage_utils.c
+@@ -256,10 +256,17 @@ int is_blktype(struct lxc_storage *b)
+ 	return 0;
+ }
+ 
++#ifdef HAVE_ISULAD
++static char **mount_errors = NULL;
++#endif
++
+ int mount_unknown_fs(const char *rootfs, const char *target,
+ 		     const char *options)
+ {
+ 	size_t i;
++#ifdef HAVE_ISULAD
++	char *errs = NULL;
++#endif
+ 	int ret;
+ 	struct cbarg {
+ 		const char *rootfs;
+@@ -288,14 +295,41 @@ int mount_unknown_fs(const char *rootfs, const char *target,
+ 		ret = lxc_file_for_each_line(fsfile[i], find_fstype_cb, &cbarg);
+ 		if (ret < 0) {
+ 			ERROR("Failed to parse \"%s\"", fsfile[i]);
++#ifdef HAVE_ISULAD
++			lxc_free_array((void**)mount_errors, free);
++			mount_errors = NULL;
++#endif
+ 			return -1;
+ 		}
+ 
++#ifdef HAVE_ISULAD
++		if (ret) {
++			lxc_free_array((void**)mount_errors, free);
++			mount_errors = NULL;
++			return 0;
++		}
++#else
+ 		if (ret)
+ 			return 0;
++#endif
++	}
++
++#ifdef HAVE_ISULAD
++	if (mount_errors != NULL) {
++		errs = lxc_string_join("\n", (const char **)mount_errors, false);
++		if (errs == NULL) {
++			ERROR("failed to join mount errors");
++		}
+ 	}
+ 
++	ERROR("Failed to determine FSType for \"%s\": %s", rootfs, errs ? errs : "unknown reason");
++
++	free(errs);
++	lxc_free_array((void**)mount_errors, free);
++	mount_errors = NULL;
++#else
+ 	ERROR("Failed to determine FSType for \"%s\"", rootfs);
++#endif 
+ 
+ 	return -1;
+ }
+@@ -316,6 +350,11 @@ int find_fstype_cb(char *buffer, void *data)
+ 	char *mntdata = NULL;
+ 	char *fstype;
+ 
++#ifdef HAVE_ISULAD
++	char mount_err[BUFSIZ] = {0};
++	int ret;
++	unsigned long pflags = 0;
++#endif
+ 	/* we don't try 'nodev' entries */
+ 	if (strstr(buffer, "nodev"))
+ 		return 0;
+@@ -327,14 +366,35 @@ int find_fstype_cb(char *buffer, void *data)
+ 	DEBUG("Trying to mount \"%s\"->\"%s\" with FSType \"%s\"", cbarg->rootfs,
+ 	      cbarg->target, fstype);
+ 
++#ifdef HAVE_ISULAD
++	if (parse_mntopts(cbarg->options, &mntflags, &pflags, &mntdata) < 0) {
++#else
+ 	if (parse_mntopts(cbarg->options, &mntflags, &mntdata) < 0) {
++#endif
+ 		free(mntdata);
+ 		return 0;
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	if (mount(cbarg->rootfs, cbarg->target, fstype, (mntflags & ~MS_RDONLY), mntdata)) {		
++#else
+ 	if (mount(cbarg->rootfs, cbarg->target, fstype, mntflags, mntdata)) {
++#endif
+ 		SYSDEBUG("Failed to mount");
+ 		free(mntdata);
++#ifdef HAVE_ISULAD
++		// isulad: recored error
++		ret = snprintf(mount_err, BUFSIZ, "\t\tmount %s onto %s with FSType %s failed: %s",
++						cbarg->rootfs, cbarg->target, fstype, strerror(errno));
++		if (ret < 0 || (size_t)ret >= BUFSIZ) {
++			ERROR("failed to format output mount error");
++			return 0;
++		}
++
++		if (lxc_append_string(&mount_errors, mount_err) < 0) {
++			ERROR("failed to append mount error");
++		}
++#endif
+ 		return 0;
+ 	}
+ 
+diff --git a/src/lxc/terminal.h b/src/lxc/terminal.h
+index 4d21f33..c835e9a 100644
+--- a/src/lxc/terminal.h
++++ b/src/lxc/terminal.h
+@@ -79,6 +79,16 @@ struct lxc_terminal {
+ 
+ 		/* whether the log file will be rotated */
+ 		unsigned int log_rotate;
++#ifdef HAVE_ISULAD
++                /* driver of log, support file and syslog */
++                char *log_driver;
++
++                /* syslog tag for every log */
++                char *log_syslog_tag;
++
++                /* syslog facility */
++                int log_syslog_facility;
++#endif
+ 	};
+ 
+ 	struct /* lxc_terminal_ringbuf */ {
+@@ -88,7 +98,27 @@ struct lxc_terminal {
+ 		/* the in-memory ringbuffer */
+ 		struct lxc_ringbuf ringbuf;
+ 	};
++#ifdef HAVE_ISULAD
++	char *init_fifo[3]; /* isulad: default fifos for the start */
++	struct lxc_list fifos; /* isulad: fifos used to forward teminal */
++	bool disable_pty;
++	bool open_stdin;
++	int pipes[3][2]; /* isulad: pipes for dup to container fds of stdin,stdout,stderr on daemonize mode*/
++#endif
++};
++
++#ifdef HAVE_ISULAD
++/* isulad: fifo struct */
++struct lxc_fifos_fd {
++	char *in_fifo;
++	char *out_fifo;
++	char *err_fifo;
++	int in_fd;
++	int out_fd;
++	int err_fd;
++	struct lxc_list node;
+ };
++#endif
+ 
+ /**
+  * lxc_terminal_allocate: allocate the console or a tty
+@@ -254,4 +284,9 @@ extern void lxc_terminal_init(struct lxc_terminal *terminal);
+ extern int lxc_terminal_map_ids(struct lxc_conf *c,
+ 				struct lxc_terminal *terminal);
+ 
++#ifdef HAVE_ISULAD
++int lxc_terminal_add_fifos(struct lxc_conf *conf, const char *fifonames);
++int lxc_set_terminal_winsz(struct lxc_terminal *terminal, unsigned int height, unsigned int width);
++#endif
++
+ #endif /* __LXC_TERMINAL_H */
+-- 
+2.25.1
+

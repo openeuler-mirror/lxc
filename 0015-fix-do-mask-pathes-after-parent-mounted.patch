@@ -1,0 +1,44 @@
+From 96a35e077d21a1abf1cc3819fb842b8089ee268d Mon Sep 17 00:00:00 2001
+From: isuladci <isulad@ci.com>
+Date: Tue, 20 Sep 2022 01:40:18 -0700
+Subject: [PATCH] fix do mask pathes after parent mounted
+
+Signed-off-by: isuladci <isulad@ci.com>
+---
+ src/lxc/conf.c | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/src/lxc/conf.c b/src/lxc/conf.c
+index 378cf9f..439601a 100644
+--- a/src/lxc/conf.c
++++ b/src/lxc/conf.c
+@@ -3975,19 +3975,19 @@ int lxc_setup(struct lxc_handler *handler)
+ 	}
+ 
+ #ifdef HAVE_ISULAD
+-	// isulad: setup rootfs masked paths
+-	if (!lxc_list_empty(&lxc_conf->rootfs.maskedpaths)) {
+-		if (setup_rootfs_maskedpaths(&lxc_conf->rootfs.maskedpaths)) {
+-			return log_error(-1, "failed to setup maskedpaths");
+-		}
+-	}
+-
+ 	// isulad: setup rootfs ro paths
+ 	if (!lxc_list_empty(&lxc_conf->rootfs.ropaths)) {
+ 		if (setup_rootfs_ropaths(&lxc_conf->rootfs.ropaths)) {
+ 			return log_error(-1, "failed to setup readonlypaths");
+ 		}
+ 	}
++	
++	// isulad: setup rootfs masked paths
++	if (!lxc_list_empty(&lxc_conf->rootfs.maskedpaths)) {
++		if (setup_rootfs_maskedpaths(&lxc_conf->rootfs.maskedpaths)) {
++			return log_error(-1, "failed to setup maskedpaths");
++		}
++	}
+ 
+ 	//isulad: system container, remount /proc/sys/xxx by mount_list
+ 	if (lxc_conf->systemd != NULL && strcmp(lxc_conf->systemd, "true") == 0) {
+-- 
+2.25.1
+

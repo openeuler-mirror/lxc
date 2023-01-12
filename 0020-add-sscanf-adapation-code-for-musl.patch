@@ -1,0 +1,31 @@
+From 3cefa43ec2f5f0366c470290d48bdcd88690cf90 Mon Sep 17 00:00:00 2001
+From: isuladci <isulad@ci.com>
+Date: Thu, 8 Dec 2022 09:48:29 +0800
+Subject: [PATCH] add sscanf adapation code for musl
+
+Signed-off-by: isuladci <isulad@ci.com>
+---
+ src/lxc/isulad_utils.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/lxc/isulad_utils.c b/src/lxc/isulad_utils.c
+index 067e1c9..ee39302 100644
+--- a/src/lxc/isulad_utils.c
++++ b/src/lxc/isulad_utils.c
+@@ -173,7 +173,13 @@ static proc_t *lxc_stat2proc(const char *S)
+     (void)memset(P, 0x00, sizeof(proc_t));
+ 
+     /* parse these two strings separately, skipping the leading "(". */
++    /* https://www.openwall.com/lists/musl/2013/11/15/5: musl's sscanf("%15c",cmd) 
++       requires exactly 15 characters; anything shorter is a matching failure. */
++#ifdef __MUSL__
++    num = sscanf(S, "%d (%15s", &P->pid, P->cmd);   /* comm[16] in kernel */
++#else
+     num = sscanf(S, "%d (%15c", &P->pid, P->cmd);   /* comm[16] in kernel */
++#endif
+     if (num != 2) {
+         ERROR("Call sscanf error: %s", errno ? strerror(errno) : "");
+         free(P);
+-- 
+2.25.1
+

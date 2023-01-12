@@ -1,0 +1,2368 @@
+From d6745a42729f4704a0d9913676bf6d8b03c21903 Mon Sep 17 00:00:00 2001
+From: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+Date: Fri, 15 Jul 2022 17:06:09 +0800
+Subject: [PATCH] refactor patch code of utils commands and so on
+
+Signed-off-by: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+---
+ src/lxc/cgroups/isulad_cgroup2_devices.c | 575 +++++++++++++++++++++++
+ src/lxc/commands.c                       | 185 +++++++-
+ src/lxc/commands.h                       |  10 +
+ src/lxc/conf.h                           |  95 ++++
+ src/lxc/isulad_utils.c                   | 319 +++++++++++++
+ src/lxc/isulad_utils.h                   |  99 ++++
+ src/lxc/lsm/lsm.c                        |  20 +
+ src/lxc/lxc.h                            |  19 +
+ src/lxc/lxccontainer.h                   | 194 ++++++++
+ src/lxc/network.c                        |   8 +
+ src/lxc/tools/lxc_ls.c                   |   8 +
+ src/lxc/tools/lxc_start.c                | 109 ++++-
+ src/lxc/utils.c                          | 173 +++++++
+ src/lxc/utils.h                          |  11 +
+ 14 files changed, 1822 insertions(+), 3 deletions(-)
+ create mode 100644 src/lxc/cgroups/isulad_cgroup2_devices.c
+ create mode 100644 src/lxc/isulad_utils.c
+ create mode 100644 src/lxc/isulad_utils.h
+
+diff --git a/src/lxc/cgroups/isulad_cgroup2_devices.c b/src/lxc/cgroups/isulad_cgroup2_devices.c
+new file mode 100644
+index 0000000..05613c5
+--- /dev/null
++++ b/src/lxc/cgroups/isulad_cgroup2_devices.c
+@@ -0,0 +1,575 @@
++/* SPDX-License-Identifier: LGPL-2.1+ */
++
++/* Parts of this taken from systemd's implementation. */
++
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE 1
++#endif
++#include <errno.h>
++#include <fcntl.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <sys/stat.h>
++#include <sys/syscall.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#include "cgroup2_devices.h"
++#include "config.h"
++#include "log.h"
++#include "macro.h"
++#include "memory_utils.h"
++
++#ifdef HAVE_STRUCT_BPF_CGROUP_DEV_CTX
++#include <linux/bpf.h>
++#include <linux/filter.h>
++
++#define BPF_LOG_BUF_SIZE (1 << 23) /* 8MB */
++#ifndef BPF_LOG_LEVEL1
++#define BPF_LOG_LEVEL1 1
++#endif
++
++#ifndef BPF_LOG_LEVEL2
++#define BPF_LOG_LEVEL2 2
++#endif
++
++#ifndef BPF_LOG_LEVEL
++#define BPF_LOG_LEVEL (BPF_LOG_LEVEL1 | BPF_LOG_LEVEL2)
++#endif
++
++lxc_log_define(cgroup2_devices, cgroup);
++
++static int bpf_program_add_instructions(struct bpf_program *prog,
++					const struct bpf_insn *instructions,
++					size_t count)
++{
++
++	struct bpf_insn *new_insn;
++
++	if (prog->kernel_fd >= 0)
++		return log_error_errno(-1, EBUSY, "Refusing to update bpf cgroup program that's already loaded");
++
++	new_insn = realloc(prog->instructions, sizeof(struct bpf_insn) * (count + prog->n_instructions));
++	if (!new_insn)
++		return log_error_errno(-1, ENOMEM, "Failed to reallocate bpf cgroup program");
++
++	prog->instructions = new_insn;
++	memset(prog->instructions + prog->n_instructions, 0,
++	       sizeof(struct bpf_insn) * count);
++	memcpy(prog->instructions + prog->n_instructions, instructions,
++	       sizeof(struct bpf_insn) * count);
++	prog->n_instructions += count;
++
++	return 0;
++}
++
++void bpf_program_free(struct bpf_program *prog)
++{
++	if (!prog)
++		return;
++
++	(void)bpf_program_cgroup_detach(prog);
++
++	if (prog->kernel_fd >= 0)
++		close(prog->kernel_fd);
++	free(prog->instructions);
++	free(prog->attached_path);
++	free(prog);
++}
++
++/* Memory load, dst_reg = *(uint *) (src_reg + off16) */
++#define BPF_LDX_MEM(SIZE, DST, SRC, OFF)                               \
++	((struct bpf_insn){.code = BPF_LDX | BPF_SIZE(SIZE) | BPF_MEM, \
++			   .dst_reg = DST,                             \
++			   .src_reg = SRC,                             \
++			   .off = OFF,                                 \
++			   .imm = 0})
++
++/* ALU ops on immediates, bpf_add|sub|...: dst_reg += imm32 */
++#define BPF_ALU32_IMM(OP, DST, IMM)                              \
++	((struct bpf_insn){.code = BPF_ALU | BPF_OP(OP) | BPF_K, \
++			   .dst_reg = DST,                       \
++			   .src_reg = 0,                         \
++			   .off = 0,                             \
++			   .imm = IMM})
++
++/* Short form of mov, dst_reg = src_reg */
++#define BPF_MOV64_IMM(DST, IMM)                                 \
++	((struct bpf_insn){.code = BPF_ALU64 | BPF_MOV | BPF_K, \
++			   .dst_reg = DST,                      \
++			   .src_reg = 0,                        \
++			   .off = 0,                            \
++			   .imm = IMM})
++
++#define BPF_MOV32_REG(DST, SRC)                               \
++	((struct bpf_insn){.code = BPF_ALU | BPF_MOV | BPF_X, \
++			   .dst_reg = DST,                    \
++			   .src_reg = SRC,                    \
++			   .off = 0,                          \
++			   .imm = 0})
++
++/* Conditional jumps against registers, if (dst_reg 'op' src_reg) goto pc + off16 */
++#define BPF_JMP_REG(OP, DST, SRC, OFF)                           \
++	((struct bpf_insn){.code = BPF_JMP | BPF_OP(OP) | BPF_X, \
++			   .dst_reg = DST,                       \
++			   .src_reg = SRC,                       \
++			   .off = OFF,                           \
++			   .imm = 0})
++
++/* Conditional jumps against immediates, if (dst_reg 'op' imm32) goto pc + off16 */
++#define BPF_JMP_IMM(OP, DST, IMM, OFF)                           \
++	((struct bpf_insn){.code = BPF_JMP | BPF_OP(OP) | BPF_K, \
++			   .dst_reg = DST,                       \
++			   .src_reg = 0,                         \
++			   .off = OFF,                           \
++			   .imm = IMM})
++
++/* Program exit */
++#define BPF_EXIT_INSN()                                \
++	((struct bpf_insn){.code = BPF_JMP | BPF_EXIT, \
++			   .dst_reg = 0,               \
++			   .src_reg = 0,               \
++			   .off = 0,                   \
++			   .imm = 0})
++
++static int bpf_access_mask(const char *acc, __u32 *mask)
++{
++	if (!acc)
++		return 0;
++
++	for (; *acc; acc++)
++		switch (*acc) {
++		case 'r':
++			*mask |= BPF_DEVCG_ACC_READ;
++			break;
++		case 'w':
++			*mask |= BPF_DEVCG_ACC_WRITE;
++			break;
++		case 'm':
++			*mask |= BPF_DEVCG_ACC_MKNOD;
++			break;
++		default:
++			return -EINVAL;
++		}
++
++	return 0;
++}
++
++static int bpf_device_type(char type)
++{
++	switch (type) {
++	case 'a':
++		return 0;
++	case 'b':
++		return BPF_DEVCG_DEV_BLOCK;
++	case 'c':
++		return BPF_DEVCG_DEV_CHAR;
++	}
++
++	return -1;
++}
++
++static inline bool bpf_device_all_access(__u32 access_mask)
++{
++	return access_mask == (BPF_DEVCG_ACC_READ | BPF_DEVCG_ACC_WRITE | BPF_DEVCG_ACC_MKNOD);
++}
++
++struct bpf_program *bpf_program_new(uint32_t prog_type)
++{
++	__do_free struct bpf_program *prog = NULL;
++
++	prog = zalloc(sizeof(struct bpf_program));
++	if (!prog)
++		return ret_set_errno(NULL, ENOMEM);
++
++	prog->prog_type = prog_type;
++	prog->kernel_fd = -EBADF;
++	/*
++	 * By default a whitelist is used unless the user tells us otherwise.
++	 */
++	prog->device_list_type = LXC_BPF_DEVICE_CGROUP_WHITELIST;
++
++	return move_ptr(prog);
++}
++
++int bpf_program_init(struct bpf_program *prog)
++{
++	if (!prog)
++		return ret_set_errno(-1, EINVAL);
++
++	const struct bpf_insn pre_insn[] = {
++	    /* load device type to r2 */
++	    BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_1, offsetof(struct bpf_cgroup_dev_ctx, access_type)),
++	    BPF_ALU32_IMM(BPF_AND, BPF_REG_2, 0xFFFF),
++
++	    /* load access type to r3 */
++	    BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_1, offsetof(struct bpf_cgroup_dev_ctx, access_type)),
++	    BPF_ALU32_IMM(BPF_RSH, BPF_REG_3, 16),
++
++	    /* load major number to r4 */
++	    BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_1, offsetof(struct bpf_cgroup_dev_ctx, major)),
++
++	    /* load minor number to r5 */
++	    BPF_LDX_MEM(BPF_W, BPF_REG_5, BPF_REG_1, offsetof(struct bpf_cgroup_dev_ctx, minor)),
++	};
++
++	return bpf_program_add_instructions(prog, pre_insn, ARRAY_SIZE(pre_insn));
++}
++
++int bpf_program_append_device(struct bpf_program *prog, struct device_item *device)
++{
++	int ret;
++	int jump_nr = 1;
++	__u32 access_mask = 0;
++	int device_type;
++	struct bpf_insn bpf_access_decision[2];
++	bool add_exist = false;
++
++	if (!prog || !device)
++		return ret_set_errno(-1, EINVAL);
++
++	/* This is a global rule so no need to append anything. */
++	if (device->global_rule > LXC_BPF_DEVICE_CGROUP_LOCAL_RULE) {
++		prog->device_list_type = device->global_rule;
++		return 0;
++	}
++
++	ret = bpf_access_mask(device->access, &access_mask);
++	if (ret < 0)
++		return log_error_errno(ret, -ret, "Invalid access mask specified %s", device->access);
++
++	if (!bpf_device_all_access(access_mask))
++		jump_nr += 3;
++
++	device_type = bpf_device_type(device->type);
++	if (device_type < 0)
++		return log_error_errno(-1, EINVAL, "Invalid bpf cgroup device type %c", device->type);
++
++	if (device_type > 0)
++		jump_nr++;
++
++	if (device->major >= 0)
++		jump_nr++;
++
++	if (device->minor >= 0)
++		jump_nr++;
++
++	if (device_type > 0) {
++		struct bpf_insn ins[] = {
++			BPF_JMP_IMM(BPF_JNE, BPF_REG_2, device_type, jump_nr--),
++		};
++
++		ret = bpf_program_add_instructions(prog, ins, ARRAY_SIZE(ins));
++		if (ret)
++			return log_error_errno(-1, errno, "Failed to add instructions to bpf cgroup program");
++		add_exist = true;
++	}
++
++	if (!bpf_device_all_access(access_mask)) {
++		struct bpf_insn ins[] = {
++			BPF_MOV32_REG(BPF_REG_1, BPF_REG_3),
++			BPF_ALU32_IMM(BPF_AND, BPF_REG_1, access_mask),
++			BPF_JMP_REG(BPF_JNE, BPF_REG_1, BPF_REG_3, jump_nr-2),
++		};
++
++		jump_nr -= 3;
++		ret = bpf_program_add_instructions(prog, ins, ARRAY_SIZE(ins));
++		if (ret)
++			return log_error_errno(-1, errno, "Failed to add instructions to bpf cgroup program");
++		add_exist = true;
++	}
++
++	if (device->major >= 0) {
++		struct bpf_insn ins[] = {
++			BPF_JMP_IMM(BPF_JNE, BPF_REG_4, device->major, jump_nr--),
++		};
++
++		ret = bpf_program_add_instructions(prog, ins, ARRAY_SIZE(ins));
++		if (ret)
++			return log_error_errno(-1, errno, "Failed to add instructions to bpf cgroup program");
++		add_exist = true;
++	}
++
++	if (device->minor >= 0) {
++		struct bpf_insn ins[] = {
++			BPF_JMP_IMM(BPF_JNE, BPF_REG_5, device->minor, jump_nr--),
++		};
++
++		ret = bpf_program_add_instructions(prog, ins, ARRAY_SIZE(ins));
++		if (ret)
++			return log_error_errno(-1, errno, "Failed to add instructions to bpf cgroup program");
++		add_exist = true;
++	}
++
++	if (add_exist) {
++		bpf_access_decision[0] = BPF_MOV64_IMM(BPF_REG_0, device->allow);
++		bpf_access_decision[1] = BPF_EXIT_INSN();
++		ret = bpf_program_add_instructions(prog, bpf_access_decision,
++					   ARRAY_SIZE(bpf_access_decision));
++		if (ret)
++			return log_error_errno(-1, errno, "Failed to add instructions to bpf cgroup program");
++	}
++
++	return 0;
++}
++
++int bpf_program_finalize(struct bpf_program *prog)
++{
++	struct bpf_insn ins[] = {
++	    BPF_MOV64_IMM(BPF_REG_0, prog->device_list_type),
++	    BPF_EXIT_INSN(),
++	};
++
++	if (!prog)
++		return ret_set_errno(-1, EINVAL);
++
++	TRACE("Implementing %s bpf device cgroup program",
++	      prog->device_list_type == LXC_BPF_DEVICE_CGROUP_BLACKLIST
++		  ? "blacklist"
++		  : "whitelist");
++	return bpf_program_add_instructions(prog, ins, ARRAY_SIZE(ins));
++}
++
++static int bpf_program_load_kernel(struct bpf_program *prog)
++{
++	__do_free char *log_buf = NULL;
++	__u32 log_level = 0;
++	__u32 log_size = 0;
++	union bpf_attr attr;
++	struct rlimit limit = {
++		.rlim_cur = RLIM_INFINITY,
++		.rlim_max = RLIM_INFINITY,
++	};
++
++	if (prog->kernel_fd >= 0) {
++		return 0;
++	}
++
++	if (lxc_log_get_level() <= LXC_LOG_LEVEL_DEBUG) {
++		log_buf = zalloc(BPF_LOG_BUF_SIZE);
++		if (!log_buf) {
++			WARN("Failed to allocate bpf log buffer");
++		} else {
++			log_level = BPF_LOG_LEVEL;
++			log_size = BPF_LOG_BUF_SIZE;
++		}
++	}
++
++	if (setrlimit(RLIMIT_MEMLOCK, &limit) < 0)
++		return log_error_errno(-1, errno, "Failed to set rlimit memlock to unlimited");
++
++	attr = (union bpf_attr){
++	    .prog_type	= prog->prog_type,
++	    .insns	= PTR_TO_UINT64(prog->instructions),
++	    .insn_cnt	= prog->n_instructions,
++	    .license	= PTR_TO_UINT64("GPL"),
++	    .log_buf	= PTR_TO_UINT64(log_buf),
++	    .log_level	= log_level,
++	    .log_size	= log_size,
++	};
++
++	prog->kernel_fd = bpf(BPF_PROG_LOAD, &attr, sizeof(attr));
++	if (prog->kernel_fd < 0)
++		return log_error_errno(-1, errno, "Failed to load bpf program: %s", log_buf);
++
++	TRACE("Loaded bpf program: %s", log_buf ?: "(null)");
++	return 0;
++}
++
++int bpf_program_cgroup_attach(struct bpf_program *prog, int type,
++			      const char *path, uint32_t flags)
++{
++	__do_free char *copy = NULL;
++	__do_close int fd = -EBADF;
++	union bpf_attr attr;
++	int ret;
++
++	if (!prog)
++		return ret_set_errno(-1, EINVAL);
++
++	if (flags & ~(BPF_F_ALLOW_OVERRIDE | BPF_F_ALLOW_MULTI))
++		return log_error_errno(-1, EINVAL, "Invalid flags for bpf program");
++
++	if (prog->attached_path) {
++		if (prog->attached_type != type)
++			return log_error_errno(-1, EBUSY, "Wrong type for bpf program");
++
++		if (prog->attached_flags != flags)
++			return log_error_errno(-1, EBUSY, "Wrong flags for bpf program");
++
++		if (flags != BPF_F_ALLOW_OVERRIDE)
++			return true;
++	}
++
++	ret = bpf_program_load_kernel(prog);
++	if (ret < 0)
++		return log_error_errno(-1, ret, "Failed to load bpf program");
++
++	copy = strdup(path);
++	if (!copy)
++		return log_error_errno(-1, ENOMEM, "Failed to duplicate cgroup path %s", path);
++
++	fd = open(path, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
++	if (fd < 0)
++		return log_error_errno(-1, errno, "Failed to open cgroup path %s", path);
++
++	attr = (union bpf_attr){
++	    .attach_type	= type,
++	    .target_fd		= fd,
++	    .attach_bpf_fd	= prog->kernel_fd,
++	    .attach_flags	= flags,
++	};
++
++	ret = bpf(BPF_PROG_ATTACH, &attr, sizeof(attr));
++	if (ret < 0)
++		return log_error_errno(-1, errno, "Failed to attach bpf program");
++
++	free_move_ptr(prog->attached_path, copy);
++	prog->attached_type = type;
++	prog->attached_flags = flags;
++
++	TRACE("Loaded and attached bpf program to cgroup %s", prog->attached_path);
++	return 0;
++}
++
++int bpf_program_cgroup_detach(struct bpf_program *prog)
++{
++	int ret;
++	__do_close int fd = -EBADF;
++
++	if (!prog)
++		return 0;
++
++	if (!prog->attached_path)
++		return 0;
++
++	fd = open(prog->attached_path, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
++	if (fd < 0) {
++		if (errno != ENOENT)
++			return log_error_errno(-1, errno, "Failed to open attach cgroup %s",
++					       prog->attached_path);
++	} else {
++		union bpf_attr attr;
++
++		attr = (union bpf_attr){
++		    .attach_type	= prog->attached_type,
++		    .target_fd		= fd,
++		    .attach_bpf_fd	= prog->kernel_fd,
++		};
++
++		ret = bpf(BPF_PROG_DETACH, &attr, sizeof(attr));
++		if (ret < 0)
++			return log_error_errno(-1, errno, "Failed to detach bpf program from cgroup %s",
++					       prog->attached_path);
++	}
++
++	free(prog->attached_path);
++	prog->attached_path = NULL;
++
++	return 0;
++}
++
++void lxc_clear_cgroup2_devices(struct lxc_conf *conf)
++{
++	if (conf->cgroup2_devices) {
++		(void)bpf_program_cgroup_detach(conf->cgroup2_devices);
++		(void)bpf_program_free(conf->cgroup2_devices);
++	}
++}
++
++int bpf_list_add_device(struct lxc_conf *conf, struct device_item *device)
++{
++	__do_free struct lxc_list *list_elem = NULL;
++	__do_free struct device_item *new_device = NULL;
++	struct lxc_list *it;
++
++	lxc_list_for_each(it, &conf->devices) {
++		struct device_item *cur = it->elem;
++
++		if (cur->global_rule > LXC_BPF_DEVICE_CGROUP_LOCAL_RULE &&
++		    device->global_rule > LXC_BPF_DEVICE_CGROUP_LOCAL_RULE) {
++			TRACE("Switched from %s to %s",
++			      cur->global_rule == LXC_BPF_DEVICE_CGROUP_WHITELIST
++				  ? "whitelist"
++				  : "blacklist",
++			      device->global_rule == LXC_BPF_DEVICE_CGROUP_WHITELIST
++				  ? "whitelist"
++				  : "blacklist");
++			cur->global_rule = device->global_rule;
++			return 1;
++		}
++
++		if (cur->type != device->type)
++			continue;
++		if (cur->major != device->major)
++			continue;
++		if (cur->minor != device->minor)
++			continue;
++		if (strcmp(cur->access, device->access))
++			continue;
++
++		/*
++		 * The rule is switched from allow to deny or vica versa so
++		 * don't bother allocating just flip the existing one.
++		 */
++		if (cur->allow != device->allow) {
++			cur->allow = device->allow;
++			return log_trace(0, "Switched existing rule of bpf device program: type %c, major %d, minor %d, access %s, allow %d, global_rule %d",
++					 cur->type, cur->major, cur->minor,
++					 cur->access, cur->allow,
++					 cur->global_rule);
++		}
++
++		return log_trace(1, "Reusing existing rule of bpf device program: type %c, major %d, minor %d, access %s, allow %d, global_rule %d",
++				 cur->type, cur->major, cur->minor, cur->access,
++				 cur->allow, cur->global_rule);
++	}
++
++	list_elem = malloc(sizeof(*list_elem));
++	if (!list_elem)
++		return log_error_errno(-1, ENOMEM, "Failed to allocate new device list");
++
++	new_device = memdup(device, sizeof(struct device_item));
++	if (!new_device)
++		return log_error_errno(-1, ENOMEM, "Failed to allocate new device item");
++
++	lxc_list_add_elem(list_elem, move_ptr(new_device));
++	lxc_list_add_tail(&conf->devices, move_ptr(list_elem));
++
++	return 0;
++}
++
++bool bpf_devices_cgroup_supported(void)
++{
++	const struct bpf_insn dummy[] = {
++	    BPF_MOV64_IMM(BPF_REG_0, 1),
++	    BPF_EXIT_INSN(),
++	};
++
++	__do_bpf_program_free struct bpf_program *prog = NULL;
++	int ret;
++
++	if (geteuid() != 0)
++		return log_trace(false,
++				 "The bpf device cgroup requires real root");
++
++	prog = bpf_program_new(BPF_PROG_TYPE_CGROUP_DEVICE);
++	if (prog < 0)
++		return log_trace(false, "Failed to allocate new bpf device cgroup program");
++
++	ret = bpf_program_init(prog);
++	if (ret)
++		return log_error_errno(false, ENOMEM, "Failed to initialize bpf program");
++
++	ret = bpf_program_add_instructions(prog, dummy, ARRAY_SIZE(dummy));
++	if (ret < 0)
++		return log_trace(false, "Failed to add new instructions to bpf device cgroup program");
++
++	ret = bpf_program_load_kernel(prog);
++	if (ret < 0)
++		return log_trace(false, "Failed to load new bpf device cgroup program");
++
++	return log_trace(true, "The bpf device cgroup is supported");
++}
++#endif
+diff --git a/src/lxc/commands.c b/src/lxc/commands.c
+index b6ae101..c2a5665 100644
+--- a/src/lxc/commands.c
++++ b/src/lxc/commands.c
+@@ -86,6 +86,10 @@ static const char *lxc_cmd_str(lxc_cmd_t cmd)
+ 		[LXC_CMD_GET_INIT_PIDFD]        	= "get_init_pidfd",
+ 		[LXC_CMD_GET_LIMITING_CGROUP]		= "get_limiting_cgroup",
+ 		[LXC_CMD_GET_LIMITING_CGROUP2_FD]	= "get_limiting_cgroup2_fd",
++#ifdef HAVE_ISULAD
++		[LXC_CMD_SET_TERMINAL_FIFOS]  		= "set_terminal_fifos",
++		[LXC_CMD_SET_TERMINAL_WINCH]  		= "set_terminal_winch",
++#endif
+ 	};
+ 
+ 	if (cmd >= LXC_CMD_MAX)
+@@ -117,7 +121,15 @@ static int lxc_cmd_rsp_recv(int sock, struct lxc_cmd_rr *cmd)
+ 	int ret;
+ 	struct lxc_cmd_rsp *rsp = &cmd->rsp;
+ 
++#ifdef HAVE_ISULAD
++	/*isulad: add timeout 1s to avoid long block due to [lxc monitor] error*/
++	ret = lxc_abstract_unix_recv_fds_timeout(sock, &fd_rsp, 1, rsp, sizeof(*rsp), 1000 * 1000);
++	if (ret < 0 && (errno == ECONNRESET || errno == EAGAIN || errno == EWOULDBLOCK)) {
++		errno = ECONNRESET; /*isulad set errno ECONNRESET when timeout */
++	}
++#else
+ 	ret = lxc_abstract_unix_recv_fds(sock, &fd_rsp, 1, rsp, sizeof(*rsp));
++#endif
+ 	if (ret < 0)
+ 		return log_warn_errno(-1,
+ 				      errno, "Failed to receive response for command \"%s\"",
+@@ -592,8 +604,9 @@ static int lxc_cmd_get_cgroup_callback_do(int fd, struct lxc_cmd_req *req,
+ 		reqdata = NULL;
+ 	}
+ 
+-	get_fn = (limiting_cgroup ? cgroup_ops->get_cgroup
+-				  : cgroup_ops->get_limiting_cgroup);
++	// bugfix in newer version
++	get_fn = (limiting_cgroup ? cgroup_ops->get_limiting_cgroup
++				  : cgroup_ops->get_cgroup);
+ 
+ 	path = get_fn(cgroup_ops, reqdata);
+ 
+@@ -1260,7 +1273,11 @@ int lxc_cmd_serve_state_clients(const char *name, const char *lxcpath,
+ 
+ 	ret = lxc_cmd(name, &cmd, &stopped, lxcpath, NULL);
+ 	if (ret < 0)
++#ifdef HAVE_ISULAD
++		return log_warn_errno(-1, errno, "Failed to serve state clients");
++#else
+ 		return log_error_errno(-1, errno, "Failed to serve state clients");
++#endif
+ 
+ 	return 0;
+ }
+@@ -1475,6 +1492,123 @@ static int lxc_cmd_get_limiting_cgroup2_fd_callback(int fd,
+ 	return ret_errno(ENOSYS);
+ }
+ 
++#ifdef HAVE_ISULAD
++/*
++ * isulad: lxc_cmd_set_terminal_fifos: Set the fifos used for the container as terminal input/output
++ *
++ * @hashed_sock_name: hashed socket name
++ *
++ * Returns 0 when success, else when fail.
++ */
++int lxc_cmd_set_terminal_fifos(const char *name, const char *lxcpath, const char *in_fifo,
++				const char *out_fifo, const char *err_fifo)
++{
++	int ret = 0, stopped = 0;
++	int len = 0;
++	char *tmp = NULL;
++	const char *split = "&&&&", *none_fifo_name = "none";
++	const char *cmd_in_fifo = in_fifo ? in_fifo : none_fifo_name;
++	const char *cmd_out_fifo = out_fifo ? out_fifo : none_fifo_name;
++	const char *cmd_err_fifo = err_fifo ? err_fifo : none_fifo_name;
++
++	if (len + strlen(cmd_in_fifo) + strlen(split) + strlen(cmd_out_fifo) +
++	     strlen(split) + strlen(cmd_err_fifo) == SIZE_MAX)
++		return -1;
++	len += strlen(cmd_in_fifo) + strlen(split) + strlen(cmd_out_fifo) + strlen(split) + strlen(cmd_err_fifo) + 1;
++	tmp = malloc(len);
++	if (tmp == NULL)
++		return -1;
++	ret = snprintf(tmp, len, "%s%s%s%s%s", cmd_in_fifo, split, cmd_out_fifo, split, cmd_err_fifo);
++	if (ret < 0 || ret >= len) {
++		ERROR("Failed to snprintf in fifo of command");
++		free(tmp);
++		return -1;
++	}
++
++	struct lxc_cmd_rr cmd = {
++		.req = {
++			.cmd = LXC_CMD_SET_TERMINAL_FIFOS,
++			.datalen = strlen(tmp)+1,
++			.data = tmp,
++		},
++	};
++
++	ret = lxc_cmd(name, &cmd, &stopped, lxcpath, NULL);
++	if (ret < 0) {
++		ERROR("Failed to send command to container");
++		free(tmp);
++		return -1;
++	}
++
++	if (cmd.rsp.ret != 0) {
++		ERROR("Command response error:%d", cmd.rsp.ret);
++		free(tmp);
++		return -1;
++	}
++
++	free(tmp);
++	return 0;
++}
++
++static int lxc_cmd_set_terminal_fifos_callback(int fd, struct lxc_cmd_req *req,
++					struct lxc_handler *handler, struct lxc_epoll_descr *descr)
++{
++	struct lxc_cmd_rsp rsp;
++	memset(&rsp, 0, sizeof(rsp));
++
++	rsp.ret = lxc_terminal_add_fifos(handler->conf, req->data);;
++
++	return lxc_cmd_rsp_send(fd, &rsp);
++}
++
++struct lxc_cmd_set_terminal_winch_request {
++	unsigned int height;
++	unsigned int width;
++};
++
++int lxc_cmd_set_terminal_winch(const char *name, const char *lxcpath, unsigned int height, unsigned int width)
++{
++	int ret = 0, stopped = 0;
++	struct lxc_cmd_set_terminal_winch_request data = { 0 };
++
++	data.height = height;
++	data.width = width;
++
++	struct lxc_cmd_rr cmd = {
++		.req = {
++			.cmd = LXC_CMD_SET_TERMINAL_WINCH,
++			.datalen = sizeof(struct lxc_cmd_set_terminal_winch_request),
++			.data = &data,
++		},
++	};
++
++	ret = lxc_cmd(name, &cmd, &stopped, lxcpath, NULL);
++	if (ret < 0) {
++		ERROR("Failed to send command to container");
++		return -1;
++	}
++
++	if (cmd.rsp.ret != 0) {
++		ERROR("Command response error:%d", cmd.rsp.ret);
++		return -1;
++	}
++	return 0;
++}
++
++static int lxc_cmd_set_terminal_winch_callback(int fd, struct lxc_cmd_req *req,
++					struct lxc_handler *handler, struct lxc_epoll_descr *descr)
++{
++	struct lxc_cmd_rsp rsp;
++	struct lxc_cmd_set_terminal_winch_request *data = (struct lxc_cmd_set_terminal_winch_request *)(req->data);
++	memset(&rsp, 0, sizeof(rsp));
++
++	rsp.ret = lxc_set_terminal_winsz(&handler->conf->console, data->height, data->width);;
++
++	return lxc_cmd_rsp_send(fd, &rsp);
++
++}
++#endif
++
+ static int lxc_cmd_process(int fd, struct lxc_cmd_req *req,
+ 			   struct lxc_handler *handler,
+ 			   struct lxc_epoll_descr *descr)
+@@ -1504,10 +1638,18 @@ static int lxc_cmd_process(int fd, struct lxc_cmd_req *req,
+ 		[LXC_CMD_GET_INIT_PIDFD]                = lxc_cmd_get_init_pidfd_callback,
+ 		[LXC_CMD_GET_LIMITING_CGROUP]           = lxc_cmd_get_limiting_cgroup_callback,
+ 		[LXC_CMD_GET_LIMITING_CGROUP2_FD]       = lxc_cmd_get_limiting_cgroup2_fd_callback,
++#ifdef HAVE_ISULAD
++		[LXC_CMD_SET_TERMINAL_FIFOS]  			= lxc_cmd_set_terminal_fifos_callback,
++		[LXC_CMD_SET_TERMINAL_WINCH]  			= lxc_cmd_set_terminal_winch_callback,
++#endif
+ 	};
+ 
+ 	if (req->cmd >= LXC_CMD_MAX)
++#ifdef HAVE_ISULAD
++		return log_error_errno(-1, ENOENT, "Undefined command id %d", req->cmd);
++#else
+ 		return log_trace_errno(-1, EINVAL, "Invalid command id %d", req->cmd);
++#endif
+ 
+ 	return cb[req->cmd](fd, req, handler, descr);
+ }
+@@ -1646,6 +1788,44 @@ static int lxc_cmd_accept(int fd, uint32_t events, void *data,
+ 	return ret;
+ }
+ 
++#ifdef HAVE_ISULAD
++int lxc_cmd_init(const char *name, const char *lxcpath, const char *suffix)
++{
++	__do_close int fd = -EBADF;
++	int ret;
++	char path[LXC_AUDS_ADDR_LEN] = {0};
++	__do_free char *runtime_sock_dir = NULL;
++
++	runtime_sock_dir = generate_named_unix_sock_dir(name);
++	if (runtime_sock_dir == NULL)
++		return -1;
++
++	if (mkdir_p(runtime_sock_dir, 0700) < 0)
++		return log_error_errno(-1, errno, "Failed to create container runtime unix sock directory %s", path);
++
++	if (generate_named_unix_sock_path(name, suffix, path, sizeof(path)) != 0)
++		return -1;
++
++	fd = lxc_named_unix_open(path, SOCK_STREAM, 0);
++	if (fd < 0) {
++		if (errno == EADDRINUSE) {
++			WARN("Container \"%s\" appears to be already running", name);
++			(void)unlink(path);
++
++			fd = lxc_named_unix_open(path, SOCK_STREAM, 0);
++			if (fd < 0)
++				return log_error_errno(-1, errno, "Failed to create command socket %s", path);
++		} else
++			return log_error_errno(-1, errno, "Failed to create command socket %s", path);
++	}
++
++	ret = fcntl(fd, F_SETFD, FD_CLOEXEC);
++	if (ret < 0)
++		return log_error_errno(-1, errno, "Failed to set FD_CLOEXEC on command socket file descriptor");
++
++	return log_trace(move_fd(fd), "Created unix socket \"%s\"", path);
++}
++#else
+ int lxc_cmd_init(const char *name, const char *lxcpath, const char *suffix)
+ {
+ 	__do_close int fd = -EBADF;
+@@ -1670,6 +1850,7 @@ int lxc_cmd_init(const char *name, const char *lxcpath, const char *suffix)
+ 
+ 	return log_trace(move_fd(fd), "Created abstract unix socket \"%s\"", &path[1]);
+ }
++#endif
+ 
+ int lxc_cmd_mainloop_add(const char *name, struct lxc_epoll_descr *descr,
+ 			 struct lxc_handler *handler)
+diff --git a/src/lxc/commands.h b/src/lxc/commands.h
+index 3624a14..f6371fd 100644
+--- a/src/lxc/commands.h
++++ b/src/lxc/commands.h
+@@ -40,6 +40,10 @@ typedef enum {
+ 	LXC_CMD_GET_INIT_PIDFD,
+ 	LXC_CMD_GET_LIMITING_CGROUP,
+ 	LXC_CMD_GET_LIMITING_CGROUP2_FD,
++#ifdef HAVE_ISULAD
++	LXC_CMD_SET_TERMINAL_FIFOS,
++	LXC_CMD_SET_TERMINAL_WINCH,
++#endif
+ 	LXC_CMD_MAX,
+ } lxc_cmd_t;
+ 
+@@ -136,4 +140,10 @@ extern char *lxc_cmd_get_limiting_cgroup_path(const char *name,
+ 					      const char *subsystem);
+ extern int lxc_cmd_get_limiting_cgroup2_fd(const char *name, const char *lxcpath);
+ 
++#ifdef HAVE_ISULAD
++extern int lxc_cmd_set_terminal_fifos(const char *name, const char *lxcpath,
++				const char *in_fifo, const char *out_fifo, const char *err_fifo);
++extern int lxc_cmd_set_terminal_winch(const char *name, const char *lxcpath, unsigned int height, unsigned int width);
++#endif
++
+ #endif /* __commands_h */
+diff --git a/src/lxc/conf.h b/src/lxc/conf.h
+index b72afba..0478eb1 100644
+--- a/src/lxc/conf.h
++++ b/src/lxc/conf.h
+@@ -23,6 +23,10 @@
+ #include "start.h"
+ #include "terminal.h"
+ 
++#ifdef HAVE_ISULAD
++#include "oci_runtime_hooks.h"
++#endif
++
+ #if HAVE_SYS_RESOURCE_H
+ #include <sys/resource.h>
+ #endif
+@@ -146,6 +150,8 @@ struct lxc_tty_info {
+  * @mountflags : the portion of @options that are flags
+  * @data       : the portion of @options that are not flags
+  * @managed    : whether it is managed by LXC
++ * @maskedpaths: A list of paths to be msked over inside the container
++ * @ropaths    : A list of paths to be remounted with readonly inside the container
+  */
+ struct lxc_rootfs {
+ 	char *path;
+@@ -155,6 +161,14 @@ struct lxc_rootfs {
+ 	unsigned long mountflags;
+ 	char *data;
+ 	bool managed;
++#ifdef HAVE_ISULAD
++	/* isulad: maskedpaths */
++	struct lxc_list maskedpaths;
++	/* isulad: ropaths */
++	struct lxc_list ropaths;
++	/* isulad: errfd */
++	int errfd;
++#endif
+ };
+ 
+ /*
+@@ -203,6 +217,11 @@ enum lxchooks {
+ 	LXCHOOK_CLONE,
+ 	LXCHOOK_DESTROY,
+ 	LXCHOOK_START_HOST,
++#ifdef HAVE_ISULAD
++	OCI_HOOK_PRESTART,
++	OCI_HOOK_POSTSTART,
++	OCI_HOOK_POSTSTOP,
++#endif
+ 	NUM_LXC_HOOKS
+ };
+ 
+@@ -233,6 +252,27 @@ struct device_item {
+ 	int global_rule;
+ };
+ 
++#ifdef HAVE_ISULAD
++/*
++ * iSulad: Defines a structure to store the devices which will
++ * be attached in container
++ * @name       : the target device name in container
++ * @type       : the type of target device "c" or "b"
++ * @mode       : file mode for the device
++ * @maj        : major number for the device
++ * @min        : minor number for the device
++ */
++struct lxc_populate_devs {
++	char *name;
++	char *type;
++	mode_t file_mode;
++	int maj;
++	int min;
++	uid_t uid;
++	gid_t gid;
++};
++#endif
++
+ struct lxc_conf {
+ 	/* Pointer to the name of the container. Do not free! */
+ 	const char *name;
+@@ -401,6 +441,40 @@ struct lxc_conf {
+ 		/* Absolute path (in the container) to the shared mount point */
+ 		char *path_cont;
+ 	} shmount;
++
++#ifdef HAVE_ISULAD
++	/* support oci hook */
++	oci_runtime_spec_hooks *ocihooks;
++
++	/* init args used to repalce init_cmd */
++	char **init_argv;
++	size_t init_argc;
++
++	gid_t *init_groups;
++	size_t init_groups_len;
++
++	/* populate devices */
++	struct lxc_list populate_devs;
++	mode_t umask;  // umask value
++
++	char *container_info_file;
++
++  /* exit fifo fd*/
++	int exit_fd;
++
++  /* record error messages */
++	char *errmsg;
++
++  /* pipdfd for get error message of child or grandchild process */
++	int errpipe[2];
++
++  /* systemd value */
++	char *systemd;
++
++  /* Linux Security Modules SELinux context for device mount */
++	char *lsm_se_mount_context;
++#endif
++
+ };
+ 
+ extern int write_id_mapping(enum idtype idtype, pid_t pid, const char *buf,
+@@ -439,7 +513,11 @@ extern int lxc_setup_rootfs_prepare_root(struct lxc_conf *conf,
+ 					 const char *name, const char *lxcpath);
+ extern int lxc_setup(struct lxc_handler *handler);
+ extern int lxc_setup_parent(struct lxc_handler *handler);
++#ifdef HAVE_ISULAD
++extern int setup_resource_limits(struct lxc_list *limits, pid_t pid, int errfd);
++#else
+ extern int setup_resource_limits(struct lxc_list *limits, pid_t pid);
++#endif
+ extern int find_unmapped_nsid(const struct lxc_conf *conf, enum idtype idtype);
+ extern int mapped_hostid(unsigned id, const struct lxc_conf *conf,
+ 			 enum idtype idtype);
+@@ -447,8 +525,14 @@ extern int userns_exec_1(const struct lxc_conf *conf, int (*fn)(void *),
+ 			 void *data, const char *fn_name);
+ extern int userns_exec_full(struct lxc_conf *conf, int (*fn)(void *),
+ 			    void *data, const char *fn_name);
++#ifdef HAVE_ISULAD
++// isulad modify
++extern int parse_mntopts(const char *mntopts, unsigned long *mntflags,
++			unsigned long *pflags, char **mntdata);
++#else
+ extern int parse_mntopts(const char *mntopts, unsigned long *mntflags,
+ 			 char **mntdata);
++#endif
+ extern int parse_propagationopts(const char *mntopts, unsigned long *pflags);
+ extern void tmp_proc_unmount(struct lxc_conf *lxc_conf);
+ extern void turn_into_dependent_mounts(void);
+@@ -480,4 +564,15 @@ static inline int chown_mapped_root(const char *path, const struct lxc_conf *con
+ 	return userns_exec_mapped_root(path, -EBADF, conf);
+ }
+ 
++#ifdef HAVE_ISULAD
++// isulad add
++int lxc_clear_init_args(struct lxc_conf *lxc_conf);
++int lxc_clear_init_groups(struct lxc_conf *lxc_conf);
++int lxc_clear_populate_devices(struct lxc_conf *c);
++int lxc_clear_rootfs_masked_paths(struct lxc_conf *c);
++int lxc_clear_rootfs_ro_paths(struct lxc_conf *c);
++int lxc_drop_caps(struct lxc_conf *conf);
++int run_oci_hooks(const char *name, const char *hookname, struct lxc_conf *conf, const char *lxcpath);
++void lxc_close_error_pipe(int *errpipe);
++#endif
+ #endif /* __LXC_CONF_H */
+diff --git a/src/lxc/isulad_utils.c b/src/lxc/isulad_utils.c
+new file mode 100644
+index 0000000..15d9323
+--- /dev/null
++++ b/src/lxc/isulad_utils.c
+@@ -0,0 +1,319 @@
++/* SPDX-License-Identifier: LGPL-2.1+ */
++/******************************************************************************
++ * Copyright (c) Huawei Technologies Co., Ltd. 2020. Allrights reserved
++ * Description: isulad utils
++ * Author: lifeng
++ * Create: 2020-04-11
++******************************************************************************/
++
++#include <stdlib.h>
++#include <string.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <pwd.h>
++#include <ctype.h>
++
++#include "isulad_utils.h"
++#include "log.h"
++#include "path.h"
++#include "file_utils.h"
++
++lxc_log_define(isulad_utils, lxc);
++
++void *lxc_common_calloc_s(size_t size)
++{
++	if (size == 0 || size > SIZE_MAX) {
++		return NULL;
++	}
++
++	return calloc((size_t)1, size);
++}
++
++int lxc_mem_realloc(void **newptr, size_t newsize, void *oldptr, size_t oldsize)
++{
++	void *tmp = NULL;
++
++	if (newsize == 0) {
++		goto err_out;
++	}
++
++	tmp = lxc_common_calloc_s(newsize);
++	if (tmp == NULL) {
++		ERROR("Failed to malloc memory");
++		goto err_out;
++	}
++
++	if (oldptr != NULL) {
++		memcpy(tmp, oldptr, (newsize < oldsize) ? newsize : oldsize);
++
++		memset(oldptr, 0, oldsize);
++
++		free(oldptr);
++	}
++
++	*newptr = tmp;
++	return 0;
++
++err_out:
++	return -1;
++}
++
++char *safe_strdup(const char *src)
++{
++	char *dst = NULL;
++
++	if (src == NULL) {
++		return NULL;
++	}
++
++	dst = strdup(src);
++	if (dst == NULL) {
++		abort();
++	}
++
++	return dst;
++}
++
++int lxc_open(const char *filename, int flags, mode_t mode)
++{
++	char rpath[PATH_MAX] = {0x00};
++
++	if (cleanpath(filename, rpath, sizeof(rpath)) == NULL) {
++		return -1;
++	}
++	if (mode) {
++		return open(rpath, (int)((unsigned int)flags | O_CLOEXEC), mode);
++	} else {
++		return open(rpath, (int)((unsigned int)flags | O_CLOEXEC));
++	}
++}
++
++FILE *lxc_fopen(const char *filename, const char *mode)
++{
++	char rpath[PATH_MAX] = {0x00};
++
++	if (cleanpath(filename, rpath, sizeof(rpath)) == NULL) {
++		return NULL;
++	}
++
++	return fopen_cloexec(rpath, mode);
++}
++
++/* isulad: write error message */
++void lxc_write_error_message(int errfd, const char *format, ...)
++{
++	int ret;
++	char errbuf[BUFSIZ + 1] = {0};
++	ssize_t sret;
++	va_list argp;
++
++	if (errfd <= 0)
++		return;
++
++	va_start(argp, format);
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wformat-nonliteral"
++	ret = vsnprintf(errbuf, BUFSIZ, format, argp);
++#pragma GCC diagnostic pop
++	va_end(argp);
++	if (ret < 0 || ret >= BUFSIZ)
++		SYSERROR("Failed to call vsnprintf");
++	sret = write(errfd, errbuf, strlen(errbuf));
++	if (sret < 0)
++		SYSERROR("Write errbuf failed");
++}
++
++/* isulad: read file to buffer */
++int lxc_file2str(const char *filename, char ret[], int cap)
++{
++    int fd, num_read;
++
++    if ((fd = lxc_open(filename, O_RDONLY | O_CLOEXEC, 0)) == -1)
++        return -1;
++    if ((num_read = read(fd, ret, cap - 1)) <= 0)
++        num_read = -1;
++    else
++        ret[num_read] = 0;
++    close(fd);
++
++    return num_read;
++}
++
++/* isuald: lxc_stat2proc() makes sure it can handle arbitrary executable file basenames
++ * for `cmd', i.e. those with embedded whitespace or embedded ')'s.
++ * Such names confuse %s (see scanf(3)), so the string is split and %39c
++ * is used instead. (except for embedded ')' "(%[^)]c)" would work.
++ */
++static proc_t *lxc_stat2proc(const char *S)
++{
++    int num;
++    proc_t *P = NULL;
++    char *tmp = NULL;
++
++    if (!S)
++        return NULL;
++
++    tmp = strrchr(S, ')');  /* split into "PID (cmd" and "<rest>" */
++    if (!tmp)
++        return NULL;
++    *tmp = '\0';            /* replace trailing ')' with NUL */
++
++    P = malloc(sizeof(proc_t));
++    if (P == NULL)
++        return NULL;
++    (void)memset(P, 0x00, sizeof(proc_t));
++
++    /* parse these two strings separately, skipping the leading "(". */
++    num = sscanf(S, "%d (%15c", &P->pid, P->cmd);   /* comm[16] in kernel */
++    if (num != 2) {
++        ERROR("Call sscanf error: %s", errno ? strerror(errno) : "");
++        free(P);
++        return NULL;
++    }
++    num = sscanf(tmp + 2,           /* skip space after ')' too */
++                 "%c "
++                 "%d %d %d %d %d "
++                 "%lu %lu %lu %lu %lu "
++                 "%Lu %Lu %Lu %Lu "  /* utime stime cutime cstime */
++                 "%ld %ld %ld %ld "
++                 "%Lu "  /* start_time */
++                 "%lu "
++                 "%ld "
++                 "%lu %lu %lu %lu %lu %lu "
++                 "%*s %*s %*s %*s " /* discard, no RT signals & Linux 2.1 used hex */
++                 "%lu %lu %lu "
++                 "%d %d "
++                 "%lu %lu",
++                 &P->state,
++                 &P->ppid, &P->pgrp, &P->session, &P->tty, &P->tpgid,
++                 &P->flags, &P->min_flt, &P->cmin_flt, &P->maj_flt, &P->cmaj_flt,
++                 &P->utime, &P->stime, &P->cutime, &P->cstime,
++                 &P->priority, &P->nice, &P->timeout, &P->it_real_value,
++                 &P->start_time,
++                 &P->vsize,
++                 &P->rss,
++                 &P->rss_rlim, &P->start_code, &P->end_code, &P->start_stack, &P->kstk_esp,
++                 &P->kstk_eip,
++                 &P->wchan, &P->nswap, &P->cnswap,
++                 &P->exit_signal, &P->processor,  /* 2.2.1 ends with "exit_signal" */
++                 &P->rtprio, &P->sched  /* both added to 2.5.18 */
++                );
++    if (num != 35) {
++        ERROR("Call sscanf error: %s", errno ? strerror(errno) : "");
++        free(P);
++        return NULL;
++    }
++    if (P->tty == 0)
++        P->tty = -1;  /* the old notty val, update elsewhere bef. moving to 0 */
++    return P;
++}
++
++/* isulad: get starttime of process pid */
++unsigned long long lxc_get_process_startat(pid_t pid)
++{
++    int sret = 0;
++    unsigned long long startat = 0;
++    proc_t *pid_info = NULL;
++    char filename[PATH_MAX] = {0};
++    char sbuf[1024] = {0}; /* bufs for stat */
++
++    sret = snprintf(filename, sizeof(filename), "/proc/%d/stat", pid);
++    if (sret < 0 || sret >= sizeof(filename)) {
++        ERROR("Failed to sprintf filename");
++        goto out;
++    }
++
++    if ((lxc_file2str(filename, sbuf, sizeof(sbuf))) == -1) {
++        SYSERROR("Failed to read pidfile %s", filename);
++        goto out;
++    }
++
++    pid_info = lxc_stat2proc(sbuf);
++    if (!pid_info) {
++        ERROR("Failed to get proc stat info");
++        goto out;
++    }
++
++    startat = pid_info->start_time;
++out:
++    free(pid_info);
++    return startat;
++}
++
++// isulad: set env home in container
++int lxc_setup_env_home(uid_t uid)
++{
++	char *homedir = "/"; // default home dir is /
++	struct passwd pw, *pwbufp = NULL;
++	char buf[BUFSIZ];
++	int ret;
++
++	ret = getpwuid_r(uid, &pw, buf, sizeof(buf), &pwbufp);
++	if ((ret == 0) && (pwbufp != NULL) && (pwbufp->pw_uid == uid)) {
++		homedir = pwbufp->pw_dir;
++		goto set_env;
++	}
++
++	WARN("User invalid, can not find user '%u'", uid);
++
++set_env:
++	// if we didn't configure HOME, set it based on uid
++	if (setenv("HOME", homedir, 0) < 0) {
++		SYSERROR("Unable to set env 'HOME'");
++		return -1;
++	}
++
++	NOTICE("Setted env 'HOME' to %s", homedir);
++	return 0;
++}
++
++bool lxc_process_alive(pid_t pid, unsigned long long start_time)
++{
++	int sret = 0;
++	bool alive = true;
++	proc_t *pid_info = NULL;
++	char filename[PATH_MAX] = {0};
++	char sbuf[1024] = {0}; /* bufs for stat */
++
++	sret = kill(pid, 0);
++	if (sret < 0 && errno == ESRCH)
++		return false;
++
++	sret = snprintf(filename, sizeof(filename), "/proc/%d/stat", pid);
++	if (sret < 0 || sret >= sizeof(filename)) {
++		ERROR("Failed to sprintf filename");
++		goto out;
++	}
++
++	if ((lxc_file2str(filename, sbuf, sizeof(sbuf))) == -1) {
++		ERROR("Failed to read pidfile %s", filename);
++		alive = false;
++		goto out;
++	}
++
++	pid_info = lxc_stat2proc(sbuf);
++	if (!pid_info) {
++		ERROR("Failed to get proc stat info");
++		alive = false;
++		goto out;
++	}
++
++	if (start_time != pid_info->start_time)
++		alive = false;
++out:
++	free(pid_info);
++	return alive;
++}
++
++bool is_non_negative_num(const char *s)
++{
++	if (!s || !strcmp(s, ""))
++		return false;
++	while(*s  != '\0') {
++		if(!isdigit(*s))
++			return false;
++		++s;
++	}
++	return true;
++}
+diff --git a/src/lxc/isulad_utils.h b/src/lxc/isulad_utils.h
+new file mode 100644
+index 0000000..345f511
+--- /dev/null
++++ b/src/lxc/isulad_utils.h
+@@ -0,0 +1,99 @@
++/* SPDX-License-Identifier: LGPL-2.1+ */
++/******************************************************************************
++ * Copyright (c) Huawei Technologies Co., Ltd. 2020. Allrights reserved
++ * Description: isulad utils
++ * Author: lifeng
++ * Create: 2020-04-11
++******************************************************************************/
++#ifndef __iSULAD_UTILS_H
++#define __iSULAD_UTILS_H
++
++#include <stdio.h>
++#include <stdbool.h>
++
++/* isulad: replace space with SPACE_MAGIC_STR */
++#define SPACE_MAGIC_STR "[#)"
++
++/* isulad:
++ ld cutime, cstime, priority, nice, timeout, it_real_value, rss,
++ c  state,
++ d  ppid, pgrp, session, tty, tpgid,
++ s  signal, blocked, sigignore, sigcatch,
++ lu flags, min_flt, cmin_flt, maj_flt, cmaj_flt, utime, stime,
++ lu rss_rlim, start_code, end_code, start_stack, kstk_esp, kstk_eip,
++ lu start_time, vsize, wchan, nswap, cnswap,
++*/
++
++/* Basic data structure which holds all information we can get about a process.
++ * (unless otherwise specified, fields are read from /proc/#/stat)
++ *
++ * Most of it comes from task_struct in linux/sched.h
++ */
++typedef struct proc_t {
++    // 1st 16 bytes
++    int pid;        /* process id */
++    int ppid;       /* pid of parent process */
++
++    char state;     /* single-char code for process state (S=sleeping) */
++
++    unsigned long long
++    utime,      /* user-mode CPU time accumulated by process */
++    stime,      /* kernel-mode CPU time accumulated by process */
++    // and so on...
++    cutime,     /* cumulative utime of process and reaped children */
++    cstime,     /* cumulative stime of process and reaped children */
++    start_time; /* start time of process -- seconds since 1-1-70 */
++
++    long
++    priority,   /* kernel scheduling priority */
++    timeout,    /* ? */
++    nice,       /* standard unix nice level of process */
++    rss,        /* resident set size from /proc/#/stat (pages) */
++    it_real_value;  /* ? */
++    unsigned long
++    rtprio,     /* real-time priority */
++    sched,      /* scheduling class */
++    vsize,      /* number of pages of virtual memory ... */
++    rss_rlim,   /* resident set size limit? */
++    flags,      /* kernel flags for the process */
++    min_flt,    /* number of minor page faults since process start */
++    maj_flt,    /* number of major page faults since process start */
++    cmin_flt,   /* cumulative min_flt of process and child processes */
++    cmaj_flt,   /* cumulative maj_flt of process and child processes */
++    nswap,      /* ? */
++    cnswap,     /* cumulative nswap ? */
++    start_code, /* address of beginning of code segment */
++    end_code,   /* address of end of code segment */
++    start_stack,    /* address of the bottom of stack for the process */
++    kstk_esp,   /* kernel stack pointer */
++    kstk_eip,   /* kernel instruction pointer */
++    wchan;      /* address of kernel wait channel proc is sleeping in */
++
++    char cmd[16];   /* basename of executable file in call to exec(2) */
++    int
++    pgrp,       /* process group id */
++    session,    /* session id */
++    tty,        /* full device number of controlling terminal */
++    tpgid,      /* terminal process group id */
++    exit_signal,    /* might not be SIGCHLD */
++    processor;      /* current (or most recent?) CPU */
++} proc_t;
++
++extern int lxc_mem_realloc(void **newptr, size_t newsize, void *oldptr, size_t oldsize);
++extern void *lxc_common_calloc_s(size_t size);
++extern char *safe_strdup(const char *src);
++
++extern int lxc_open(const char *filename, int flags, mode_t mode);
++extern FILE *lxc_fopen(const char *filename, const char *mode);
++
++extern void lxc_write_error_message(int errfd, const char *format, ...);
++extern int lxc_file2str(const char *filename, char ret[], int cap);
++extern int unsigned long long lxc_get_process_startat(pid_t pid);
++// set env home in container
++extern int lxc_setup_env_home(uid_t uid);
++
++extern bool lxc_process_alive(pid_t pid, unsigned long long start_time);
++
++extern bool is_non_negative_num(const char *s);
++
++#endif
+diff --git a/src/lxc/lsm/lsm.c b/src/lxc/lsm/lsm.c
+index 553e0c9..2f87dd6 100644
+--- a/src/lxc/lsm/lsm.c
++++ b/src/lxc/lsm/lsm.c
+@@ -168,6 +168,26 @@ int lsm_process_label_set(const char *label, struct lxc_conf *conf,
+ 	return drv->process_label_set(label, conf, on_exec);
+ }
+ 
++#ifdef HAVE_ISULAD
++int lsm_file_label_set(const char *path, const char *label)
++{
++	if (!drv) {
++		ERROR("LSM driver not inited");
++		return -1;
++	}
++	return drv->file_label_set(path, label);
++}
++
++int lsm_relabel(const char *path, const char *label, bool share)
++{
++	if (!drv) {
++		ERROR("LSM driver not inited");
++		return -1;
++	}
++	return drv->relabel(path, label, share);
++}
++#endif
++
+ int lsm_process_prepare(struct lxc_conf *conf, const char *lxcpath)
+ {
+ 	if (!drv) {
+diff --git a/src/lxc/lxc.h b/src/lxc/lxc.h
+index 630eff0..fb57083 100644
+--- a/src/lxc/lxc.h
++++ b/src/lxc/lxc.h
+@@ -32,8 +32,14 @@ struct lxc_handler;
+  * @daemonize    : whether or not the container is daemonized
+  * Returns 0 on success, < 0 otherwise
+  */
++#ifdef HAVE_ISULAD
++extern int lxc_start(char *const argv[], struct lxc_handler *handler,
++		     const char *lxcpath, bool daemonize, int *error_num,
++		     unsigned int start_timeout);
++#else
+ extern int lxc_start(char *const argv[], struct lxc_handler *handler,
+ 		     const char *lxcpath, bool daemonize, int *error_num);
++#endif
+ 
+ /*
+  * Start the specified command inside an application container
+@@ -44,9 +50,15 @@ extern int lxc_start(char *const argv[], struct lxc_handler *handler,
+  * @daemonize    : whether or not the container is daemonized
+  * Returns 0 on success, < 0 otherwise
+  */
++#ifdef HAVE_ISULAD
++extern int lxc_execute(const char *name, char *const argv[], int quiet,
++		       struct lxc_handler *handler, const char *lxcpath,
++		       bool daemonize, int *error_num, unsigned int start_timeout);
++#else
+ extern int lxc_execute(const char *name, char *const argv[], int quiet,
+ 		       struct lxc_handler *handler, const char *lxcpath,
+ 		       bool daemonize, int *error_num);
++#endif
+ 
+ /*
+  * Close the fd associated with the monitoring
+@@ -83,6 +95,13 @@ extern lxc_state_t lxc_state(const char *name, const char *lxcpath);
+  */
+ extern struct lxc_container *lxc_container_new(const char *name, const char *configpath);
+ 
++#ifdef HAVE_ISULAD
++/*
++ * Create a new container without loading config.
++ */
++extern struct lxc_container *lxc_container_without_config_new(const char *name, const char *configpath);
++#endif
++
+ /*
+  * Returns 1 on success, 0 on failure.
+  */
+diff --git a/src/lxc/lxccontainer.h b/src/lxc/lxccontainer.h
+index b4ec1d6..3680ade 100644
+--- a/src/lxc/lxccontainer.h
++++ b/src/lxc/lxccontainer.h
+@@ -26,6 +26,10 @@ extern "C" {
+ #define LXC_CREATE_MAXFLAGS       (1 << 1) /*!< Number of \c LXC_CREATE* flags */
+ #define LXC_MOUNT_API_V1		   1
+ 
++#ifdef HAVE_ISULAD
++#define LXC_IMAGE_OCI_KEY "lxc.imagetype.oci"
++#endif
++
+ struct bdev_specs;
+ 
+ struct lxc_snapshot;
+@@ -40,6 +44,41 @@ struct lxc_mount {
+ 	int version;
+ };
+ 
++#ifdef HAVE_ISULAD
++struct lxc_blkio_metrics {
++	uint64_t read;
++	uint64_t write;
++	uint64_t total;
++};
++
++struct lxc_container_metrics {
++    /* State of container */
++    const char *state;
++    /* The process ID of the init container */
++    pid_t init;
++    /* Current pids */
++    uint64_t pids_current;
++    /* CPU usage */
++    uint64_t cpu_use_nanos;
++    uint64_t cpu_use_user;
++    uint64_t cpu_use_sys;
++    /* BlkIO usage */
++    struct lxc_blkio_metrics io_service_bytes;
++    struct lxc_blkio_metrics io_serviced;
++    /* Memory usage */
++    uint64_t mem_used;
++    uint64_t mem_limit;
++    /* Kernel Memory usage */
++    uint64_t kmem_used;
++    uint64_t kmem_limit;
++    /* Cache usage */
++    uint64_t cache;
++    uint64_t cache_total;
++    /* total inactive file */
++    uint64_t inactive_file_total;
++};
++#endif
++
+ /*!
+  * An LXC container.
+  *
+@@ -107,6 +146,38 @@ struct lxc_container {
+ 	/*! Full path to configuration file */
+ 	char *config_path;
+ 
++#ifdef HAVE_ISULAD
++	/*! isulad:
++	 * \private
++	 * exit FIFO File to open used monitor the state of lxc monitor process.
++	 */
++	char *exit_fifo;
++	/*! Whether container wishes to create pty or pipes for console log */
++	bool disable_pty;
++
++	/*! Whether container wishes to keep stdin active */
++	bool open_stdin;
++
++	/*!
++	 * \private
++	 * isulad: support oci hook from json file
++	 * full path of json file
++	 * */
++	char *ocihookfile;
++
++	/*! isulad:
++	 * \private
++	 * start_timeout.
++	 */
++	unsigned int start_timeout;
++
++	/*! isulad:
++	 * \private
++	 *  image_type_oci
++	 */
++	bool image_type_oci;
++#endif
++
+ 	/*!
+ 	 * \brief Determine if \c /var/lib/lxc/$name/config exists.
+ 	 *
+@@ -865,6 +936,115 @@ struct lxc_container {
+ 	 * \return pidfd of init process of the container.
+ 	 */
+ 	int (*init_pidfd)(struct lxc_container *c);
++
++#ifdef HAVE_ISULAD
++	/*! isulad add
++	 * \brief An API call to set the path of info file
++	 *
++	 * \param c Container.
++	 * \param info_file Value of the path of info file.
++	 *
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*set_container_info_file) (struct lxc_container *c, const char *info_file);
++
++	/*! isulad add
++	 * \brief An API call to change the path of the console default fifos
++	 *
++	 * \param c Container.
++	 * \param path Value of the console path.
++	 *
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*set_terminal_init_fifos)(struct lxc_container *c, const char *in, const char *out, const char *err);
++
++	/*! isulad add
++	 * \brief An API call to add the path of terminal fifos
++	 *
++	 * \param c Container.
++	 * \param path Value of the console path..
++	 *
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*add_terminal_fifos)(struct lxc_container *c, const char *in, const char *out, const char *err);
++
++	bool (*set_terminal_winch)(struct lxc_container *c, unsigned int height, unsigned int width);
++
++	bool (*set_exec_terminal_winch)(struct lxc_container *c, const char *suffix, unsigned int height, unsigned int width);
++
++	/*!
++	 * \brief Change whether the container wants to create pty or pipes
++	 * from the console log.
++	 *
++	 * \param c Container.
++	 * \param state Value for the disable pty bit (0 or 1).
++	 *
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*want_disable_pty)(struct lxc_container *c, bool state);
++
++	/*!
++	 * \brief Change whether the container wants to keep stdin active
++	 * for parent process of container
++	 *
++	 * \param c Container.
++	 * \param state Value for the open_stdin bit (0 or 1).
++	 *
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*want_open_stdin)(struct lxc_container *c, bool state);
++
++	/*! isulad add
++	 * \brief An API call to clean resources of container
++	 *
++	 * \param c Container.
++	 * \param pid Value of container process.
++	 *
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*clean_container_resource) (struct lxc_container *c, pid_t pid);
++
++	/*! isulad add
++	 * \brief An API call to get container pids
++	 *
++	 * \param c Container.
++	 * \param pids Value of container pids.
++	 * \param pids_len Value of container pids len.
++	 * \param pid Value of container pid.
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*get_container_pids)(struct lxc_container *c,pid_t **pids,size_t *pids_len);
++
++	/*! isulad add
++	 * \brief An API call to set start timeout
++	 *
++	 * \param c Container.
++	 * \param start_timeout Value of start timeout.
++	 *
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*set_start_timeout)(struct lxc_container *c, unsigned int start_timeout);
++
++	/*! isulad add
++	 * \brief An API call to set oci type
++	 *
++	 * \param c Container.
++	 * \param image_type_oci image oci type.
++	 *
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*set_oci_type)(struct lxc_container *c, bool image_type_oci);
++	
++	/*! isulad add
++	 * \brief An API call to set start timeout
++	 *
++	 * \param c Container.
++	 * \param start_timeout Value of start timeout.
++	 *
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*get_container_metrics)(struct lxc_container *c, struct lxc_container_metrics *metrics);
++#endif
+ };
+ 
+ /*!
+@@ -998,6 +1178,20 @@ struct lxc_console_log {
+  */
+ struct lxc_container *lxc_container_new(const char *name, const char *configpath);
+ 
++#ifdef HAVE_ISULAD
++/*!
++ * \brief Create a new container without loading config.
++ *
++ * \param name Name to use for container.
++ * \param configpath Full path to configuration file to use.
++ *
++ * \return Newly-allocated container, or \c NULL on error.
++ *
++ * \note This function can only used for listing container.
++ */
++struct lxc_container *lxc_container_without_config_new(const char *name, const char *configpath);
++#endif
++
+ /*!
+  * \brief Add a reference to the specified container.
+  *
+diff --git a/src/lxc/network.c b/src/lxc/network.c
+index bca0440..56efa4b 100644
+--- a/src/lxc/network.c
++++ b/src/lxc/network.c
+@@ -3441,9 +3441,17 @@ static int lxc_network_setup_in_child_namespaces_common(struct lxc_netdev *netde
+ 
+ 	/* set the network device up */
+ 	if (netdev->flags & IFF_UP) {
++#ifdef HAVE_ISULAD
++		if (netdev->name[0] != '\0') {
++			err = lxc_netdev_up(netdev->name);
++			if (err)
++				return log_error_errno(-1, -err, "Failed to set network device \"%s\" up", netdev->name);
++		}
++#else
+ 		err = lxc_netdev_up(netdev->name);
+ 		if (err)
+ 			return log_error_errno(-1, -err, "Failed to set network device \"%s\" up", netdev->name);
++#endif
+ 
+ 		/* the network is up, make the loopback up too */
+ 		err = lxc_netdev_up("lo");
+diff --git a/src/lxc/tools/lxc_ls.c b/src/lxc/tools/lxc_ls.c
+index 0abcd7a..7c0b69c 100644
+--- a/src/lxc/tools/lxc_ls.c
++++ b/src/lxc/tools/lxc_ls.c
+@@ -106,7 +106,11 @@ struct wrapargs {
+ /*
+  * Takes struct wrapargs as argument.
+  */
++#ifdef HAVE_ISULAD
++static int ls_get_wrapper(void *wrap, int msgfd);
++#else
+ static int ls_get_wrapper(void *wrap);
++#endif
+ 
+ /*
+  * To calculate swap usage we should not simply check memory.usage_in_bytes and
+@@ -1005,7 +1009,11 @@ static int my_parser(struct lxc_arguments *args, int c, char *arg)
+ 	return 0;
+ }
+ 
++#ifdef HAVE_ISULAD
++static int ls_get_wrapper(void *wrap, int msgfd)
++#else
+ static int ls_get_wrapper(void *wrap)
++#endif
+ {
+ 	int ret = -1;
+ 	size_t len = 0;
+diff --git a/src/lxc/tools/lxc_start.c b/src/lxc/tools/lxc_start.c
+index 459b867..3ef5961 100644
+--- a/src/lxc/tools/lxc_start.c
++++ b/src/lxc/tools/lxc_start.c
+@@ -28,6 +28,11 @@
+ #include "confile.h"
+ #include "log.h"
+ 
++#ifdef HAVE_ISULAD
++#include <ctype.h>
++#include "isulad_utils.h"
++#endif
++
+ lxc_log_define(lxc_start, lxc);
+ 
+ static int my_parser(struct lxc_arguments *args, int c, char *arg);
+@@ -48,6 +53,16 @@ static const struct option my_longopts[] = {
+ 	{"share-ipc", required_argument, 0, OPT_SHARE_IPC},
+ 	{"share-uts", required_argument, 0, OPT_SHARE_UTS},
+ 	{"share-pid", required_argument, 0, OPT_SHARE_PID},
++#ifdef HAVE_ISULAD
++	{"in-fifo", required_argument, 0, OPT_INPUT_FIFO},
++	{"out-fifo", required_argument, 0, OPT_OUTPUT_FIFO},
++	{"err-fifo", required_argument, 0, OPT_STDERR_FIFO},
++	{"container-pidfile", required_argument, 0, OPT_CONTAINER_INFO},
++	{"exit-fifo", required_argument, 0, OPT_EXIT_FIFO},
++	{"start-timeout", required_argument, 0, OPT_START_TIMEOUT},
++	{"disable-pty", no_argument, 0, OPT_DISABLE_PTY},
++	{"open-stdin", no_argument, 0, OPT_OPEN_STDIN},
++#endif
+ 	LXC_COMMON_OPTIONS
+ };
+ 
+@@ -70,7 +85,20 @@ Options :\n\
+                          Note: --daemon implies --close-all-fds\n\
+   -s, --define KEY=VAL   Assign VAL to configuration variable KEY\n\
+       --share-[net|ipc|uts|pid]=NAME Share a namespace with another container or pid\n\
+-",
++"
++#ifdef HAVE_ISULAD
++"\
++      --in-fifo           Stdin fifo path\n\
++      --out-fifo          Stdout fifo path\n\
++      --err-fifo          Stderr fifo path\n\
++      --container-pidfile File path for container pid\n\
++      --exit-fifo         Fifo path to save exit code\n\
++      --start-timeout     Timeout for start container\n\
++      --disable-pty       Disable pty for attach\n\
++      --open-stdin        Open stdin for attach\n\
++"
++#endif
++,
+ 	.options      = my_longopts,
+ 	.parser       = my_parser,
+ 	.checker      = NULL,
+@@ -118,6 +146,38 @@ static int my_parser(struct lxc_arguments *args, int c, char *arg)
+ 	case OPT_SHARE_PID:
+ 		args->share_ns[LXC_NS_PID] = arg;
+ 		break;
++
++#ifdef HAVE_ISULAD
++	case OPT_CONTAINER_INFO:
++		args->container_info = arg;
++		break;
++	case OPT_INPUT_FIFO:
++		args->terminal_fifos[0] = arg;
++		break;
++	case OPT_OUTPUT_FIFO:
++		args->terminal_fifos[1] = arg;
++		break;
++	case OPT_STDERR_FIFO:
++		args->terminal_fifos[2] = arg;
++		break;
++	case OPT_EXIT_FIFO:
++		args->exit_monitor_fifo = arg;
++		break;
++	case OPT_DISABLE_PTY:
++		args->disable_pty = 1;
++		break;
++	case OPT_OPEN_STDIN:
++		args->open_stdin = 1;
++		break;
++	case OPT_START_TIMEOUT:
++		if(!is_non_negative_num(arg)) {
++			fprintf(stderr, "Error start timeout parameter:%s.\n", arg);
++			return -1;
++		}
++		args->start_timeout = (unsigned int)atoi(arg);
++		break;
++#endif
++
+ 	}
+ 	return 0;
+ }
+@@ -163,6 +223,9 @@ int main(int argc, char *argv[])
+ 		"/sbin/init",
+ 		NULL,
+ 	};
++#ifdef HAVE_ISULAD
++	char *container_info_file = NULL;
++#endif
+ 
+ 	lxc_list_init(&defines);
+ 
+@@ -283,6 +346,42 @@ int main(int argc, char *argv[])
+ 			goto out;
+ 		}
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: container info file used to store pid and ppid info of container*/
++	if (my_args.container_info != NULL) {
++		if (ensure_path(&container_info_file, my_args.container_info) < 0) {
++			ERROR("Failed to ensure container's piddile '%s'", my_args.container_info);
++			goto out;
++		}
++		if (!c->set_container_info_file(c, container_info_file)) {
++			ERROR("Failed to set container's piddile '%s'", container_info_file);
++			goto out;
++		}
++	}
++
++	if (my_args.terminal_fifos[0] || my_args.terminal_fifos[1] || my_args.terminal_fifos[2]) {
++		c->set_terminal_init_fifos(c, my_args.terminal_fifos[0], my_args.terminal_fifos[1], my_args.terminal_fifos[2]);
++	}
++
++	/* isulad: fifo used to monitor state of monitor process */
++	if (my_args.exit_monitor_fifo != NULL) {
++		c->exit_fifo = safe_strdup(my_args.exit_monitor_fifo);
++	}
++
++	if (my_args.disable_pty) {
++		c->want_disable_pty(c, true);
++	}
++
++	if (my_args.open_stdin) {
++		c->want_open_stdin(c, true);
++	}
++
++	/* isulad: add start timeout */
++	if(my_args.start_timeout) {
++		c->set_start_timeout(c, my_args.start_timeout);
++	}
++#endif
++
+ 	if (my_args.console)
+ 		if (!c->set_config_item(c, "lxc.console.path", my_args.console))
+ 			goto out;
+@@ -305,6 +404,11 @@ int main(int argc, char *argv[])
+ 	else
+ 		err = c->start(c, 0, args) ? EXIT_SUCCESS : EXIT_FAILURE;
+ 	if (err) {
++#ifdef HAVE_ISULAD
++		if (c->lxc_conf->errmsg)
++			fprintf(stderr, "%s:%s:%s:%d starting container process caused \"%s\"", c->name,
++					__FILE__, __func__, __LINE__, c->lxc_conf->errmsg);
++#endif
+ 		ERROR("The container failed to start");
+ 
+ 		if (my_args.daemonize)
+@@ -320,5 +424,8 @@ int main(int argc, char *argv[])
+ 
+ out:
+ 	lxc_container_put(c);
++#ifdef HAVE_ISULAD
++	free(container_info_file);
++#endif
+ 	exit(err);
+ }
+diff --git a/src/lxc/utils.c b/src/lxc/utils.c
+index 88d0f85..ab351d8 100644
+--- a/src/lxc/utils.c
++++ b/src/lxc/utils.c
+@@ -27,6 +27,9 @@
+ #include <sys/types.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
++#ifdef HAVE_ISULAD
++#include <sys/sysmacros.h>
++#endif
+ 
+ #include "config.h"
+ #include "log.h"
+@@ -71,6 +74,9 @@ static int _recursive_rmdir(const char *dirname, dev_t pdev,
+ 	int ret;
+ 	struct dirent *direntp;
+ 	char pathname[PATH_MAX];
++#ifdef HAVE_ISULAD
++	int saved_errno = 0;
++#endif
+ 
+ 	dir = opendir(dirname);
+ 	if (!dir)
+@@ -133,6 +139,11 @@ static int _recursive_rmdir(const char *dirname, dev_t pdev,
+ 		} else {
+ 			ret = unlink(pathname);
+ 			if (ret < 0) {
++#ifdef HAVE_ISULAD
++				if (saved_errno == 0) {
++					saved_errno = errno;
++				}
++#endif
+ 				__do_close int fd = -EBADF;
+ 
+ 				fd = open(pathname, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+@@ -158,10 +169,18 @@ static int _recursive_rmdir(const char *dirname, dev_t pdev,
+ 	}
+ 
+ 	if (rmdir(dirname) < 0 && !btrfs_try_remove_subvol(dirname) && !hadexclude) {
++#ifdef HAVE_ISULAD
++		if (saved_errno == 0) {
++			saved_errno = errno;
++		}
++#endif
+ 		SYSERROR("Failed to delete \"%s\"", dirname);
+ 		failed = 1;
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	errno = saved_errno;
++#endif
+ 	return failed ? -1 : 0;
+ }
+ 
+@@ -1008,7 +1027,11 @@ static int open_if_safe(int dirfd, const char *nextpath)
+  *
+  * Return an open fd for the path, or <0 on error.
+  */
++#ifdef HAVE_ISULAD
++int open_without_symlink(const char *target, const char *prefix_skip)
++#else
+ static int open_without_symlink(const char *target, const char *prefix_skip)
++#endif
+ {
+ 	int curlen = 0, dirfd, fulllen, i;
+ 	char *dup;
+@@ -1079,6 +1102,65 @@ out:
+ 	return dirfd;
+ }
+ 
++#ifdef HAVE_ISULAD
++static int format_mount_label(const char *data, const char *mount_label, char **mnt_opts)
++{
++	int ret = 0;
++
++	if (mount_label != NULL) {
++		if (data != NULL) {
++			ret = asprintf(mnt_opts, "%s,context=\"%s\"", data, mount_label);
++		} else {
++			ret = asprintf(mnt_opts, "context=\"%s\"", mount_label);
++		}
++
++		return ret < 0 ? -1 : 0;
++	}
++
++	*mnt_opts = data != NULL ? strdup(data) : NULL;
++	return 0;
++}
++
++static int receive_mount_options(const char *data, const char *mount_label,
++    const char *fstype, char **mnt_opts)
++{
++	// SELinux kernels don't support labeling of /proc or /sys
++	if (fstype != NULL && (strcmp(fstype, "proc") == 0 || strcmp(fstype, "sysfs") == 0)) {
++		return format_mount_label(data, NULL, mnt_opts);
++	}
++
++	return format_mount_label(data, mount_label, mnt_opts);
++}
++
++static int relabel_bind_mount_source(const char *src, const char *fstype, const char *data, const char *mount_label)
++{
++	__do_free_string_list char **parts = NULL;
++	ssize_t parts_len;
++	ssize_t i;
++
++	if (data == NULL) {
++		return lsm_relabel(src, mount_label, false);
++	}
++
++	parts = lxc_string_split(data, ',');
++	if (parts == NULL) {
++		return -1;
++	}
++
++	parts_len = lxc_array_len((void **)parts);
++	for (i = 0; i < parts_len; i++) {
++		if (strcmp(parts[i], "z") == 0) {
++			return lsm_relabel(src, mount_label, true);
++		} else if (strcmp(parts[i], "Z") == 0) {
++			return lsm_relabel(src, mount_label, false);
++		}
++	}
++
++	return lsm_relabel(src, mount_label, false);
++}
++
++#endif
++
+ /*
+  * Safely mount a path into a container, ensuring that the mount target
+  * is under the container's @rootfs.  (If @rootfs is NULL, then the container
+@@ -1087,14 +1169,22 @@ out:
+  * CAVEAT: This function must not be used for other purposes than container
+  * setup before executing the container's init
+  */
++#ifdef HAVE_ISULAD
++int safe_mount(const char *src, const char *dest, const char *fstype,
++		unsigned long flags, const void *data, const char *rootfs, const char *mount_label)
++#else
+ int safe_mount(const char *src, const char *dest, const char *fstype,
+ 		unsigned long flags, const void *data, const char *rootfs)
++#endif
+ {
+ 	int destfd, ret, saved_errno;
+ 	/* Only needs enough for /proc/self/fd/<fd>. */
+ 	char srcbuf[50], destbuf[50];
+ 	int srcfd = -1;
+ 	const char *mntsrc = src;
++#ifdef HAVE_ISULAD
++  __do_free char *mnt_opts = NULL;
++#endif
+ 
+ 	if (!rootfs)
+ 		rootfs = "";
+@@ -1137,8 +1227,23 @@ int safe_mount(const char *src, const char *dest, const char *fstype,
+ 		return -EINVAL;
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	if (receive_mount_options(data, mount_label, fstype, &mnt_opts) != 0) {
++		ERROR("Failed to receive mount options");
++		return -EINVAL;
++	}
++
++	ret = mount(mntsrc, destbuf, fstype, flags, mnt_opts);
++	saved_errno = errno;
++	if (ret < 0 && fstype != NULL && strcmp(fstype, "mqueue") == 0) {
++		INFO("older kernels don't support labeling of /dev/mqueue, retry without selinux context");
++		ret = mount(mntsrc, destbuf, fstype, flags, data);
++		saved_errno = errno;
++	}
++#else
+ 	ret = mount(mntsrc, destbuf, fstype, flags, data);
+ 	saved_errno = errno;
++#endif
+ 	if (srcfd != -1)
+ 		close(srcfd);
+ 
+@@ -1149,6 +1254,19 @@ int safe_mount(const char *src, const char *dest, const char *fstype,
+ 		return ret;
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	if (fstype != NULL && strcmp(fstype, "mqueue") == 0 && lsm_file_label_set(dest, mount_label) != 0) {
++		ERROR("Failed to set file label on %s", dest);
++		return -EINVAL;
++	}
++
++	if (fstype != NULL && strcmp(fstype, "bind") == 0 &&
++		    relabel_bind_mount_source(src, fstype, (const char *)data, mount_label) != 0) {
++		ERROR("Failed to reabel %s with %s", src, mount_label);
++		return -EINVAL;
++	}
++#endif
++
+ 	return 0;
+ }
+ 
+@@ -1215,7 +1333,11 @@ domount:
+ 	if (!strcmp(rootfs, ""))
+ 		ret = mount("proc", path, "proc", 0, NULL);
+ 	else
++#ifdef HAVE_ISULAD
++		ret = safe_mount("proc", path, "proc", 0, NULL, rootfs, NULL);
++#else
+ 		ret = safe_mount("proc", path, "proc", 0, NULL, rootfs);
++#endif
+ 	if (ret < 0)
+ 		return -1;
+ 
+@@ -1425,6 +1547,11 @@ static int lxc_get_unused_loop_dev(char *name_loop)
+ {
+ 	int loop_nr, ret;
+ 	int fd_ctl = -1, fd_tmp = -1;
++#ifdef HAVE_ISULAD
++	// isulad: retry and try mknod
++	int max_retry = 200;
++	bool try_mknod = true;
++#endif
+ 
+ 	fd_ctl = open("/dev/loop-control", O_RDWR | O_CLOEXEC);
+ 	if (fd_ctl < 0) {
+@@ -1442,8 +1569,37 @@ static int lxc_get_unused_loop_dev(char *name_loop)
+ 	if (ret < 0 || ret >= LO_NAME_SIZE)
+ 		goto on_error;
+ 
++#ifdef HAVE_ISULAD
++retry:
++#endif
+ 	fd_tmp = open(name_loop, O_RDWR | O_CLOEXEC);
+ 	if (fd_tmp < 0) {
++#ifdef HAVE_ISULAD
++		/* Success of LOOP_CTL_GET_FREE doesn't mean /dev/loop$i is ready,
++		* we try to make node by ourself to avoid wait. */
++		if (try_mknod) {
++			/* Do not check result of mknod because LOOP_CTL_GET_FREE
++			* alse do mknod, so this mknod may fail as node already
++			* exist. If we can open the node without error, we can
++			* say that it's be created successfully.
++			*
++			* note: 7 is the major device number of loopback devices
++			*	 in kernel.
++			*/
++			mknod(name_loop, S_IFBLK | 0640, makedev(7, loop_nr));
++			try_mknod = false;
++			goto retry;
++		}
++		/* we need to wait some time to make sure it's ready for open if
++		* it can't open even if we have already try to make node by ourself. */
++		if (max_retry > 0) {
++			max_retry--;
++			usleep(5000); /* 5 millisecond */
++			goto retry;
++		}
++		SYSERROR("Failed to open loop \"%s\"", name_loop);
++		goto on_error;
++#else
+ 		/* on Android loop devices are moved under /dev/block, give it a shot */
+ 		ret = snprintf(name_loop, LO_NAME_SIZE, "/dev/block/loop%d", loop_nr);
+                 if (ret < 0 || ret >= LO_NAME_SIZE)
+@@ -1452,6 +1608,7 @@ static int lxc_get_unused_loop_dev(char *name_loop)
+ 		fd_tmp = open(name_loop, O_RDWR | O_CLOEXEC);
+ 		if (fd_tmp < 0)
+ 			SYSERROR("Failed to open loop \"%s\"", name_loop);
++#endif
+ 	}
+ 
+ on_error:
+@@ -1661,6 +1818,7 @@ uint64_t lxc_find_next_power2(uint64_t n)
+ 	return n;
+ }
+ 
++#ifndef HAVE_ISULAD
+ static int process_dead(/* takes */ int status_fd)
+ {
+ 	__do_close int dupfd = -EBADF;
+@@ -1698,15 +1856,19 @@ static int process_dead(/* takes */ int status_fd)
+ 
+ 	return ret;
+ }
++#endif
+ 
+ int lxc_set_death_signal(int signal, pid_t parent, int parent_status_fd)
+ {
+ 	int ret;
++#ifndef HAVE_ISULAD
+ 	pid_t ppid;
++#endif
+ 
+ 	ret = prctl(PR_SET_PDEATHSIG, prctl_arg(signal), prctl_arg(0),
+ 		    prctl_arg(0), prctl_arg(0));
+ 
++#ifndef HAVE_ISULAD
+ 	/* verify that we haven't been orphaned in the meantime */
+ 	ppid = (pid_t)syscall(SYS_getppid);
+ 	if (ppid == 0) { /* parent outside our pidns */
+@@ -1718,6 +1880,7 @@ int lxc_set_death_signal(int signal, pid_t parent, int parent_status_fd)
+ 	} else if (ppid != parent) {
+ 		return raise(SIGKILL);
+ 	}
++#endif
+ 
+ 	if (ret < 0)
+ 		return -1;
+@@ -1755,8 +1918,18 @@ int lxc_rm_rf(const char *dirname)
+ 	struct dirent *direntp;
+ 
+ 	dir = opendir(dirname);
++#ifdef HAVE_ISULAD
++	if (!dir) {
++		if (errno == ENOENT) {
++			WARN("Destroy path: \"%s\" do not exist", dirname);
++			return 0;
++		}
++		return log_error_errno(-1, errno, "Failed to open dir \"%s\"", dirname);
++	}
++#else
+ 	if (!dir)
+ 		return log_error_errno(-1, errno, "Failed to open dir \"%s\"", dirname);
++#endif
+ 
+ 	while ((direntp = readdir(dir))) {
+ 		__do_free char *pathname = NULL;
+diff --git a/src/lxc/utils.h b/src/lxc/utils.h
+index cf2c042..917a086 100644
+--- a/src/lxc/utils.h
++++ b/src/lxc/utils.h
+@@ -28,6 +28,10 @@
+ #include "process_utils.h"
+ #include "string_utils.h"
+ 
++#ifdef HAVE_ISULAD
++#include "isulad_utils.h"
++#endif
++
+ /* returns 1 on success, 0 if there were any failures */
+ extern int lxc_rmdir_onedev(const char *path, const char *exclude);
+ extern int get_u16(unsigned short *val, const char *arg, int base);
+@@ -145,9 +149,16 @@ extern bool cgns_supported(void);
+ extern char *choose_init(const char *rootfs);
+ extern bool switch_to_ns(pid_t pid, const char *ns);
+ extern char *get_template_path(const char *t);
++#ifdef HAVE_ISULAD
++extern int open_without_symlink(const char *target, const char *prefix_skip);
++extern int safe_mount(const char *src, const char *dest, const char *fstype,
++		      unsigned long flags, const void *data,
++		      const char *rootfs, const char *mount_label);
++#else
+ extern int safe_mount(const char *src, const char *dest, const char *fstype,
+ 		      unsigned long flags, const void *data,
+ 		      const char *rootfs);
++#endif
+ extern int lxc_mount_proc_if_needed(const char *rootfs);
+ extern int open_devnull(void);
+ extern int set_stdfds(int fd);
+-- 
+2.25.1
+

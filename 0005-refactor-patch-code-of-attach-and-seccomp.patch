@@ -1,0 +1,1517 @@
+From ad33756d6190df4f1aad9b6468b0b59086e916b5 Mon Sep 17 00:00:00 2001
+From: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+Date: Tue, 19 Jul 2022 15:23:34 +0800
+Subject: [PATCH] refactor patch code of attach and seccomp
+
+Signed-off-by: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+---
+ src/lxc/attach.c      | 517 +++++++++++++++++++++++++++++++++++++++
+ src/lxc/lsm/nop.c     |  14 ++
+ src/lxc/seccomp.c     | 555 ++++++++++++++++++++++++++++++++++++++++++
+ src/lxc/storage/zfs.c |   9 +
+ 4 files changed, 1095 insertions(+)
+
+diff --git a/src/lxc/attach.c b/src/lxc/attach.c
+index 38e16f2..8a2c52a 100644
+--- a/src/lxc/attach.c
++++ b/src/lxc/attach.c
+@@ -49,6 +49,25 @@
+ #include <sys/personality.h>
+ #endif
+ 
++#ifdef HAVE_ISULAD
++#include "exec_commands.h"
++
++typedef enum {
++	ATTACH_INIT,
++	ATTACH_TIMEOUT,
++	ATTACH_MAX,
++} attach_timeout_t;
++
++static volatile attach_timeout_t g_attach_timeout_state = ATTACH_INIT;
++
++struct attach_timeout_conf {
++	int64_t timeout;
++	unsigned long long start_time;
++	pid_t pid;
++};
++
++#endif
++
+ lxc_log_define(attach, lxc);
+ 
+ /* Define default options if no options are supplied by the user. */
+@@ -630,6 +649,9 @@ struct attach_clone_payload {
+ 	struct lxc_proc_context_info *init_ctx;
+ 	lxc_attach_exec_t exec_function;
+ 	void *exec_payload;
++#ifdef HAVE_ISULAD
++	struct lxc_terminal *terminal;
++#endif
+ };
+ 
+ static void lxc_put_attach_clone_payload(struct attach_clone_payload *p)
+@@ -642,6 +664,48 @@ static void lxc_put_attach_clone_payload(struct attach_clone_payload *p)
+ 	}
+ }
+ 
++#ifdef HAVE_ISULAD
++static int isulad_set_attach_pipes(struct lxc_terminal *terminal)
++{
++	int ret = 0;
++	if (terminal->pipes[0][1] >= 0) {
++		close(terminal->pipes[0][1]);
++		terminal->pipes[0][1] = -1;
++	}
++
++	if (terminal->pipes[0][0] >= 0) {
++		ret = dup2(terminal->pipes[0][0], STDIN_FILENO);
++		if (ret < 0)
++			goto out;
++	}
++
++	if (terminal->pipes[1][0] >= 0) {
++		close(terminal->pipes[1][0]);
++		terminal->pipes[1][0] = -1;
++	}
++
++	if (terminal->pipes[1][1] >= 0) {
++		ret = dup2(terminal->pipes[1][1], STDOUT_FILENO);
++		if (ret < 0)
++			goto out;
++	}
++	if (terminal->pipes[2][0] >= 0) {
++		close(terminal->pipes[2][0]);
++		terminal->pipes[2][0] = -1;
++	}
++
++	if (terminal->pipes[2][1] >= 0) {
++		ret = dup2(terminal->pipes[2][1], STDERR_FILENO);
++		if (ret < 0)
++			goto out;
++	}
++
++	setsid();
++out:
++	return ret;
++}
++#endif
++
+ static int attach_child_main(struct attach_clone_payload *payload)
+ {
+ 	int lsm_fd, ret;
+@@ -654,6 +718,31 @@ static int attach_child_main(struct attach_clone_payload *payload)
+ 	bool needs_lsm = (options->namespaces & CLONE_NEWNS) &&
+ 			 (options->attach_flags & LXC_ATTACH_LSM) &&
+ 			 init_ctx->lsm_label;
++#ifdef HAVE_ISULAD
++	int msg_fd = -1;
++	sigset_t mask;
++
++	/*isulad: record errpipe fd*/
++	msg_fd = init_ctx->container->lxc_conf->errpipe[1];
++	init_ctx->container->lxc_conf->errpipe[1] = -1;
++	/*isulad: set system umask */
++	umask(init_ctx->container->lxc_conf->umask);
++
++	/*isulad: restore default signal handlers and unblock all signals*/
++	for (int i = 1; i < NSIG; i++)
++		signal(i, SIG_DFL);
++
++	ret = sigfillset(&mask);
++	if (ret < 0) {
++		SYSERROR("Failed to fill signal mask");
++		goto on_error;;
++	}
++	ret = sigprocmask(SIG_UNBLOCK, &mask, NULL);
++	if (ret < 0) {
++		SYSERROR("Failed to set signal mask");
++		goto on_error;
++	}
++#endif
+ 
+ 	/* A description of the purpose of this functionality is provided in the
+ 	 * lxc-attach(1) manual page. We have to remount here and not in the
+@@ -695,6 +784,28 @@ static int attach_child_main(struct attach_clone_payload *payload)
+ 		TRACE("Dropped capabilities");
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: set workdir */
++	if (options->initial_cwd || init_ctx->container->lxc_conf->init_cwd) {
++		char *init_cwd;
++		init_cwd = options->initial_cwd ? options->initial_cwd : init_ctx->container->lxc_conf->init_cwd;
++		/* try to create workdir if not exist */
++		struct stat st;
++		if (stat(init_cwd, &st) < 0 && mkdir_p(init_cwd, 0750) < 0) {
++			SYSERROR("Try to create directory \"%s\" as workdir failed when attach", init_cwd);
++			lxc_write_error_message(msg_fd, "Try to create directory \"%s\" as workdir failed when attach: %s",
++						init_cwd, strerror(errno));
++			goto on_error;
++		}
++		if (chdir(init_cwd)) {
++			SYSERROR("Could not change directory to \"%s\" when attach", init_cwd);
++			lxc_write_error_message(msg_fd, "Could not change directory to \"%s\" when attach: %s",
++						init_cwd, strerror(errno));
++			goto on_error;
++		}
++	}
++#endif
++
+ 	/* Always set the environment (specify (LXC_ATTACH_KEEP_ENV, NULL, NULL)
+ 	 * if you want this to be a no-op).
+ 	 */
+@@ -736,8 +847,10 @@ static int attach_child_main(struct attach_clone_payload *payload)
+ 			goto on_error;
+ 	}
+ 
++#ifndef HAVE_ISULAD
+ 	if (!lxc_setgroups(0, NULL) && errno != EPERM)
+ 		goto on_error;
++#endif
+ 
+ 	if (options->namespaces & CLONE_NEWUSER) {
+ 		/* Check whether nsuid 0 has a mapping. */
+@@ -770,6 +883,13 @@ static int attach_child_main(struct attach_clone_payload *payload)
+ 	else
+ 		new_gid = ns_root_gid;
+ 
++#ifdef HAVE_ISULAD
++	// isulad: set env home in container
++	if (lxc_setup_env_home(new_uid) < 0) {
++		goto on_error;
++	}
++#endif
++
+ 	if ((init_ctx->container && init_ctx->container->lxc_conf &&
+ 	     init_ctx->container->lxc_conf->no_new_privs) ||
+ 	    (options->attach_flags & LXC_ATTACH_NO_NEW_PRIVS)) {
+@@ -810,10 +930,12 @@ static int attach_child_main(struct attach_clone_payload *payload)
+ 			goto on_error;
+ 	}
+ 
++#ifndef HAVE_ISULAD
+ 	close(payload->ipc_socket);
+ 	payload->ipc_socket = -EBADF;
+ 	lxc_proc_put_context_info(init_ctx);
+ 	payload->init_ctx = NULL;
++#endif
+ 
+ 	/* The following is done after the communication socket is shut down.
+ 	 * That way, all errors that might (though unlikely) occur up until this
+@@ -856,6 +978,24 @@ static int attach_child_main(struct attach_clone_payload *payload)
+ 	}
+ 
+ 	if (options->attach_flags & LXC_ATTACH_TERMINAL) {
++#ifdef HAVE_ISULAD
++		/* isulad: dup2 pipe[0][0] to container stdin, pipe[1][1] to container stdout, pipe[2][1] to container stderr */
++		if (payload->terminal->disable_pty) {
++			ret = isulad_set_attach_pipes(payload->terminal);
++			if (ret < 0) {
++				SYSERROR("Failed to prepare terminal file pipes");
++				goto on_error;
++			}
++		}
++
++		if(!payload->terminal->disable_pty && payload->terminal_pts_fd >= 0) {
++			ret = lxc_terminal_prepare_login(payload->terminal_pts_fd);
++			if (ret < 0) {
++				SYSERROR("Failed to prepare terminal file descriptor %d", payload->terminal_pts_fd);
++				goto on_error;
++			}
++		}
++#else
+ 		ret = lxc_terminal_prepare_login(payload->terminal_pts_fd);
+ 		if (ret < 0) {
+ 			SYSERROR("Failed to prepare terminal file descriptor %d", payload->terminal_pts_fd);
+@@ -863,6 +1003,7 @@ static int attach_child_main(struct attach_clone_payload *payload)
+ 		}
+ 
+ 		TRACE("Prepared terminal file descriptor %d", payload->terminal_pts_fd);
++#endif
+ 	}
+ 
+ 	/* Avoid unnecessary syscalls. */
+@@ -872,6 +1013,17 @@ static int attach_child_main(struct attach_clone_payload *payload)
+ 	if (new_gid == ns_root_gid)
+ 		new_gid = LXC_INVALID_GID;
+ 
++#ifdef HAVE_ISULAD
++	if (prctl(PR_SET_KEEPCAPS, 1) < 0) {
++		SYSERROR("Failed to keep permitted capabilities");
++		goto on_error;
++	}
++
++	if (!lxc_setgroups(init_ctx->container->lxc_conf->init_groups_len,
++			init_ctx->container->lxc_conf->init_groups))
++		goto on_error;
++#endif
++
+ 	/* Make sure that the processes STDIO is correctly owned by the user that we are switching to */
+ 	ret = fix_stdio_permissions(new_uid);
+ 	if (ret)
+@@ -880,21 +1032,63 @@ static int attach_child_main(struct attach_clone_payload *payload)
+ 	if (!lxc_switch_uid_gid(new_uid, new_gid))
+ 		goto on_error;
+ 
++#ifdef HAVE_ISULAD
++	if (prctl(PR_SET_KEEPCAPS, 0) < 0) {
++		SYSERROR("Failed to clear permitted capabilities");
++		goto on_error;
++	}
++
++	if (lxc_drop_caps(init_ctx->container->lxc_conf) != 0) {
++		ERROR("Failed to drop caps.");
++		goto on_error;
++	}
++
++	close(payload->ipc_socket);
++	payload->ipc_socket = -EBADF;
++	lxc_proc_put_context_info(init_ctx);
++	payload->init_ctx = NULL;
++	_exit(payload->exec_function(payload->exec_payload, msg_fd));
++#else
+ 	/* We're done, so we can now do whatever the user intended us to do. */
+ 	_exit(payload->exec_function(payload->exec_payload));
++#endif
+ 
+ on_error:
+ 	lxc_put_attach_clone_payload(payload);
+ 	_exit(EXIT_FAILURE);
+ }
+ 
++#ifdef HAVE_ISULAD
++static int lxc_attach_terminal(struct lxc_conf *conf,
++			       struct lxc_terminal *terminal, lxc_attach_options_t *options)
++#else
+ static int lxc_attach_terminal(struct lxc_conf *conf,
+ 			       struct lxc_terminal *terminal)
++#endif
+ {
+ 	int ret;
+ 
+ 	lxc_terminal_init(terminal);
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: if we pass fifo in option, use them as init fifos */
++	if (options->init_fifo[0]) {
++		free(terminal->init_fifo[0]);
++		terminal->init_fifo[0] = safe_strdup(options->init_fifo[0]);
++	}
++	if (options->init_fifo[1]) {
++		free(terminal->init_fifo[1]);
++		terminal->init_fifo[1] = safe_strdup(options->init_fifo[1]);
++	}
++	if (options->init_fifo[2]) {
++		free(terminal->init_fifo[2]);
++		terminal->init_fifo[2] = safe_strdup(options->init_fifo[2]);
++	}
++
++	terminal->disable_pty = options->disable_pty;
++	terminal->open_stdin = options->open_stdin;
++#endif
++
+ 	ret = lxc_terminal_create(terminal);
+ 	if (ret < 0)
+ 		return log_error(-1, "Failed to create terminal");
+@@ -952,9 +1146,126 @@ static inline void lxc_attach_terminal_close_log(struct lxc_terminal *terminal)
+ 	close_prot_errno_disarm(terminal->log_fd);
+ }
+ 
++#ifdef HAVE_ISULAD
++/* isulad: attach timeout thread function */
++static void* wait_attach_timeout(void *arg)
++{
++	struct attach_timeout_conf *conf = (struct attach_timeout_conf *)arg;
++
++	if (!conf || conf->timeout < 1)
++		goto out;
++	sleep(conf->timeout);
++	if (lxc_process_alive(conf->pid, conf->start_time)) {
++		g_attach_timeout_state = ATTACH_TIMEOUT;
++		if (kill(conf->pid, SIGKILL) < 0) {
++			ERROR("Failed to send signal %d to pid %d", SIGKILL, conf->pid);
++		}
++	}
++
++out:
++	free(conf);
++	return ((void *)0);
++}
++
++/* isulad: create attach timeout thread */
++static int create_attach_timeout_thread(int64_t attach_timeout, pid_t pid)
++{
++	int ret = 0;
++	pthread_t ptid;
++	pthread_attr_t attr;
++	struct attach_timeout_conf *timeout_conf = NULL;
++
++	timeout_conf = malloc(sizeof(struct attach_timeout_conf));
++	if (timeout_conf == NULL) {
++		ERROR("Failed to malloc attach timeout conf");
++		ret = -1;
++		goto out;
++	}
++
++	memset(timeout_conf, 0, sizeof(struct attach_timeout_conf));
++	timeout_conf->timeout = attach_timeout;
++	timeout_conf->pid = pid;
++	timeout_conf->start_time = lxc_get_process_startat(pid);
++
++	pthread_attr_init(&attr);
++	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++	ret = pthread_create(&ptid, &attr, wait_attach_timeout, timeout_conf);
++	pthread_attr_destroy(&attr);
++	if (ret != 0) {
++		ERROR("Create attach wait timeout thread failed");
++		free(timeout_conf);
++		goto out;
++	}
++
++out:
++	return ret;
++}
++
++static int attach_signal_handler(int fd, uint32_t events, void *data,
++			  struct lxc_epoll_descr *descr)
++{
++	int ret;
++	siginfo_t info;
++	struct signalfd_siginfo siginfo;
++	pid_t *pid = data;
++
++	ret = lxc_read_nointr(fd, &siginfo, sizeof(siginfo));
++	if (ret < 0)
++		return log_error(LXC_MAINLOOP_ERROR, "Failed to read signal info from signal file descriptor %d", fd);
++
++	if (ret != sizeof(siginfo))
++		return log_error(LXC_MAINLOOP_ERROR, "Unexpected size for struct signalfd_siginfo");
++
++	/* Check whether init is running. */
++	info.si_pid = 0;
++	ret = waitid(P_PID, *pid, &info, WEXITED | WNOWAIT | WNOHANG);
++	if (ret == 0 && info.si_pid == *pid) {
++		return log_warn(LXC_MAINLOOP_CLOSE, "Container attach init process %d exited", *pid);
++	}
++
++	return LXC_MAINLOOP_CONTINUE;
++}
++
++static int isulad_setup_signal_fd(sigset_t *oldmask)
++{
++	int ret;
++	sigset_t mask;
++	const int signals[] = {SIGBUS, SIGILL, SIGSEGV, SIGWINCH, SIGTERM};
++
++	/* Block everything except serious error signals. */
++	ret = sigfillset(&mask);
++	if (ret < 0)
++		return -EBADF;
++
++	for (int sig = 0; sig < (sizeof(signals) / sizeof(signals[0])); sig++) {
++		ret = sigdelset(&mask, signals[sig]);
++		if (ret < 0)
++			return -EBADF;
++	}
++
++	ret = pthread_sigmask(SIG_BLOCK, &mask, oldmask);
++	if (ret < 0)
++		return log_error_errno(-EBADF, errno,
++				       "Failed to set signal mask");
++
++	ret = signalfd(-1, &mask, SFD_CLOEXEC);
++	if (ret < 0)
++		return log_error_errno(-EBADF,
++				       errno, "Failed to create signal file descriptor");
++
++	TRACE("Created signal file descriptor %d", ret);
++
++	return ret;
++}
++
++int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
++	       void *exec_payload, lxc_attach_options_t *options,
++	       pid_t *attached_process, char **err_msg)
++#else
+ int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+ 	       void *exec_payload, lxc_attach_options_t *options,
+ 	       pid_t *attached_process)
++#endif
+ {
+ 	int i, ret, status;
+ 	int ipc_sockets[2];
+@@ -966,6 +1277,13 @@ int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+ 	struct lxc_conf *conf;
+ 	char *name, *lxcpath;
+ 	struct attach_clone_payload payload = {0};
++#ifdef HAVE_ISULAD
++	struct lxc_exec_command_handler exec_command;
++	const char *suffix = options->suffix;
++
++	exec_command.maincmd_fd = -1;
++	exec_command.terminal = &terminal;
++#endif
+ 
+ 	ret = access("/proc/self/ns", X_OK);
+ 	if (ret)
+@@ -1017,6 +1335,14 @@ int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+ 	if (!conf)
+ 		return log_error_errno(-EINVAL, EINVAL, "Missing container confifg");
+ 
++#ifdef HAVE_ISULAD
++	// always switch uid and gid for attach
++	if (options->uid == -1)
++		options->uid = init_ctx->container->lxc_conf->init_uid;
++	if (options->gid == -1)
++		options->gid = init_ctx->container->lxc_conf->init_gid;
++#endif
++
+ 	if (!fetch_seccomp(init_ctx->container, options))
+ 		WARN("Failed to get seccomp policy");
+ 
+@@ -1090,7 +1416,11 @@ int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+ 	}
+ 
+ 	if (options->attach_flags & LXC_ATTACH_TERMINAL) {
++#ifdef HAVE_ISULAD
++		ret = lxc_attach_terminal(conf, &terminal, options);
++#else
+ 		ret = lxc_attach_terminal(conf, &terminal);
++#endif
+ 		if (ret < 0) {
+ 			ERROR("Failed to setup new terminal");
+ 			free(cwd);
+@@ -1099,6 +1429,12 @@ int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+ 		}
+ 
+ 		terminal.log_fd = options->log_fd;
++#ifdef HAVE_ISULAD
++		if (suffix != NULL) {
++			exec_command.maincmd_fd = lxc_exec_cmd_init(name, lxcpath, suffix);
++			exec_command.terminal = &terminal;
++		}
++#endif
+ 	} else {
+ 		lxc_terminal_init(&terminal);
+ 	}
+@@ -1139,10 +1475,40 @@ int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+ 	ret = socketpair(PF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0, ipc_sockets);
+ 	if (ret < 0) {
+ 		SYSERROR("Could not set up required IPC mechanism for attaching");
++#ifdef HAVE_ISULAD
++		if (options->attach_flags & LXC_ATTACH_TERMINAL) {
++			lxc_terminal_delete(&terminal);
++			lxc_terminal_conf_free(&terminal);
++			if (exec_command.maincmd_fd != -1) {
++				close(exec_command.maincmd_fd);
++			}
++			lxc_exec_unix_sock_delete(name, suffix);
++		}
++#endif
++		free(cwd);
++		lxc_proc_put_context_info(init_ctx);
++		return -1;
++	}
++
++#ifdef HAVE_ISULAD
++	/* isulad: pipdfd for get error message of child or grandchild process. */
++	if (pipe2(conf->errpipe, O_CLOEXEC) != 0) {
++		SYSERROR("Failed to init errpipe");
++		if (options->attach_flags & LXC_ATTACH_TERMINAL) {
++			lxc_terminal_delete(&terminal);
++			lxc_terminal_conf_free(&terminal);
++			if (exec_command.maincmd_fd != -1) {
++				close(exec_command.maincmd_fd);
++			}
++			lxc_exec_unix_sock_delete(name, suffix);
++		}
++		close(ipc_sockets[0]);
++		close(ipc_sockets[1]);
+ 		free(cwd);
+ 		lxc_proc_put_context_info(init_ctx);
+ 		return -1;
+ 	}
++#endif
+ 
+ 	/* Create intermediate subprocess, two reasons:
+ 	 *       1. We can't setns() in the child itself, since we want to make
+@@ -1154,6 +1520,18 @@ int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+ 	pid = fork();
+ 	if (pid < 0) {
+ 		SYSERROR("Failed to create first subprocess");
++#ifdef HAVE_ISULAD
++		if (options->attach_flags & LXC_ATTACH_TERMINAL) {
++			lxc_terminal_delete(&terminal);
++			lxc_terminal_conf_free(&terminal);
++			if (exec_command.maincmd_fd != -1) {
++				close(exec_command.maincmd_fd);
++			}
++			lxc_exec_unix_sock_delete(name, suffix);
++		}
++		close(ipc_sockets[0]);
++		close(ipc_sockets[1]);
++#endif
+ 		free(cwd);
+ 		lxc_proc_put_context_info(init_ctx);
+ 		return -1;
+@@ -1163,10 +1541,35 @@ int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+ 		int ret_parent = -1;
+ 		pid_t to_cleanup_pid = pid;
+ 		struct lxc_epoll_descr descr = {0};
++#ifdef HAVE_ISULAD
++		int isulad_sigfd;
++		sigset_t isulad_oldmask;
++		struct lxc_epoll_descr isulad_descr = {0};
++#endif
+ 
+ 		/* close unneeded file descriptors */
+ 		close(ipc_sockets[1]);
+ 		free(cwd);
++#ifdef HAVE_ISULAD
++		/* isulad: close errpipe */
++		close(conf->errpipe[1]);
++		conf->errpipe[1] = -1;
++		/* isulad: close pipe after clone */
++		if (terminal.pipes[0][0] >= 0) {
++			close(terminal.pipes[0][0]);
++			terminal.pipes[0][0] = -1;
++		}
++
++		if (terminal.pipes[1][1] >= 0) {
++			close(terminal.pipes[1][1]);
++			terminal.pipes[1][1] = -1;
++		}
++
++		if (terminal.pipes[2][1] >= 0) {
++			close(terminal.pipes[2][1]);
++			terminal.pipes[2][1] = -1;
++		}
++#endif
+ 		lxc_proc_close_ns_fd(init_ctx);
+ 		if (options->attach_flags & LXC_ATTACH_TERMINAL)
+ 			lxc_attach_terminal_close_pts(&terminal);
+@@ -1200,7 +1603,11 @@ int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+ 
+ 		/* Setup resource limits */
+ 		if (!lxc_list_empty(&conf->limits)) {
++#ifdef HAVE_ISULAD
++			ret = setup_resource_limits(&conf->limits, pid, -1);
++#else
+ 			ret = setup_resource_limits(&conf->limits, pid);
++#endif
+ 			if (ret < 0)
+ 				goto on_error;
+ 		}
+@@ -1210,9 +1617,28 @@ int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+ 			if (ret < 0)
+ 				goto on_error;
+ 
++#ifdef HAVE_ISULAD
++			ret = lxc_attach_terminal_mainloop_init(&terminal, &isulad_descr);
++			if (ret < 0)
++				goto on_error;
++
++			if (suffix != NULL) {
++				(void)lxc_exec_cmd_mainloop_add(&descr, &exec_command);
++			}
++#endif
+ 			TRACE("Initialized terminal mainloop");
+ 		}
+ 
++#ifdef HAVE_ISULAD
++		/* The signal fd has to be created before forking otherwise if the child
++		* process exits before we setup the signal fd, the event will be lost
++		* and the command will be stuck.
++		*/
++		isulad_sigfd = isulad_setup_signal_fd(&isulad_oldmask);
++		if (isulad_sigfd < 0)
++			goto close_mainloop;
++#endif
++
+ 		/* Let the child process know to go ahead. */
+ 		status = 0;
+ 		ret = lxc_write_nointr(ipc_sockets[0], &status, sizeof(status));
+@@ -1290,6 +1716,34 @@ int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+ 
+ 		*attached_process = attached_pid;
+ 
++#ifdef HAVE_ISULAD
++		if (options->timeout > 0) {
++			ret = create_attach_timeout_thread(options->timeout, *attached_process);
++			if (ret) {
++				ERROR("Failed to create attach timeout thread for container.");
++				goto close_mainloop;
++			}
++		}
++		/* isulad: read error msg from pipe */
++		ssize_t size_read;
++		char errbuf[BUFSIZ + 1] = {0};
++		pid_t tmp_pid = *attached_process;
++
++		size_read = read(conf->errpipe[0], errbuf, BUFSIZ);
++		if (size_read > 0) {
++			if (err_msg)
++				*err_msg = safe_strdup(errbuf);
++			goto close_mainloop;
++		}
++		if (options->attach_flags & LXC_ATTACH_TERMINAL) {
++			ret = lxc_mainloop_add_handler(&descr, isulad_sigfd, attach_signal_handler, &tmp_pid);
++			if (ret < 0) {
++				ERROR("Failed to add signal handler for %d to mainloop", tmp_pid);
++				goto close_mainloop;
++			}
++		}
++#endif
++
+ 		/* Now shut down communication with child, we're done. */
+ 		shutdown(ipc_sockets[0], SHUT_RDWR);
+ 		close(ipc_sockets[0]);
+@@ -1298,17 +1752,44 @@ int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+ 		ret_parent = 0;
+ 		to_cleanup_pid = -1;
+ 
++#ifdef HAVE_ISULAD
++		// iSulad: close stdin pipe if we do not want open_stdin with container stdin
++		if (!terminal.open_stdin) {
++			if (terminal.pipes[0][1] > 0) {
++				close(terminal.pipes[0][1]);
++				terminal.pipes[0][1] = -1;
++			}
++		}
++#endif
+ 		if (options->attach_flags & LXC_ATTACH_TERMINAL) {
++#ifdef HAVE_ISULAD
++			ret = isulad_safe_mainloop(&descr, -1);
++#else
+ 			ret = lxc_mainloop(&descr, -1);
++#endif
+ 			if (ret < 0) {
+ 				ret_parent = -1;
+ 				to_cleanup_pid = attached_pid;
+ 			}
+ 		}
+ 
++#ifdef HAVE_ISULAD
++		// do lxc_mainloop to make sure we do not lose any output
++		(void)isulad_safe_mainloop(&isulad_descr, 100);
++		if (g_attach_timeout_state == ATTACH_TIMEOUT && err_msg != NULL && *err_msg == NULL) {
++			*err_msg = safe_strdup("Attach exceeded timeout");
++		}
++#endif
+ 	close_mainloop:
++#ifdef HAVE_ISULAD
++		if (options->attach_flags & LXC_ATTACH_TERMINAL) {
++			lxc_mainloop_close(&isulad_descr);
++			lxc_mainloop_close(&descr);
++		}
++#else
+ 		if (options->attach_flags & LXC_ATTACH_TERMINAL)
+ 			lxc_mainloop_close(&descr);
++#endif
+ 
+ 	on_error:
+ 		if (ipc_sockets[0] >= 0) {
+@@ -1322,6 +1803,12 @@ int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+ 		if (options->attach_flags & LXC_ATTACH_TERMINAL) {
+ 			lxc_terminal_delete(&terminal);
+ 			lxc_terminal_conf_free(&terminal);
++#ifdef HAVE_ISULAD
++			if (exec_command.maincmd_fd != -1) {
++				close(exec_command.maincmd_fd);
++			}
++			lxc_exec_unix_sock_delete(name, suffix);
++#endif
+ 		}
+ 
+ 		lxc_proc_put_context_info(init_ctx);
+@@ -1331,10 +1818,21 @@ int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+ 	/* close unneeded file descriptors */
+ 	close_prot_errno_disarm(ipc_sockets[0]);
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: close errpipe */
++	close(conf->errpipe[0]);
++	conf->errpipe[0] = -1;
++#endif
++
+ 	if (options->attach_flags & LXC_ATTACH_TERMINAL) {
+ 		lxc_attach_terminal_close_ptmx(&terminal);
+ 		lxc_attach_terminal_close_peer(&terminal);
+ 		lxc_attach_terminal_close_log(&terminal);
++#ifdef HAVE_ISULAD
++		if (exec_command.maincmd_fd != -1) {
++			close(exec_command.maincmd_fd);
++		}
++#endif
+ 	}
+ 
+ 	/* Wait for the parent to have setup cgroups. */
+@@ -1380,6 +1878,9 @@ int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+ 	payload.terminal_pts_fd = terminal.pts;
+ 	payload.exec_function = exec_function;
+ 	payload.exec_payload = exec_payload;
++#ifdef HAVE_ISULAD
++	payload.terminal = &terminal;
++#endif
+ 
+ 	pid = lxc_raw_clone(CLONE_PARENT, NULL);
+ 	if (pid < 0) {
+@@ -1390,7 +1891,11 @@ int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+ 	}
+ 
+ 	if (pid == 0) {
++#ifdef HAVE_ISULAD
++		if (options->attach_flags & LXC_ATTACH_TERMINAL && terminal.tty_state) {
++#else
+ 		if (options->attach_flags & LXC_ATTACH_TERMINAL) {
++#endif
+ 			ret = pthread_sigmask(SIG_SETMASK,
+ 					      &terminal.tty_state->oldmask, NULL);
+ 			if (ret < 0) {
+@@ -1430,7 +1935,11 @@ int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+ 	_exit(EXIT_SUCCESS);
+ }
+ 
++#ifdef HAVE_ISULAD
++int lxc_attach_run_command(void *payload, int msg_fd)
++#else
+ int lxc_attach_run_command(void *payload)
++#endif
+ {
+ 	int ret = -1;
+ 	lxc_attach_command_t *cmd = payload;
+@@ -1446,11 +1955,19 @@ int lxc_attach_run_command(void *payload)
+ 			break;
+ 		}
+ 	}
++#ifdef HAVE_ISULAD
++	/* isulad: write error messages */
++	lxc_write_error_message(msg_fd, "exec: \"%s\": %s.", cmd->program, strerror(errno));
++#endif
+ 
+ 	return log_error_errno(ret, errno, "Failed to exec \"%s\"", cmd->program);
+ }
+ 
++#ifdef HAVE_ISULAD
++int lxc_attach_run_shell(void* payload, int msg_fd)
++#else
+ int lxc_attach_run_shell(void* payload)
++#endif
+ {
+ 	__do_free char *buf = NULL;
+ 	uid_t uid;
+diff --git a/src/lxc/lsm/nop.c b/src/lxc/lsm/nop.c
+index 5b345b9..188945d 100644
+--- a/src/lxc/lsm/nop.c
++++ b/src/lxc/lsm/nop.c
+@@ -24,11 +24,25 @@ static int nop_enabled(void)
+ 	return 0;
+ }
+ 
++#ifdef HAVE_ISULAD
++static int nop_file_label_set(const char *path, const char *label) {
++	return 0;
++}
++
++static int nop_relabel(const char *path, const char *label, bool shared) {
++	return 0;
++}
++#endif
++
+ static struct lsm_drv nop_drv = {
+ 	.name = "nop",
+ 	.enabled           = nop_enabled,
+ 	.process_label_get = nop_process_label_get,
+ 	.process_label_set = nop_process_label_set,
++#ifdef HAVE_ISULAD
++	.file_label_set    = nop_file_label_set,
++	.relabel           = nop_relabel,
++#endif
+ };
+ 
+ struct lsm_drv *lsm_nop_drv_init(void)
+diff --git a/src/lxc/seccomp.c b/src/lxc/seccomp.c
+index 7820db8..a6e6d42 100644
+--- a/src/lxc/seccomp.c
++++ b/src/lxc/seccomp.c
+@@ -351,8 +351,13 @@ int get_hostarch(void)
+ 	return lxc_seccomp_arch_unknown;
+ }
+ 
++#ifdef HAVE_ISULAD
++scmp_filter_ctx get_new_ctx(enum lxc_hostarch_t n_arch,
++			    uint32_t default_policy_action, uint32_t *architectures)
++#else
+ scmp_filter_ctx get_new_ctx(enum lxc_hostarch_t n_arch,
+ 			    uint32_t default_policy_action, bool *needs_merge)
++#endif
+ {
+ 	int ret;
+ 	uint32_t arch;
+@@ -476,9 +481,17 @@ scmp_filter_ctx get_new_ctx(enum lxc_hostarch_t n_arch,
+ 		}
+ 		TRACE("Removed native arch from main seccomp context");
+ 
++#ifdef HAVE_ISULAD
++		*architectures = arch;
++#else
+ 		*needs_merge = true;
++#endif
+ 	} else {
++#ifdef HAVE_ISULAD
++		*architectures = SCMP_ARCH_NATIVE;
++#else
+ 		*needs_merge = false;
++#endif
+ 		TRACE("Arch %d already present in main seccomp context", (int)n_arch);
+ 	}
+ 
+@@ -510,7 +523,11 @@ bool do_resolve_add_rule(uint32_t arch, char *line, scmp_filter_ctx ctx,
+ 		if (ret < 0) {
+ 			errno = -ret;
+ 			SYSERROR("Failed loading rule to reject force umount");
++#ifdef HAVE_ISULAD
++			return true;
++#else
+ 			return false;
++#endif
+ 		}
+ 
+ 		INFO("Set seccomp rule to reject force umounts");
+@@ -519,24 +536,42 @@ bool do_resolve_add_rule(uint32_t arch, char *line, scmp_filter_ctx ctx,
+ 
+ 	nr = seccomp_syscall_resolve_name(line);
+ 	if (nr == __NR_SCMP_ERROR) {
++#ifdef HAVE_ISULAD
++		DEBUG("Failed to resolve syscall \"%s\"", line);
++		DEBUG("This syscall will NOT be handled by seccomp");
++#else
+ 		WARN("Failed to resolve syscall \"%s\"", line);
+ 		WARN("This syscall will NOT be handled by seccomp");
++#endif
+ 		return true;
+ 	}
+ 
+ 	if (nr < 0) {
++#ifdef HAVE_ISULAD
++		DEBUG("Got negative return value %d for syscall \"%s\"", nr, line);
++		DEBUG("This syscall will NOT be handled by seccomp");
++#else
+ 		WARN("Got negative return value %d for syscall \"%s\"", nr, line);
+ 		WARN("This syscall will NOT be handled by seccomp");
++#endif
+ 		return true;
+ 	}
+ 
+ 	memset(&arg_cmp, 0, sizeof(arg_cmp));
+ 	for (i = 0; i < rule->args_num; i++) {
++#ifdef HAVE_ISULAD
++		DEBUG("arg_cmp[%d]: SCMP_CMP(%u, %llu, %llu, %llu)", i,
++		     rule->args_value[i].index,
++		     (long long unsigned int)rule->args_value[i].op,
++		     (long long unsigned int)rule->args_value[i].mask,
++		     (long long unsigned int)rule->args_value[i].value);
++#else
+ 		INFO("arg_cmp[%d]: SCMP_CMP(%u, %llu, %llu, %llu)", i,
+ 		     rule->args_value[i].index,
+ 		     (long long unsigned int)rule->args_value[i].op,
+ 		     (long long unsigned int)rule->args_value[i].mask,
+ 		     (long long unsigned int)rule->args_value[i].value);
++#endif
+ 
+ 		if (SCMP_CMP_MASKED_EQ == rule->args_value[i].op)
+ 			arg_cmp[i] = SCMP_CMP(rule->args_value[i].index,
+@@ -553,14 +588,43 @@ bool do_resolve_add_rule(uint32_t arch, char *line, scmp_filter_ctx ctx,
+ 					   rule->args_num, arg_cmp);
+ 	if (ret < 0) {
+ 		errno = -ret;
++#ifdef HAVE_ISULAD
++		DEBUG("Failed loading rule for %s (nr %d action %d (%s))",
++		      line, nr, rule->action, get_action_name(rule->action));
++		return true;
++#else
+ 		SYSERROR("Failed loading rule for %s (nr %d action %d (%s))",
+ 		         line, nr, rule->action, get_action_name(rule->action));
+ 		return false;
++#endif
+ 	}
+ 
+ 	return true;
+ }
+ 
++#ifdef HAVE_ISULAD
++#define SCMP_ARCH_INDEX_MAX 3
++
++struct scmp_ctx_info {
++	uint32_t architectures[SCMP_ARCH_INDEX_MAX];
++	enum lxc_hostarch_t lxc_arch[SCMP_ARCH_INDEX_MAX];
++	scmp_filter_ctx contexts[SCMP_ARCH_INDEX_MAX];
++	bool needs_merge[SCMP_ARCH_INDEX_MAX];
++};
++
++static int get_arch_index(enum lxc_hostarch_t arch, struct scmp_ctx_info *ctx)
++{
++	int i;
++
++	for (i = 0; i < SCMP_ARCH_INDEX_MAX; i++) {
++		if (ctx->lxc_arch[i] == arch)
++			return i;
++	}
++
++	return -1;
++}
++#endif
++
+ /*
+  * v2 consists of
+  * [x86]
+@@ -575,6 +639,494 @@ bool do_resolve_add_rule(uint32_t arch, char *line, scmp_filter_ctx ctx,
+  * write
+  * close
+  */
++#ifdef HAVE_ISULAD
++static int parse_config_v2(FILE *f, char *line, size_t *line_bufsz, struct lxc_conf *conf)
++{
++	int ret;
++	char *p;
++	enum lxc_hostarch_t cur_rule_arch, native_arch;
++	bool blacklist = false;
++	uint32_t default_policy_action = -1, default_rule_action = -1;
++	struct seccomp_v2_rule rule;
++	struct scmp_ctx_info ctx;
++
++	if (strncmp(line, "blacklist", 9) == 0)
++		blacklist = true;
++	else if (strncmp(line, "whitelist", 9) != 0) {
++		ERROR("Bad seccomp policy style \"%s\"", line);
++		return -1;
++	}
++
++	p = strchr(line, ' ');
++	if (p) {
++		default_policy_action = get_v2_default_action(p + 1);
++		if (default_policy_action == -2)
++			return -1;
++	}
++
++	/* for blacklist, allow any syscall which has no rule */
++	if (blacklist) {
++		if (default_policy_action == -1)
++			default_policy_action = SCMP_ACT_ALLOW;
++
++		if (default_rule_action == -1)
++			default_rule_action = SCMP_ACT_KILL;
++	} else {
++		if (default_policy_action == -1)
++			default_policy_action = SCMP_ACT_KILL;
++
++		if (default_rule_action == -1)
++			default_rule_action = SCMP_ACT_ALLOW;
++	}
++
++	memset(&ctx, 0, sizeof(ctx));
++	ctx.architectures[0] = SCMP_ARCH_NATIVE;
++	ctx.architectures[1] = SCMP_ARCH_NATIVE;
++	ctx.architectures[2] = SCMP_ARCH_NATIVE;
++	native_arch = get_hostarch();
++	cur_rule_arch = native_arch;
++	if (native_arch == lxc_seccomp_arch_amd64) {
++		cur_rule_arch = lxc_seccomp_arch_all;
++
++		ctx.lxc_arch[0] = lxc_seccomp_arch_i386;
++		ctx.contexts[0] = get_new_ctx(lxc_seccomp_arch_i386,
++					      default_policy_action, &ctx.architectures[0]);
++		if (!ctx.contexts[0])
++			goto bad;
++
++		ctx.lxc_arch[1] = lxc_seccomp_arch_x32;
++		ctx.contexts[1] = get_new_ctx(lxc_seccomp_arch_x32,
++					      default_policy_action, &ctx.architectures[1]);
++		if (!ctx.contexts[1])
++			goto bad;
++
++		ctx.lxc_arch[2] = lxc_seccomp_arch_amd64;
++		ctx.contexts[2] = get_new_ctx(lxc_seccomp_arch_amd64,
++					      default_policy_action, &ctx.architectures[2]);
++		if (!ctx.contexts[2])
++			goto bad;
++#ifdef SCMP_ARCH_PPC
++	} else if (native_arch == lxc_seccomp_arch_ppc64) {
++		cur_rule_arch = lxc_seccomp_arch_all;
++
++		ctx.lxc_arch[0] = lxc_seccomp_arch_ppc;
++		ctx.contexts[0] = get_new_ctx(lxc_seccomp_arch_ppc,
++					      default_policy_action, &ctx.architectures[0]);
++		if (!ctx.contexts[0])
++			goto bad;
++
++		ctx.lxc_arch[1] = lxc_seccomp_arch_ppc64;
++		ctx.contexts[1] = get_new_ctx(lxc_seccomp_arch_ppc64,
++					      default_policy_action, &ctx.architectures[1]);
++		if (!ctx.contexts[1])
++			goto bad;
++#endif
++#ifdef SCMP_ARCH_ARM
++	} else if (native_arch == lxc_seccomp_arch_arm64) {
++		cur_rule_arch = lxc_seccomp_arch_all;
++
++		ctx.lxc_arch[0] = lxc_seccomp_arch_arm;
++		ctx.contexts[0] = get_new_ctx(lxc_seccomp_arch_arm,
++					      default_policy_action, &ctx.architectures[0]);
++		if (!ctx.contexts[0])
++			goto bad;
++
++#ifdef SCMP_ARCH_AARCH64
++		ctx.lxc_arch[1] = lxc_seccomp_arch_arm64;
++		ctx.contexts[1] = get_new_ctx(lxc_seccomp_arch_arm64,
++					      default_policy_action, &ctx.architectures[1]);
++		if (!ctx.contexts[1])
++			goto bad;
++#endif
++#endif
++#ifdef SCMP_ARCH_MIPS
++	} else if (native_arch == lxc_seccomp_arch_mips64) {
++		cur_rule_arch = lxc_seccomp_arch_all;
++
++		ctx.lxc_arch[0] = lxc_seccomp_arch_mips;
++		ctx.contexts[0] = get_new_ctx(lxc_seccomp_arch_mips,
++					      default_policy_action, &ctx.architectures[0]);
++		if (!ctx.contexts[0])
++			goto bad;
++
++		ctx.lxc_arch[1] = lxc_seccomp_arch_mips64n32;
++		ctx.contexts[1] = get_new_ctx(lxc_seccomp_arch_mips64n32,
++					      default_policy_action, &ctx.architectures[1]);
++		if (!ctx.contexts[1])
++			goto bad;
++
++		ctx.lxc_arch[2] = lxc_seccomp_arch_mips64;
++		ctx.contexts[2] = get_new_ctx(lxc_seccomp_arch_mips64,
++					      default_policy_action, &ctx.architectures[2]);
++		if (!ctx.contexts[2])
++			goto bad;
++	} else if (native_arch == lxc_seccomp_arch_mipsel64) {
++		cur_rule_arch = lxc_seccomp_arch_all;
++		ctx.lxc_arch[0] = lxc_seccomp_arch_mipsel;
++		ctx.contexts[0] = get_new_ctx(lxc_seccomp_arch_mipsel,
++					      default_policy_action, &ctx.architectures[0]);
++		if (!ctx.contexts[0])
++			goto bad;
++
++		ctx.lxc_arch[1] = lxc_seccomp_arch_mipsel64n32;
++		ctx.contexts[1] = get_new_ctx(lxc_seccomp_arch_mipsel64n32,
++					      default_policy_action, &ctx.architectures[1]);
++		if (!ctx.contexts[1])
++			goto bad;
++
++		ctx.lxc_arch[2] = lxc_seccomp_arch_mipsel64;
++		ctx.contexts[2] = get_new_ctx(lxc_seccomp_arch_mipsel64,
++					      default_policy_action, &ctx.architectures[2]);
++		if (!ctx.contexts[2])
++			goto bad;
++#endif
++	}
++
++	if (default_policy_action != SCMP_ACT_KILL) {
++		ret = seccomp_reset(conf->seccomp.seccomp_ctx, default_policy_action);
++		if (ret != 0) {
++			ERROR("Error re-initializing Seccomp");
++			return -1;
++		}
++
++		ret = seccomp_attr_set(conf->seccomp.seccomp_ctx, SCMP_FLTATR_CTL_NNP, 0);
++		if (ret < 0) {
++			errno = -ret;
++			SYSERROR("Failed to turn off no-new-privs");
++			return -1;
++		}
++
++#ifdef SCMP_FLTATR_ATL_TSKIP
++		ret = seccomp_attr_set(conf->seccomp.seccomp_ctx, SCMP_FLTATR_ATL_TSKIP, 1);
++		if (ret < 0) {
++			errno = -ret;
++			SYSWARN("Failed to turn on seccomp nop-skip, continuing");
++		}
++#endif
++	}
++
++	while (getline(&line, line_bufsz, f) != -1) {
++		if (line[0] == '#')
++			continue;
++
++		if (line[0] == '\0')
++			continue;
++
++		remove_trailing_newlines(line);
++
++		DEBUG("Processing \"%s\"", line);
++
++		if (line[0] == '[') {
++			/* Read the architecture for next set of rules. */
++			if (strcmp(line, "[x86]") == 0 ||
++			    strcmp(line, "[X86]") == 0) {
++				if (native_arch != lxc_seccomp_arch_i386 &&
++				    native_arch != lxc_seccomp_arch_amd64) {
++					cur_rule_arch = lxc_seccomp_arch_unknown;
++					continue;
++				}
++
++				cur_rule_arch = lxc_seccomp_arch_i386;
++			} else if (strcmp(line, "[x32]") == 0 ||
++				   strcmp(line, "[X32]") == 0) {
++				if (native_arch != lxc_seccomp_arch_amd64) {
++					cur_rule_arch = lxc_seccomp_arch_unknown;
++					continue;
++				}
++
++				cur_rule_arch = lxc_seccomp_arch_x32;
++			} else if (strcmp(line, "[X86_64]") == 0 ||
++				   strcmp(line, "[x86_64]") == 0) {
++				if (native_arch != lxc_seccomp_arch_amd64) {
++					cur_rule_arch = lxc_seccomp_arch_unknown;
++					continue;
++				}
++
++				cur_rule_arch = lxc_seccomp_arch_amd64;
++			} else if (strcmp(line, "[all]") == 0 ||
++				   strcmp(line, "[ALL]") == 0) {
++				cur_rule_arch = lxc_seccomp_arch_all;
++			}
++#ifdef SCMP_ARCH_ARM
++			else if (strcmp(line, "[arm]") == 0 ||
++				 strcmp(line, "[ARM]") == 0) {
++				if (native_arch != lxc_seccomp_arch_arm &&
++				    native_arch != lxc_seccomp_arch_arm64) {
++					cur_rule_arch = lxc_seccomp_arch_unknown;
++					continue;
++				}
++
++				cur_rule_arch = lxc_seccomp_arch_arm;
++			}
++#endif
++#ifdef SCMP_ARCH_AARCH64
++			else if (strcmp(line, "[arm64]") == 0 ||
++				 strcmp(line, "[ARM64]") == 0) {
++				if (native_arch != lxc_seccomp_arch_arm64) {
++					cur_rule_arch = lxc_seccomp_arch_unknown;
++					continue;
++				}
++
++				cur_rule_arch = lxc_seccomp_arch_arm64;
++			}
++#endif
++#ifdef SCMP_ARCH_PPC64LE
++			else if (strcmp(line, "[ppc64le]") == 0 ||
++				 strcmp(line, "[PPC64LE]") == 0) {
++				if (native_arch != lxc_seccomp_arch_ppc64le) {
++					cur_rule_arch = lxc_seccomp_arch_unknown;
++					continue;
++				}
++
++				cur_rule_arch = lxc_seccomp_arch_ppc64le;
++			}
++#endif
++#ifdef SCMP_ARCH_PPC64
++			else if (strcmp(line, "[ppc64]") == 0 ||
++				 strcmp(line, "[PPC64]") == 0) {
++				if (native_arch != lxc_seccomp_arch_ppc64) {
++					cur_rule_arch = lxc_seccomp_arch_unknown;
++					continue;
++				}
++
++				cur_rule_arch = lxc_seccomp_arch_ppc64;
++			}
++#endif
++#ifdef SCMP_ARCH_PPC
++			else if (strcmp(line, "[ppc]") == 0 ||
++				 strcmp(line, "[PPC]") == 0) {
++				if (native_arch != lxc_seccomp_arch_ppc &&
++				    native_arch != lxc_seccomp_arch_ppc64) {
++					cur_rule_arch = lxc_seccomp_arch_unknown;
++					continue;
++				}
++
++				cur_rule_arch = lxc_seccomp_arch_ppc;
++			}
++#endif
++#ifdef SCMP_ARCH_MIPS
++			else if (strcmp(line, "[mips64]") == 0 ||
++				 strcmp(line, "[MIPS64]") == 0) {
++				if (native_arch != lxc_seccomp_arch_mips64) {
++					cur_rule_arch = lxc_seccomp_arch_unknown;
++					continue;
++				}
++
++				cur_rule_arch = lxc_seccomp_arch_mips64;
++			} else if (strcmp(line, "[mips64n32]") == 0 ||
++				   strcmp(line, "[MIPS64N32]") == 0) {
++				if (native_arch != lxc_seccomp_arch_mips64) {
++					cur_rule_arch = lxc_seccomp_arch_unknown;
++					continue;
++				}
++
++				cur_rule_arch = lxc_seccomp_arch_mips64n32;
++			} else if (strcmp(line, "[mips]") == 0 ||
++				   strcmp(line, "[MIPS]") == 0) {
++				if (native_arch != lxc_seccomp_arch_mips &&
++				    native_arch != lxc_seccomp_arch_mips64) {
++					cur_rule_arch = lxc_seccomp_arch_unknown;
++					continue;
++				}
++
++				cur_rule_arch = lxc_seccomp_arch_mips;
++			} else if (strcmp(line, "[mipsel64]") == 0 ||
++				   strcmp(line, "[MIPSEL64]") == 0) {
++				if (native_arch != lxc_seccomp_arch_mipsel64) {
++					cur_rule_arch = lxc_seccomp_arch_unknown;
++					continue;
++				}
++
++				cur_rule_arch = lxc_seccomp_arch_mipsel64;
++			} else if (strcmp(line, "[mipsel64n32]") == 0 ||
++				   strcmp(line, "[MIPSEL64N32]") == 0) {
++				if (native_arch != lxc_seccomp_arch_mipsel64) {
++					cur_rule_arch = lxc_seccomp_arch_unknown;
++					continue;
++				}
++
++				cur_rule_arch = lxc_seccomp_arch_mipsel64n32;
++			} else if (strcmp(line, "[mipsel]") == 0 ||
++				   strcmp(line, "[MIPSEL]") == 0) {
++				if (native_arch != lxc_seccomp_arch_mipsel &&
++				    native_arch != lxc_seccomp_arch_mipsel64) {
++					cur_rule_arch = lxc_seccomp_arch_unknown;
++					continue;
++				}
++
++				cur_rule_arch = lxc_seccomp_arch_mipsel;
++			}
++#endif
++#ifdef SCMP_ARCH_S390X
++			else if (strcmp(line, "[s390x]") == 0 ||
++				 strcmp(line, "[S390X]") == 0) {
++				if (native_arch != lxc_seccomp_arch_s390x) {
++					cur_rule_arch = lxc_seccomp_arch_unknown;
++					continue;
++				}
++
++				cur_rule_arch = lxc_seccomp_arch_s390x;
++			}
++#endif
++			else {
++				goto bad_arch;
++			}
++
++			continue;
++		}
++
++		/* irrelevant arch - i.e. arm on i386 */
++		if (cur_rule_arch == lxc_seccomp_arch_unknown)
++			continue;
++
++		memset(&rule, 0, sizeof(rule));
++		/* read optional action which follows the syscall */
++		ret = parse_v2_rules(line, default_rule_action, &rule);
++		if (ret != 0) {
++			ERROR("Failed to interpret seccomp rule");
++			goto bad_rule;
++		}
++
++		if (cur_rule_arch == native_arch) {
++			/* add for native arch */
++			if (!do_resolve_add_rule(SCMP_ARCH_NATIVE, line,
++						 conf->seccomp.seccomp_ctx, &rule))
++				goto bad_rule;
++
++			DEBUG("Added native rule for arch %d for %s action %d(%s)",
++			     SCMP_ARCH_NATIVE, line, rule.action,
++			     get_action_name(rule.action));
++		} else if (cur_rule_arch != lxc_seccomp_arch_all) {
++			/* add for compat specified arch */
++			int arch_index = get_arch_index(cur_rule_arch, &ctx);
++			if (arch_index < 0)
++				goto bad_arch;
++
++			if (!do_resolve_add_rule(ctx.architectures[arch_index], line,
++						 ctx.contexts[arch_index], &rule))
++				goto bad_rule;
++
++			DEBUG("Added compat rule for arch %d for %s action %d(%s)",
++			     ctx.architectures[arch_index], line, rule.action,
++			     get_action_name(rule.action));
++			ctx.needs_merge[arch_index] = true;
++		} else {
++			/* add for all compat archs */
++			if (!do_resolve_add_rule(SCMP_ARCH_NATIVE, line,
++						 conf->seccomp.seccomp_ctx, &rule))
++				goto bad_rule;
++
++			DEBUG("Added native rule for arch %d for %s action %d(%s)",
++			     SCMP_ARCH_NATIVE, line, rule.action,
++			     get_action_name(rule.action));
++
++			if (ctx.architectures[0] != SCMP_ARCH_NATIVE) {
++				if (!do_resolve_add_rule(ctx.architectures[0], line,
++							 ctx.contexts[0], &rule))
++					goto bad_rule;
++
++				DEBUG("Added compat rule for arch %d for %s action %d(%s)",
++				     ctx.architectures[0], line, rule.action,
++				     get_action_name(rule.action));
++				ctx.needs_merge[0] = true;
++			}
++
++			if (ctx.architectures[1] != SCMP_ARCH_NATIVE) {
++				if (!do_resolve_add_rule(ctx.architectures[1], line,
++							 ctx.contexts[1], &rule))
++					goto bad_rule;
++
++				DEBUG("Added compat rule for arch %d for %s action %d(%s)",
++				     ctx.architectures[1], line, rule.action,
++				     get_action_name(rule.action));
++				ctx.needs_merge[1] = true;
++			}
++
++			if (ctx.architectures[2] != SCMP_ARCH_NATIVE) {
++				if (!do_resolve_add_rule(ctx.architectures[2], line,
++							ctx.contexts[2], &rule))
++					goto bad_rule;
++
++				DEBUG("Added native rule for arch %d for %s action %d(%s)",
++				     ctx.architectures[2], line, rule.action,
++				     get_action_name(rule.action));
++				ctx.needs_merge[2] = true;
++			}
++		}
++
++	}
++
++	INFO("Merging compat seccomp contexts into main context");
++	if (ctx.contexts[0]) {
++		if (ctx.needs_merge[0]) {
++			ret = seccomp_merge(conf->seccomp.seccomp_ctx, ctx.contexts[0]);
++			if (ret < 0) {
++				ERROR("%s - Failed to merge first compat seccomp "
++				      "context into main context", strerror(-ret));
++				goto bad;
++			}
++
++			TRACE("Merged first compat seccomp context into main context");
++		} else {
++			seccomp_release(ctx.contexts[0]);
++			ctx.contexts[0] = NULL;
++		}
++	}
++
++	if (ctx.contexts[1]) {
++		if (ctx.needs_merge[1]) {
++			ret = seccomp_merge(conf->seccomp.seccomp_ctx, ctx.contexts[1]);
++			if (ret < 0) {
++				ERROR("%s - Failed to merge second compat seccomp "
++				      "context into main context", strerror(-ret));
++				goto bad;
++			}
++
++			TRACE("Merged second compat seccomp context into main context");
++		} else {
++			seccomp_release(ctx.contexts[1]);
++			ctx.contexts[1] = NULL;
++		}
++	}
++
++	if (ctx.contexts[2]) {
++		if (ctx.needs_merge[2]) {
++			ret = seccomp_merge(conf->seccomp.seccomp_ctx, ctx.contexts[2]);
++			if (ret < 0) {
++				ERROR("%s - Failed to merge third compat seccomp "
++				      "context into main context", strerror(-ret));
++				goto bad;
++			}
++
++			TRACE("Merged third compat seccomp context into main context");
++		} else {
++			seccomp_release(ctx.contexts[2]);
++			ctx.contexts[2] = NULL;
++		}
++	}
++
++	free(line);
++	return 0;
++
++bad_arch:
++	ERROR("Unsupported architecture \"%s\"", line);
++
++bad_rule:
++bad:
++	if (ctx.contexts[0])
++		seccomp_release(ctx.contexts[0]);
++
++	if (ctx.contexts[1])
++		seccomp_release(ctx.contexts[1]);
++
++	if (ctx.contexts[2])
++		seccomp_release(ctx.contexts[2]);
++
++	free(line);
++
++	return -1;
++}
++#else
+ static int parse_config_v2(FILE *f, char *line, size_t *line_bufsz, struct lxc_conf *conf)
+ {
+ 	int ret;
+@@ -1067,6 +1619,7 @@ bad:
+ 
+ 	return -1;
+ }
++#endif
+ #else /* HAVE_DECL_SECCOMP_SYSCALL_RESOLVE_NAME_ARCH */
+ static int parse_config_v2(FILE *f, char *line, struct lxc_conf *conf)
+ {
+@@ -1288,6 +1841,7 @@ void lxc_seccomp_free(struct lxc_seccomp *seccomp)
+ 	seccomp_notify_free(seccomp->notifier.req_buf, seccomp->notifier.rsp_buf);
+ 	seccomp->notifier.req_buf = NULL;
+ 	seccomp->notifier.rsp_buf = NULL;
++	free_disarm(seccomp->notifier.cookie);
+ #endif
+ }
+ 
+@@ -1498,6 +2052,7 @@ void seccomp_conf_init(struct lxc_conf *conf)
+ 	       sizeof(conf->seccomp.notifier.proxy_addr));
+ 	conf->seccomp.notifier.req_buf = NULL;
+ 	conf->seccomp.notifier.rsp_buf = NULL;
++	conf->seccomp.notifier.cookie = NULL;
+ #endif
+ }
+ 
+diff --git a/src/lxc/storage/zfs.c b/src/lxc/storage/zfs.c
+index ee9e32d..903937a 100644
+--- a/src/lxc/storage/zfs.c
++++ b/src/lxc/storage/zfs.c
+@@ -167,13 +167,22 @@ int zfs_mount(struct lxc_storage *bdev)
+ 	const char *src;
+ 	char cmd_output[PATH_MAX] = {0};
+ 
++#ifdef HAVE_ISULAD
++	unsigned long pflags = 0;
++#endif
++
+ 	if (strcmp(bdev->type, "zfs"))
+ 		return -22;
+ 
+ 	if (!bdev->src || !bdev->dest)
+ 		return -22;
+ 
++#ifdef HAVE_ISULAD
++	ret = parse_mntopts(bdev->mntopts, &mntflags, &pflags, &mntdata);
++#else
+ 	ret = parse_mntopts(bdev->mntopts, &mntflags, &mntdata);
++#endif
++
+ 	if (ret < 0) {
+ 		ERROR("Failed to parse mount options");
+ 		return -22;
+-- 
+2.25.1
+

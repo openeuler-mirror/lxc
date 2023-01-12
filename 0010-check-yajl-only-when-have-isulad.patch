@@ -1,0 +1,70 @@
+From d4cb8f6a8f46a3f5d72f22d7f79df83ad82215e0 Mon Sep 17 00:00:00 2001
+From: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+Date: Mon, 25 Jul 2022 16:42:03 +0800
+Subject: [PATCH] check yajl only when have isulad
+
+Signed-off-by: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+---
+ configure.ac        | 6 +++---
+ src/lxc/Makefile.am | 7 +++++--
+ src/lxc/af_unix.c   | 2 +-
+ 3 files changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/configure.ac b/configure.ac
+index ce8854e..2180586 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -120,9 +120,6 @@ AM_CONDITIONAL([DISTRO_UBUNTU], [test "x$with_distro" = "xubuntu"])
+ 
+ AC_CONFIG_LINKS([config/etc/default.conf:config/etc/${distroconf}])
+ 
+-# Check yajl
+-PKG_CHECK_MODULES([YAJL], [yajl >= 2],[],[AC_MSG_ERROR([You must install yajl >= 2])])
+-
+ # Check for init system type
+ AC_MSG_CHECKING([for init system type])
+ AC_ARG_WITH([init-script],
+@@ -839,6 +836,9 @@ AM_CONDITIONAL([HAVE_ISULAD], [test "x$adapt_isulad" = "xyes"])
+ if test "x$adapt_isulad" = "xyes"; then
+ 	AC_DEFINE([HAVE_ISULAD], 1, [adapt to iSulad])
+ 	AC_MSG_RESULT([yes])
++
++	# Check yajl
++	PKG_CHECK_MODULES([YAJL], [yajl >= 2],[],[AC_MSG_ERROR([You must install yajl >= 2])])
+ else
+ 	AC_MSG_RESULT([no])
+ fi
+diff --git a/src/lxc/Makefile.am b/src/lxc/Makefile.am
+index b9a8750..61a229f 100644
+--- a/src/lxc/Makefile.am
++++ b/src/lxc/Makefile.am
+@@ -360,8 +360,11 @@ LDADD = liblxc.la \
+ 	@OPENSSL_LIBS@ \
+ 	@SECCOMP_LIBS@ \
+ 	@SELINUX_LIBS@ \
+-	@DLOG_LIBS@ \
+-	@YAJL_LIBS@
++	@DLOG_LIBS@
++
++if HAVE_ISULAD
++	LDADD += @YAJL_LIBS@
++endif
+ 
+ if ENABLE_TOOLS
+ lxc_attach_SOURCES = tools/lxc_attach.c \
+diff --git a/src/lxc/af_unix.c b/src/lxc/af_unix.c
+index cb4233e..0be9368 100644
+--- a/src/lxc/af_unix.c
++++ b/src/lxc/af_unix.c
+@@ -382,7 +382,7 @@ int lxc_unix_connect_type(struct sockaddr_un *addr, int type)
+ 		      offsetof(struct sockaddr_un, sun_path) + len);
+ 	if (ret < 0)
+ #ifdef HAVE_ISULAD
+-		return log_error_errno(-1, errno,
++		return log_warn_errno(-1, errno,
+ 				       "Failed to connect new AF_UNIX socket");
+ #else
+ 		return log_error_errno(-1, errno,
+-- 
+2.25.1
+

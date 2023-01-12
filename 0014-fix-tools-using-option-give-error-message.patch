@@ -1,0 +1,25 @@
+From cce266a71a8998e17abada2a7e716298c2169208 Mon Sep 17 00:00:00 2001
+From: Neil.wrz<wangrunze13@huawei.com>
+Date: Thu, 1 Sep 2022 05:04:56 -0700
+Subject: [PATCH] fix tools using '-?' option give error message
+
+Signed-off-by: Neil.wrz<wangrunze13@huawei.com> 
+---
+ src/lxc/tools/arguments.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/lxc/tools/arguments.h b/src/lxc/tools/arguments.h
+index c16d99f..80c2083 100644
+--- a/src/lxc/tools/arguments.h
++++ b/src/lxc/tools/arguments.h
+@@ -145,6 +145,7 @@ struct lxc_arguments {
+ #define LXC_COMMON_OPTIONS                                                     \
+ 	    { "name",        required_argument, 0, 'n'         },              \
+ 	    { "help",        no_argument,       0, 'h'         },              \
++	    { "help",        no_argument,       0, '?'         },              \
+ 	    { "usage",       no_argument,       0, OPT_USAGE   },              \
+ 	    { "version",     no_argument,       0, OPT_VERSION },              \
+ 	    { "quiet",       no_argument,       0, 'q'         },              \
+-- 
+2.25.1
+

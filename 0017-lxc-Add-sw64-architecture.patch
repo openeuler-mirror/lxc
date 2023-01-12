@@ -1,0 +1,26 @@
+From 10ce28085f6d425aae21e043a45c6ef02fdd1e44 Mon Sep 17 00:00:00 2001
+From: rpm-build <rpm-build>
+Date: Mon, 24 Oct 2022 11:03:11 +0800
+Subject: [PATCH] Add sw64 architecture
+
+Signed-off-by: rpm-build <rpm-build>
+---
+ src/lxc/syscall_numbers.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/lxc/syscall_numbers.h b/src/lxc/syscall_numbers.h
+index bfd0e57..803eab7 100644
+--- a/src/lxc/syscall_numbers.h
++++ b/src/lxc/syscall_numbers.h
+@@ -377,6 +377,8 @@
+ #ifndef __NR_pidfd_send_signal
+ 	#if defined __alpha__
+ 		#define __NR_pidfd_send_signal 534
++	#elif defined __sw_64__
++		#define __NR_pidfd_send_signal 271
+ 	#elif defined _MIPS_SIM
+ 		#if _MIPS_SIM == _MIPS_SIM_ABI32	/* o32 */
+ 			#define __NR_pidfd_send_signal 4424
+-- 
+2.33.0
+

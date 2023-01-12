@@ -1,0 +1,178 @@
+From 90512fd67873600a490d2432e6c9429771f719be Mon Sep 17 00:00:00 2001
+From: isuladci <isulad@ci.com>
+Date: Fri, 2 Dec 2022 18:52:39 +0800
+Subject: [PATCH] add lxc-attach add-gids option
+
+Signed-off-by: isuladci <isulad@ci.com>
+---
+ src/lxc/attach.c           | 13 ++++++--
+ src/lxc/attach_options.h   |  2 ++
+ src/lxc/tools/arguments.h  |  3 ++
+ src/lxc/tools/lxc_attach.c | 65 ++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 80 insertions(+), 3 deletions(-)
+
+diff --git a/src/lxc/attach.c b/src/lxc/attach.c
+index 8a2c52a..24d020d 100644
+--- a/src/lxc/attach.c
++++ b/src/lxc/attach.c
+@@ -1019,9 +1019,16 @@ static int attach_child_main(struct attach_clone_payload *payload)
+ 		goto on_error;
+ 	}
+ 
+-	if (!lxc_setgroups(init_ctx->container->lxc_conf->init_groups_len,
+-			init_ctx->container->lxc_conf->init_groups))
+-		goto on_error;
++	if (options->add_gids != NULL && options->add_gids_len != 0) {
++		if (!lxc_setgroups(options->add_gids_len, options->add_gids)) {
++			goto on_error;
++		}
++	} else {
++		if (!lxc_setgroups(init_ctx->container->lxc_conf->init_groups_len,
++				init_ctx->container->lxc_conf->init_groups)) {
++			goto on_error;
++		}
++	}
+ #endif
+ 
+ 	/* Make sure that the processes STDIO is correctly owned by the user that we are switching to */
+diff --git a/src/lxc/attach_options.h b/src/lxc/attach_options.h
+index 16b4e21..4591d65 100644
+--- a/src/lxc/attach_options.h
++++ b/src/lxc/attach_options.h
+@@ -124,6 +124,8 @@ typedef struct lxc_attach_options_t {
+ 	const char *suffix;
+ 	bool disable_pty;
+ 	bool open_stdin;
++	gid_t *add_gids; /* attach user additional gids */
++	size_t add_gids_len;
+ #endif
+ } lxc_attach_options_t;
+ 
+diff --git a/src/lxc/tools/arguments.h b/src/lxc/tools/arguments.h
+index 80c2083..583390a 100644
+--- a/src/lxc/tools/arguments.h
++++ b/src/lxc/tools/arguments.h
+@@ -50,6 +50,8 @@ struct lxc_arguments {
+ 	int open_stdin;
+ 	unsigned int start_timeout; /* isulad: Seconds for waiting on a container to start before it is killed*/
+ 	int64_t attach_timeout; /* for lxc-attach */
++	gid_t *add_gids;
++	size_t add_gids_len;
+ #endif
+ 
+ 	/* for lxc-console */
+@@ -175,6 +177,7 @@ struct lxc_arguments {
+ #define OPT_OPEN_STDIN OPT_USAGE - 14
+ #define OPT_ATTACH_TIMEOUT OPT_USAGE - 15
+ #define OPT_ATTACH_SUFFIX OPT_USAGE - 16
++#define OPT_ADDITIONAL_GIDS OPT_USAGE - 17
+ #endif
+ 
+ extern int lxc_arguments_parse(struct lxc_arguments *args, int argc,
+diff --git a/src/lxc/tools/lxc_attach.c b/src/lxc/tools/lxc_attach.c
+index 1a5a241..f6ddf2d 100644
+--- a/src/lxc/tools/lxc_attach.c
++++ b/src/lxc/tools/lxc_attach.c
+@@ -78,6 +78,7 @@ static const struct option my_longopts[] = {
+ #else
+ 	{"workdir", required_argument, 0, 'w'},
+ 	{"user", required_argument, 0, 'u'},
++	{"add-gids", required_argument, 0, OPT_ADDITIONAL_GIDS},
+ 	{"in-fifo", required_argument, 0, OPT_INPUT_FIFO}, /* isulad add terminal fifos*/
+ 	{"out-fifo", required_argument, 0, OPT_OUTPUT_FIFO},
+ 	{"err-fifo", required_argument, 0, OPT_STDERR_FIFO},
+@@ -146,6 +147,7 @@ Options :\n\
+ "\
+   -w, --workdir     Working directory inside the container.\n\
+   -u, --user        User ID (format: UID[:GID])\n\
++      --add-gids    Additional gids (format: GID[,GID])\n\
+       --in-fifo     Stdin fifo path\n\
+       --out-fifo    Stdout fifo path\n\
+       --err-fifo    Stderr fifo path\n\
+@@ -228,6 +230,58 @@ static int get_attach_uid_gid(const char *username, uid_t *user_id, gid_t *group
+ 	free(tmp);
+ 	return 0;
+ }
++
++static int get_attach_add_gids(const char *add_gids, gid_t **gids, size_t *gids_len)
++{
++	long long int readvalue;
++	size_t i, len;
++	const size_t max_gids = 100;
++	gid_t *g = NULL;
++	__do_free_string_list char **gids_str = NULL;
++
++	if (add_gids == NULL || strlen(add_gids) == 0) {
++		ERROR("None additional gids");
++		return -1;
++	}
++
++	gids_str = lxc_string_split(add_gids, ',');
++	if (gids_str == NULL) {
++		ERROR("Failed to split additional gids");
++		return -1;
++	}
++
++	len = lxc_array_len((void **)gids_str);
++	if (len > max_gids) {
++		ERROR("Too many gids");
++		return -1;
++	}
++
++	g = calloc(len, sizeof(gid_t));
++	if (g == NULL) {
++		ERROR("Out of memory");
++		return -1;
++	}
++
++	for (i = 0; i < len; i++) {
++		if (lxc_safe_long_long(gids_str[i], &readvalue) != 0) {
++			SYSERROR("Invalid gid value %s", gids_str[i]);
++			goto err_out;
++		}
++		if (readvalue < 0) {
++			ERROR("Invalid gid value: %lld", readvalue);
++			goto err_out;
++		}
++		g[i] = (unsigned int)readvalue;
++	}
++
++	*gids = g;
++	*gids_len = len;
++	return 0;
++
++err_out:
++	free(g);
++	return -1;
++}
+ #endif
+ 
+ static int my_parser(struct lxc_arguments *args, int c, char *arg)
+@@ -331,6 +385,12 @@ static int my_parser(struct lxc_arguments *args, int c, char *arg)
+ 	case OPT_OPEN_STDIN:
+ 		args->open_stdin = 1;
+ 		break;
++	case OPT_ADDITIONAL_GIDS:
++		if (get_attach_add_gids(arg, &args->add_gids, &args->add_gids_len) != 0) {
++			ERROR("Failed to get attach additional gids");
++			return -1;
++		}
++		break;
+ #endif
+ 	}
+ 
+@@ -655,6 +715,11 @@ int main(int argc, char *argv[])
+ 		attach_options.initial_cwd = my_args.workdir;
+ 	}
+ 
++	if (my_args.add_gids) {
++		attach_options.add_gids = my_args.add_gids;
++		attach_options.add_gids_len = my_args.add_gids_len;
++	}
++
+ 	/* isulad: add do attach background */
+ 	if (attach_options.attach_flags & LXC_ATTACH_TERMINAL)
+ 		wexit = do_attach_foreground(c, &command, &attach_options, &errmsg);
+-- 
+2.25.1
+

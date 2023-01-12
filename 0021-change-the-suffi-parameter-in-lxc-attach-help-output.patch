@@ -1,0 +1,26 @@
+From 026fea0b424c20c867be1577f5d98bc7bf97ba5a Mon Sep 17 00:00:00 2001
+From: isuladci <isulad@ci.com>
+Date: Fri, 16 Dec 2022 19:17:11 +0800
+Subject: [PATCH] change the --suffi parameter in lxc-attach --help output
+
+Signed-off-by: isuladci <isulad@ci.com>
+---
+ src/lxc/tools/lxc_attach.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/lxc/tools/lxc_attach.c b/src/lxc/tools/lxc_attach.c
+index f6ddf2d..fc0529a 100644
+--- a/src/lxc/tools/lxc_attach.c
++++ b/src/lxc/tools/lxc_attach.c
+@@ -151,7 +151,7 @@ Options :\n\
+       --in-fifo     Stdin fifo path\n\
+       --out-fifo    Stdout fifo path\n\
+       --err-fifo    Stderr fifo path\n\
+-      --suffi       ID for mutli-attach on one container\n\
++      --suffix      ID for mutli-attach on one container\n\
+       --timeout     Timeout in seconds (default: 0)\n\
+       --disable-pty Disable pty for attach\n\
+       --open-stdin  Open stdin for attach\n\
+-- 
+2.25.1
+
