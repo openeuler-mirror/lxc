@@ -1,4 +1,4 @@
-%global _release 2022102407
+%global _release 2022102408
 
 Name:           lxc
 Version:        4.0.3
@@ -68,6 +68,9 @@ BuildRequires:  systemd-units git libtool graphviz docbook2X doxygen chrpath
 BuildRequires:  pkgconfig(libseccomp)
 BuildRequires:  libcap libcap-devel libselinux-devel yajl yajl-devel
 BuildRequires:  pkgconfig(bash-completion)
+%ifarch riscv64
+BuildRequires:  libatomic_ops
+%endif
 
 Requires:       lxc-libs = 4.0.3-%{release}
 
@@ -120,6 +123,9 @@ This package contains documentation for lxc for creating containers.
 %autosetup -n lxc-4.0.3 -Sgit -p1
 
 %build
+%ifarch riscv64
+export LDFLAGS="-pthread"
+%endif
 %configure --enable-doc --enable-api-docs \
            --disable-silent-rules --docdir=%{_pkgdocdir} --disable-rpath \
            --disable-static --disable-apparmor --enable-selinux \
@@ -243,6 +249,9 @@ make check
 %endif
 
 %changelog
+* Mon Jan 16 2023 misaka00251 <liuxin@iscas.ac.cn> - 4.0.3-2022102408
+- Merge upstream & Fix RISC-V build errors
+
 * Wed Jan 04 2023 zhongtao<zhongtao17@huawei.com> - 4.0.3-2022102407
 - Type:bugfix
 - ID:NA
