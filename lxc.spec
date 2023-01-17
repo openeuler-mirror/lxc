@@ -1,4 +1,4 @@
-%global _release 2022102408
+%global _release 2022102409
 
 Name:           lxc
 Version:        4.0.3
@@ -63,6 +63,8 @@ Patch0052:	0052-add-lxc-attach-add-gids-option.patch
 Patch0053:	0053-change-the-suffi-parameter-in-lxc-attach-help-output.patch
 Patch0054:	0054-rollback-strprint-code-modified.patch
 Patch0055:	0055-add-sscanf-adapation-code-for-musl.patch
+
+Patch1000:  1000-add-riscv-support.patch
 
 BuildRequires:  systemd-units git libtool graphviz docbook2X doxygen chrpath
 BuildRequires:  pkgconfig(libseccomp)
@@ -249,6 +251,9 @@ make check
 %endif
 
 %changelog
+* Tue Jan 17 2023 misaka00251 <liuxin@iscas.ac.cn> - 4.0.3-2022102409
+- Add patch to fix RISC-V build errors
+
 * Mon Jan 16 2023 misaka00251 <liuxin@iscas.ac.cn> - 4.0.3-2022102408
 - Merge upstream & Fix RISC-V build errors
 
