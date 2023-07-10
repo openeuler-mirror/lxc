@@ -1,4 +1,4 @@
-%global _release 2022102420
+%global _release 2022102421
 
 Name:           lxc
 Version:        4.0.3
@@ -41,6 +41,7 @@ Patch0030:	0030-remove-unused-meminfo-stats.patch
 Patch0031:	0031-lxc-attach-Fix-lost-return-codes-of-spawned-processe.patch
 Patch0032:	0032-fix-load-bpf-failed.patch
 Patch0033:	0033-fix-mount-device-path-incorrect.patch
+Patch0034:	0034-add-secure-compile-macro.patch
 
 BuildRequires:  systemd-units git libtool graphviz docbook2X doxygen chrpath
 BuildRequires:  pkgconfig(libseccomp)
@@ -227,6 +228,12 @@ rm -rf %{buildroot}%{_sysconfdir}/default/%{name}
 %endif
 
 %changelog
+* Mon Jul 10 2023 mzzhou<1362843687@qq.com> - 4.0.3-2022102421
+- Type:enhancement
+- ID:NA
+- SUG:NA
+- DESC: add secure compile macro
+
 * Fri Jun 16 2023 zhangxiaoyu<zhangxiaoyu58@huawei.com> - 4.0.3-2022102420
 - Type:bugfix
 - ID:NA
