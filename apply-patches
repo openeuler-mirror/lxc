@@ -27,6 +27,12 @@ tar -xzvf $dir_name.tar.gz
 cwd=$PWD
 cd $cwd/$dir_name
 
+git init .
+git add .
+git config --local user.name "isuladci"
+git config --local user.email "isulad@ci.com"
+git commit -m "init repo for lxc-$dir_name"
+
 grep -E "Patch[0-9]{4}:\s*[0-9]{4}-.*\.patch" $cwd/lxc.spec | awk '{print $2}' | while read line
 do
     if [[ $line == '' || $line =~ ^\s*# ]]; then
@@ -36,11 +42,9 @@ do
     patch -p1 -F1 -s < $cwd/$line
 done
 
-git init .
 git add .
-git config --local user.name "isuladci"
-git config --local user.email "isulad@ci.com"
-git commit -m "init repo"
+git commit -m "change for iSulad"
+
 git config --local --unset user.name
 git config --local --unset user.email
 
