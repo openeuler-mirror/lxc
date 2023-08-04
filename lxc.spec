@@ -1,4 +1,4 @@
-%global _release 1
+%global _release 2
 
 Name:           lxc
 Version:        5.0.2
@@ -9,6 +9,10 @@ URL:            https://github.com/lxc/lxc
 Source0:        https://linuxcontainers.org/downloads/lxc/lxc-5.0.2.tar.gz
 
 Patch0001:	0001-iSulad-add-json-files-and-adapt-to-meson.patch
+Patch0002:	0002-iSulad-adapt-security-conf-attach-cgroup-and-start.patch
+Patch0003:	0003-iSulad-adapt-conf-network-storage-and-termianl.patch
+Patch0004:	0004-iSulad-adapt-confile-lxccontainer-and-start.patch
+Patch0005:	0005-fix-compile-error.patch
 
 BuildRequires:  systemd-units git libtool graphviz docbook2X doxygen chrpath
 BuildRequires:  pkgconfig(libseccomp)
@@ -72,7 +76,7 @@ This package contains documentation for lxc for creating containers.
 %ifarch riscv64
 export LDFLAGS="%{build_ldflags} -latomic -pthread"
 %endif
-meson setup -Disulad=false -Dtests=true -Dprefix=/usr build
+meson setup -Disulad=true -Dtests=true -Dprefix=/usr build
 meson compile -C build
 
 %install
@@ -148,7 +152,6 @@ meson test -C build
 %{_sbindir}/init.%{name}
 %{_sharedstatedir}/%{name}
 %dir %{_sysconfdir}/%{name}
-%config(noreplace) %{_sysconfdir}/%{name}/default.conf
 %config(noreplace) %{_sysconfdir}/lxc/*
 %config(noreplace) %{_sysconfdir}/sysconfig/*
 
@@ -166,7 +169,6 @@ meson test -C build
 %{_includedir}/%{name}/*
 %{_libdir}/pkgconfig/%{name}.pc
 %dir %{_datadir}/%{name}
-%{_datadir}/%{name}/hooks
 %{_datadir}/%{name}/lxc-patch.py*
 %{_datadir}/%{name}/selinux
 %dir %{_datadir}/%{name}/templates
@@ -191,6 +193,12 @@ meson test -C build
 %endif
 
 %changelog
+* Tue Aug 01 2023 zhangxiaoyu<zhangxiaoyu58@huawei.com> - 5.0.2-2
+- Type:enhancement
+- ID:NA
+- SUG:NA
+- DESC: add isulad code and fix compile error
+
 * Thu Jul 13 2023 haozi007<liuhao27@huawei.com> - 5.0.2-1
 - Type:enhancement
 - ID:NA

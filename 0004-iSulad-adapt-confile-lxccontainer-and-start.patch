@@ -1,0 +1,3310 @@
+From 3e7fb35a35cff34be2bb7ace0b239d540fe0657f Mon Sep 17 00:00:00 2001
+From: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+Date: Wed, 26 Jul 2023 14:57:33 +0800
+Subject: [PATCH] [iSulad] adapt confile lxccontainer and start
+
+Signed-off-by: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+---
+ src/lxc/conf.c         |  11 -
+ src/lxc/conf.h         |   4 -
+ src/lxc/confile.c      | 558 +++++++++++++++++++++++++
+ src/lxc/lxccontainer.c | 899 +++++++++++++++++++++++++++++++++++++++-
+ src/lxc/lxccontainer.h | 197 +++++++++
+ src/lxc/start.c        | 902 +++++++++++++++++++++++++++++++++++++++++
+ src/lxc/start.h        |  18 +
+ 7 files changed, 2573 insertions(+), 16 deletions(-)
+
+diff --git a/src/lxc/conf.c b/src/lxc/conf.c
+index a0e0375..187e60e 100644
+--- a/src/lxc/conf.c
++++ b/src/lxc/conf.c
+@@ -5242,7 +5242,6 @@ void lxc_conf_free(struct lxc_conf *conf)
+ 	}
+ 	free(conf->systemd);
+ 	lxc_clear_init_args(conf);
+-	lxc_clear_init_groups(conf);
+ 	lxc_clear_populate_devices(conf);
+ 	lxc_clear_rootfs_masked_paths(conf);
+ 	lxc_clear_rootfs_ro_paths(conf);
+@@ -7427,16 +7426,6 @@ int lxc_clear_init_args(struct lxc_conf *lxc_conf)
+ 	return 0;
+ }
+ 
+-/*isulad clear init groups*/
+-int lxc_clear_init_groups(struct lxc_conf *lxc_conf)
+-{
+-	free(lxc_conf->init_groups);
+-	lxc_conf->init_groups = NULL;
+-	lxc_conf->init_groups_len = 0;
+-
+-	return 0;
+-}
+-
+ /*isulad: clear populate devices*/
+ int lxc_clear_populate_devices(struct lxc_conf *c)
+ {
+diff --git a/src/lxc/conf.h b/src/lxc/conf.h
+index 683b8ba..108e05b 100644
+--- a/src/lxc/conf.h
++++ b/src/lxc/conf.h
+@@ -622,9 +622,6 @@ struct lxc_conf {
+ 	char **init_argv;
+ 	size_t init_argc;
+ 
+-	gid_t *init_groups;
+-	size_t init_groups_len;
+-
+ 	/* populate devices */
+ 	struct lxc_list populate_devs;
+ 	mode_t umask;  // umask value
+@@ -794,7 +791,6 @@ __hidden extern int parse_cap(const char *cap_name, __u32 *cap);
+ #ifdef HAVE_ISULAD
+ // isulad add
+ __hidden int lxc_clear_init_args(struct lxc_conf *lxc_conf);
+-__hidden int lxc_clear_init_groups(struct lxc_conf *lxc_conf);
+ __hidden int lxc_clear_populate_devices(struct lxc_conf *c);
+ __hidden int lxc_clear_rootfs_masked_paths(struct lxc_conf *c);
+ __hidden int lxc_clear_rootfs_ro_paths(struct lxc_conf *c);
+diff --git a/src/lxc/confile.c b/src/lxc/confile.c
+index 7966d32..1492776 100644
+--- a/src/lxc/confile.c
++++ b/src/lxc/confile.c
+@@ -157,6 +157,18 @@ lxc_config_define(uts_name);
+ lxc_config_define(sysctl);
+ lxc_config_define(proc);
+ lxc_config_define(sched_core);
++#ifdef HAVE_ISULAD
++lxc_config_define(init_args);
++lxc_config_define(populate_device);
++lxc_config_define(umask);
++lxc_config_define(rootfs_masked_paths);
++lxc_config_define(rootfs_ro_paths);
++lxc_config_define(systemd);
++lxc_config_define(console_log_driver);
++lxc_config_define(console_syslog_tag);
++lxc_config_define(console_syslog_facility);
++lxc_config_define(selinux_mount_context);
++#endif
+ 
+ static int set_config_unsupported_key(const char *key, const char *value,
+ 				      struct lxc_conf *lxc_conf, void *data)
+@@ -274,6 +286,18 @@ static struct lxc_config_t config_jump_table[] = {
+ 	{ "lxc.uts.name",                   true,  set_config_uts_name,                   get_config_uts_name,                   clr_config_uts_name,                   },
+ 	{ "lxc.sysctl",                     false, set_config_sysctl,                     get_config_sysctl,                     clr_config_sysctl,                     },
+ 	{ "lxc.proc",                       false, set_config_proc,                       get_config_proc,                       clr_config_proc,                       },
++#ifdef HAVE_ISULAD
++	{ "lxc.isulad.init.args",          set_config_init_args,                   get_config_init_args,                   clr_config_init_args,                 },
++	{ "lxc.isulad.populate.device",    set_config_populate_device,             get_config_populate_device,             clr_config_populate_device,           },
++	{ "lxc.isulad.umask",              set_config_umask,                       get_config_umask,                       clr_config_umask,                     },
++	{ "lxc.isulad.rootfs.maskedpaths", set_config_rootfs_masked_paths,         get_config_rootfs_masked_paths,         clr_config_rootfs_masked_paths,       },
++	{ "lxc.isulad.rootfs.ropaths",     set_config_rootfs_ro_paths,             get_config_rootfs_ro_paths,             clr_config_rootfs_ro_paths,           },
++	{ "lxc.isulad.systemd",            set_config_systemd,                     get_config_systemd,                     clr_config_systemd,                   },
++	{ "lxc.console.logdriver",         set_config_console_log_driver,          get_config_console_log_driver,          clr_config_console_log_driver,        },
++	{ "lxc.console.syslog_tag",        set_config_console_syslog_tag,          get_config_console_syslog_tag,          clr_config_console_syslog_tag,        },
++	{ "lxc.console.syslog_facility",   set_config_console_syslog_facility,     get_config_console_syslog_facility,     clr_config_console_syslog_facility,   },
++	{ "lxc.selinux.mount_context",     set_config_selinux_mount_context,       get_config_selinux_mount_context,       clr_config_selinux_mount_context,     },
++#endif
+ };
+ 
+ static struct lxc_config_t unsupported_config_key = {
+@@ -1588,7 +1612,12 @@ static int set_config_environment(const char *key, const char *value,
+ 	if (!new_env)
+ 		return ret_errno(ENOMEM);
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: recover space replaced by SPACE_MAGIC_STR */
++	dup = lxc_string_replace(SPACE_MAGIC_STR, " ", value);
++#else
+ 	dup = strdup(value);
++#endif
+ 	if (!dup)
+ 		return ret_errno(ENOMEM);
+ 
+@@ -2558,8 +2587,11 @@ static int set_config_console_rotate(const char *key, const char *value,
+ 	if (ret)
+ 		return ret_errno(EINVAL);
+ 
++#ifndef HAVE_ISULAD
++	/* isulad: support rotate muti-files */
+ 	if (lxc_conf->console.log_rotate > 1)
+ 		return log_error_errno(-EINVAL, EINVAL, "The \"lxc.console.rotate\" config key can only be set to 0 or 1");
++#endif
+ 
+ 	return 0;
+ }
+@@ -3049,6 +3081,54 @@ struct parse_line_conf {
+ 	bool from_include;
+ };
+ 
++#ifdef HAVE_ISULAD
++// escape_string_decode compress some escape characters
++static char *escape_string_decode(const char *src)
++{
++	size_t src_end = 0;
++	size_t dst_end = 0;
++	size_t len = 0;
++	char *dst = NULL;
++
++	if (src == NULL) {
++		return NULL;
++	}
++
++	len = strlen(src);
++	if (len == 0) {
++		return NULL;
++	}
++
++	dst = calloc(1, len + 1);
++	if (dst == NULL) {
++		ERROR("Out of memory");
++		return NULL;
++	}
++
++	while(src_end < len) {
++		if (src[src_end] == '\\') {
++			switch (src[++src_end])
++			{
++				case 'r': dst[dst_end] = '\r'; break;
++				case 'n': dst[dst_end] = '\n'; break;
++				case 'f': dst[dst_end] = '\f'; break;
++				case 'b': dst[dst_end] = '\b'; break;
++				case 't': dst[dst_end] = '\t'; break;
++				case '\\': dst[dst_end] = '\\'; break;
++				// default do not decode
++				default: dst[dst_end++] = '\\'; dst[dst_end] = src[src_end]; break;
++			}
++		} else {
++			dst[dst_end] = src[src_end];
++		}
++		dst_end++;
++		src_end++;
++	}
++
++	return dst;
++}
++#endif
++
+ static int parse_line(char *buffer, void *data)
+ {
+ 	__do_free char *linep = NULL;
+@@ -3058,6 +3138,9 @@ static int parse_line(char *buffer, void *data)
+ 	int ret;
+ 	char *dup = buffer;
+ 	struct parse_line_conf *plc = data;
++#ifdef HAVE_ISULAD
++	__do_free char *value_decode = NULL;
++#endif
+ 
+ 	if (!plc->conf)
+ 		return syserror_set(-EINVAL, "Missing config");
+@@ -3118,7 +3201,15 @@ static int parse_line(char *buffer, void *data)
+ 	}
+ 
+ 	config = lxc_get_config(key);
++#ifdef HAVE_ISULAD
++	value_decode = escape_string_decode(value);
++	if (value_decode == NULL) {
++		ERROR("Value %s decode failed", value);
++	}
++	ret = config->set(key, value_decode ? value_decode: value, plc->conf, NULL);
++#else
+ 	return config->set(key, value, plc->conf, NULL);
++#endif
+ }
+ 
+ static struct new_config_item *parse_new_conf_line(char *buffer)
+@@ -3222,6 +3313,12 @@ bool lxc_config_define_load(struct lxc_list *defines, struct lxc_container *c)
+ 
+ 	lxc_list_for_each(it, defines) {
+ 		struct new_config_item *new_item = it->elem;
++#ifdef HAVE_ISULAD
++		if (strcmp(new_item->key, LXC_IMAGE_OCI_KEY) == 0) {
++			c->set_oci_type(c, true);
++			continue;
++		}
++#endif
+ 		bret = c->set_config_item(c, new_item->key, new_item->val);
+ 		if (!bret)
+ 			break;
+@@ -6764,3 +6861,464 @@ static int clr_config_sched_core(const char *key, struct lxc_conf *c, void *data
+ 	c->sched_core = false;
+ 	return 0;
+ }
++
++
++#ifdef HAVE_ISULAD
++/* isulad: set config for init args */
++static int set_config_init_args(const char *key, const char *value,
++				 struct lxc_conf *lxc_conf, void *data)
++{
++	int ret = 0;
++	char **tmp = NULL;
++	char *new_value = NULL;
++
++	ret = set_config_string_item(&new_value, value);
++	if (ret || !new_value)
++		return ret;
++
++	tmp = (char **)realloc(lxc_conf->init_argv, (lxc_conf->init_argc + 1) * sizeof(char *));
++	if (!tmp) {
++		ERROR("Out of memory");
++		free(new_value);
++		return -1;
++	}
++
++	lxc_conf->init_argv = tmp;
++
++	lxc_conf->init_argv[lxc_conf->init_argc] = new_value;
++	lxc_conf->init_argc++;
++
++	return 0;
++}
++
++/* isulad: get config init args */
++static int get_config_init_args(const char *key, char *retv, int inlen,
++				  struct lxc_conf *c, void *data)
++{
++	int i, len, fulllen = 0;
++
++	if (!retv)
++		inlen = 0;
++	else
++		memset(retv, 0, inlen);
++
++	for (i = 0; i < c->init_argc; i++) {
++           strprint(retv, inlen, "%s", c->init_argv[i]);
++    }
++
++	return fulllen;
++}
++
++/* isulad: clr config init args*/
++static inline int clr_config_init_args(const char *key, struct lxc_conf *c,
++				   void *data)
++{
++	return lxc_clear_init_args(c);
++}
++
++/* isulad: set config for populate device */
++static int set_config_populate_device(const char *key, const char *value,
++                                      struct lxc_conf *lxc_conf, void *data)
++{
++	int ret = 0, major = 0, minor = 0;
++	uid_t uid = (uid_t)-1;
++	gid_t gid = (gid_t)-1;
++	char name[4096] = {0}; /* MAX dev path name */
++	char type[3] = {0};
++	char *replace_value = NULL;
++	mode_t filemode = 0;
++	struct lxc_list *iter = NULL;
++	struct lxc_list *dev_list = NULL;
++	struct lxc_populate_devs *dev_elem = NULL;
++
++	if (lxc_config_value_empty(value))
++		return lxc_clear_populate_devices(lxc_conf);
++
++	/* lxc.populate.device = PATH_IN_CONTAINER:DEVICETYPE:MAJOR:MINOR:MODE:UID:GID
++	 * For e.g. lxc.populate.device = /dev/sda:b:8:0:0666:0:0
++	 */
++	ret = sscanf(value, "%4095[^:]:%2[^:]:%i:%i:%i:%u:%u", name, type, &major, &minor, &filemode, &uid, &gid);
++	if (ret != 7)
++		return -1;
++
++	/* find existing list element */
++	lxc_list_for_each(iter, &lxc_conf->populate_devs) {
++		dev_elem = iter->elem;
++
++		if (strcmp(name, dev_elem->name) != 0)
++			continue;
++
++		replace_value = safe_strdup(type);
++
++		free(dev_elem->type);
++		dev_elem->type = replace_value;
++		dev_elem->file_mode = filemode;
++		dev_elem->maj = major;
++		dev_elem->min = minor;
++		dev_elem->uid = (uid_t)uid;
++		dev_elem->gid = (gid_t)gid;
++		return 0;
++	}
++
++	/* allocate list element */
++	dev_list = malloc(sizeof(*dev_list));
++	if (dev_list == NULL)
++		goto on_error;
++
++	lxc_list_init(dev_list);
++
++	dev_elem = malloc(sizeof(*dev_elem));
++	if (dev_elem == NULL)
++		goto on_error;
++	memset(dev_elem, 0, sizeof(*dev_elem));
++
++	dev_elem->name = safe_strdup(name);
++
++	dev_elem->type = safe_strdup(type);
++
++	dev_elem->file_mode = filemode;
++	dev_elem->maj = major;
++	dev_elem->min = minor;
++	dev_elem->uid = (uid_t)uid;
++	dev_elem->gid = (gid_t)gid;
++
++	lxc_list_add_elem(dev_list, dev_elem);
++
++	lxc_list_add_tail(&lxc_conf->populate_devs, dev_list);
++
++	return 0;
++
++on_error:
++	free(dev_list);
++	if (dev_elem) {
++		free(dev_elem->name);
++		free(dev_elem->type);
++		free(dev_elem);
++	}
++	return -1;
++}
++
++/* isulad: get config populate device
++ * If you ask for 'lxc.populate.device', then all populate device
++ * entries will be printed, in 'lxc.populate.device = path_in_container:type:major:minor:mode:uid:gid' format.
++ * For e.g. lxc.populate.device = /dev/sda:b:8:0:0666:0:0
++ */
++static int get_config_populate_device(const char *key, char *retv, int inlen,
++                                      struct lxc_conf *c, void *data)
++{
++	int len;
++	struct lxc_list *it = NULL;
++	int fulllen = 0;
++
++	if (!retv)
++		inlen = 0;
++	else
++		memset(retv, 0, inlen);
++
++	lxc_list_for_each(it, &c->populate_devs) {
++		struct lxc_populate_devs *elem = it->elem;
++		strprint(retv, inlen, "lxc.populate.device = %s:%s:%d:%d:%o:%u:%u\n",
++		         elem->name, elem->type, elem->maj,
++		         elem->min, elem->file_mode, elem->uid, elem->gid);
++	}
++
++	return fulllen;
++}
++
++/* isulad: clr config populate devices*/
++static inline int clr_config_populate_device(const char *key, struct lxc_conf *c,
++                void *data)
++{
++	return lxc_clear_populate_devices(c);
++}
++
++/* isulad: set config for umask */
++static int set_config_umask(const char *key, const char *value,
++			      struct lxc_conf *lxc_conf, void *data)
++{
++	if (lxc_config_value_empty(value)) {
++		ERROR("Empty umask");
++		return -1;
++	}
++
++	if (strcmp(value, "normal") == 0) {
++		lxc_conf->umask = 0022;
++		return 0;
++	} else if (strcmp(value, "secure") == 0) {
++		lxc_conf->umask = 0027;
++		return 0;
++	} else {
++		ERROR("Invalid native umask: %s", value);
++		return -1;
++	}
++}
++
++/* isulad add: get umask value*/
++static int get_config_umask(const char *key, char *retv, int inlen,
++			      struct lxc_conf *c, void *data)
++{
++	return lxc_get_conf_size_t(c, retv, inlen, c->umask);
++}
++
++/* isulad add: clear umask value */
++static inline int clr_config_umask(const char *key, struct lxc_conf *c,
++				     void *data)
++{
++	c->umask = 0027;
++	return 0;
++}
++
++/* isulad: set config for rootfs masked paths */
++static int set_config_rootfs_masked_paths(const char *key, const char *value,
++                struct lxc_conf *lxc_conf, void *data)
++{
++	struct lxc_list *list_item = NULL;
++
++	if (lxc_config_value_empty(value))
++		return lxc_clear_rootfs_masked_paths(lxc_conf);
++
++	list_item = malloc(sizeof(*list_item));
++	if (list_item == NULL)
++		goto on_error;
++
++	list_item->elem = safe_strdup(value);
++
++	lxc_list_add_tail(&lxc_conf->rootfs.maskedpaths, list_item);
++
++	return 0;
++
++on_error:
++	free(list_item);
++
++	return -1;
++}
++
++// isulad: get config rootfs masked paths
++static int get_config_rootfs_masked_paths(const char *key, char *retv, int inlen,
++                struct lxc_conf *c, void *data)
++{
++	int len, fulllen = 0;
++	struct lxc_list *it = NULL;
++
++	if (!retv)
++		inlen = 0;
++	else
++		memset(retv, 0, inlen);
++
++	lxc_list_for_each(it, &c->rootfs.maskedpaths) {
++		strprint(retv, inlen, "%s\n", (char *)it->elem);
++	}
++
++	return fulllen;
++}
++
++/* isulad: set config for rootfs ro paths */
++static int set_config_rootfs_ro_paths(const char *key, const char *value,
++                                      struct lxc_conf *lxc_conf, void *data)
++{
++	struct lxc_list *list_item = NULL;
++
++	if (lxc_config_value_empty(value))
++		return lxc_clear_rootfs_ro_paths(lxc_conf);
++
++	list_item = malloc(sizeof(*list_item));
++	if (list_item == NULL)
++		goto on_error;
++
++	list_item->elem = safe_strdup(value);
++
++	lxc_list_add_tail(&lxc_conf->rootfs.ropaths, list_item);
++
++	return 0;
++
++on_error:
++	free(list_item);
++
++	return -1;
++}
++
++// isulad: get config rootfs ro paths
++static int get_config_rootfs_ro_paths(const char *key, char *retv, int inlen,
++                                      struct lxc_conf *c, void *data)
++{
++	int len, fulllen = 0;
++	struct lxc_list *it = NULL;
++
++	if (!retv)
++		inlen = 0;
++	else
++		memset(retv, 0, inlen);
++
++	lxc_list_for_each(it, &c->rootfs.ropaths) {
++		strprint(retv, inlen, "%s\n", (char *)it->elem);
++	}
++
++	return fulllen;
++}
++
++/* isulad: clr config rootfs masked paths */
++static inline int clr_config_rootfs_masked_paths(const char *key, struct lxc_conf *c,
++                void *data)
++{
++	return lxc_clear_rootfs_masked_paths(c);
++}
++
++/* isulad: clr config rootfs ro paths */
++static inline int clr_config_rootfs_ro_paths(const char *key, struct lxc_conf *c,
++                void *data)
++{
++	return lxc_clear_rootfs_ro_paths(c);
++}
++
++/* isulad: set config for systemd */
++static int set_config_systemd(const char *key, const char *value,
++			      struct lxc_conf *lxc_conf, void *data)
++{
++	if (lxc_config_value_empty(value)) {
++		ERROR("Empty umask");
++		return -1;
++	}
++	lxc_conf->systemd = strdup(value);
++	return 0;
++}
++
++/* isulad add: get systemd value*/
++static int get_config_systemd(const char *key, char *retv, int inlen,
++			      struct lxc_conf *c, void *data)
++{
++	return lxc_get_conf_str(retv, inlen, c->systemd);
++}
++
++/* isulad add: clear systemd value */
++static inline int clr_config_systemd(const char *key, struct lxc_conf *c,
++				     void *data)
++{
++	free(c->systemd);
++	c->systemd = NULL;
++	return 0;
++}
++
++static int set_config_console_log_driver(const char *key, const char *value,
++        struct lxc_conf *lxc_conf, void *data)
++{
++	return set_config_string_item(&lxc_conf->console.log_driver, value);
++}
++
++static int set_config_console_syslog_tag(const char *key, const char *value,
++        struct lxc_conf *lxc_conf, void *data)
++{
++	if (value == NULL) {
++		return -1;
++	}
++	return set_config_string_item(&lxc_conf->console.log_syslog_tag, value);
++}
++
++static int parse_facility(const char *facility)
++{
++#define FACILITIES_LEN 20
++	const char *facility_keys[FACILITIES_LEN] = {
++		"kern", "user", "mail", "daemon", "auth",
++		"syslog", "lpr", "news", "uucp", "cron", "authpriv", "ftp",
++		"local0", "local1", "local2", "local3", "local4", "local5", "local6", "local7"
++	};
++	const int facilities[FACILITIES_LEN] = {
++		LOG_KERN, LOG_USER, LOG_MAIL, LOG_DAEMON, LOG_AUTH, LOG_SYSLOG,
++		LOG_LPR, LOG_NEWS, LOG_UUCP, LOG_CRON, LOG_AUTHPRIV, LOG_FTP,
++		LOG_LOCAL0, LOG_LOCAL1, LOG_LOCAL2, LOG_LOCAL3, LOG_LOCAL4,
++		LOG_LOCAL5, LOG_LOCAL6, LOG_LOCAL7
++	};
++	int i = 0;
++
++	if (facility == NULL) {
++		return -1;
++	}
++
++	for (; i < FACILITIES_LEN; i++) {
++		if (strcmp(facility, facility_keys[i]) == 0) {
++			return facilities[i];
++		}
++	}
++
++	return -1;
++}
++
++static int set_config_console_syslog_facility(const char *key, const char *value,
++        struct lxc_conf *lxc_conf, void *data)
++{
++	int facility;
++
++	facility = parse_facility(value);
++	if (facility < 0) {
++		NOTICE("Invalid facility: %s", value);
++		facility = LOG_DAEMON;
++	}
++
++	lxc_conf->console.log_syslog_facility = facility;
++	return 0;
++}
++
++static int set_config_selinux_mount_context(const char *key, const char *value,
++    struct lxc_conf *lxc_conf, void *data)
++{
++	if (value != NULL && strcmp(value, "unconfined_t") == 0) {
++		return set_config_string_item(&lxc_conf->lsm_se_mount_context, NULL);
++	}
++
++	return set_config_string_item(&lxc_conf->lsm_se_mount_context, value);
++}
++
++static int get_config_console_log_driver(const char *key, char *retv, int inlen,
++        struct lxc_conf *c, void *data)
++{
++	return lxc_get_conf_str(retv, inlen, c->console.log_driver);
++}
++
++static int get_config_console_syslog_tag(const char *key, char *retv, int inlen,
++        struct lxc_conf *c, void *data)
++{
++	return lxc_get_conf_str(retv, inlen, c->console.log_syslog_tag);
++}
++
++static int get_config_console_syslog_facility(const char *key, char *retv, int inlen,
++        struct lxc_conf *c, void *data)
++{
++	return lxc_get_conf_int(c, retv, inlen, c->console.log_syslog_facility);
++}
++
++static int get_config_selinux_mount_context(const char *key, char *retv, int inlen,
++    struct lxc_conf *c, void *data)
++{
++	return lxc_get_conf_str(retv, inlen, c->lsm_se_mount_context);
++}
++
++static inline int clr_config_console_log_driver(const char *key,
++                struct lxc_conf *c, void *data)
++{
++	free(c->console.log_driver);
++	c->console.log_driver = NULL;
++	return 0;
++}
++
++static inline int clr_config_console_syslog_tag(const char *key,
++                struct lxc_conf *c, void *data)
++{
++	free(c->console.log_syslog_tag);
++	c->console.log_syslog_tag= NULL;
++	return 0;
++}
++
++static inline int clr_config_console_syslog_facility(const char *key,
++                struct lxc_conf *c, void *data)
++{
++	c->console.log_syslog_facility = LOG_DAEMON;
++	return 0;
++}
++
++static inline int clr_config_selinux_mount_context(const char *key,
++    struct lxc_conf *c, void *data)
++{
++	free(c->lsm_se_mount_context);
++	c->lsm_se_mount_context = NULL;
++	return 0;
++}
++#endif
+diff --git a/src/lxc/lxccontainer.c b/src/lxc/lxccontainer.c
+index 8df6059..d4495f7 100644
+--- a/src/lxc/lxccontainer.c
++++ b/src/lxc/lxccontainer.c
+@@ -62,6 +62,10 @@
+ #include "utils.h"
+ #include "version.h"
+ 
++#ifdef HAVE_ISULAD
++#include "exec_commands.h"
++#endif
++
+ #if HAVE_OPENSSL
+ #include <openssl/evp.h>
+ #endif
+@@ -83,6 +87,11 @@
+ 
+ lxc_log_define(lxccontainer, lxc);
+ 
++#ifdef HAVE_ISULAD
++typedef bool (*func_is_io_stat_read)(const char *value);
++typedef bool (*func_is_io_stat_write)(const char *value);
++#endif
++
+ static bool do_lxcapi_destroy(struct lxc_container *c);
+ static const char *lxcapi_get_config_path(struct lxc_container *c);
+ #define do_lxcapi_get_config_path(c) lxcapi_get_config_path(c)
+@@ -272,6 +281,13 @@ static void lxc_container_free(struct lxc_container *c)
+ 	free(c->config_path);
+ 	c->config_path = NULL;
+ 
++#ifdef HAVE_ISULAD
++	free(c->exit_fifo);
++	c->exit_fifo = NULL;
++	free(c->ocihookfile);
++	c->ocihookfile = NULL;
++#endif
++
+ 	free(c);
+ }
+ 
+@@ -652,6 +668,66 @@ static bool load_config_locked(struct lxc_container *c, const char *fname)
+ 	return true;
+ }
+ 
++#ifdef HAVE_ISULAD
++static bool load_ocihooks_locked(struct lxc_container *c)
++{
++	parser_error err = NULL;
++	oci_runtime_spec_hooks *hooks = NULL;
++
++	if (!c->lxc_conf)
++		c->lxc_conf = lxc_conf_init();
++
++	if (!c->lxc_conf)
++		return false;
++
++	hooks = oci_runtime_spec_hooks_parse_file(c->ocihookfile, NULL, &err);
++	if (!hooks) {
++		fprintf(stderr, "parse oci hooks config failed: %s\n", err);
++		free(err);
++		return true;
++	}
++	c->lxc_conf->ocihooks = hooks;
++
++	if (err)
++		free(err);
++	return true;
++}
++
++/*
++ * isulad: set oci hook file path
++ * */
++static bool set_oci_hook_config_filename(struct lxc_container *c)
++{
++#define OCI_HOOK_JSON_FILE_NAME "ocihooks.json"
++	char *newpath = NULL;
++	int len, ret;
++
++	if (!c->config_path)
++		return false;
++
++	/* $lxc_path + "/" + c->name + "/" + "config" + '\0' */
++	if (strlen(c->config_path) + strlen(c->name) > SIZE_MAX - strlen(OCI_HOOK_JSON_FILE_NAME) - 3)
++		return false;
++	len = strlen(c->config_path) + strlen(c->name) + strlen(OCI_HOOK_JSON_FILE_NAME) + 3;
++
++	newpath = malloc(len);
++	if (newpath == NULL)
++		return false;
++
++	ret = snprintf(newpath, len, "%s/%s/%s", c->config_path, c->name, OCI_HOOK_JSON_FILE_NAME);
++	if (ret < 0 || ret >= len) {
++		fprintf(stderr, "Error printing out config file name\n");
++		free(newpath);
++		return false;
++	}
++
++	free(c->ocihookfile);
++	c->ocihookfile = newpath;
++
++	return true;
++}
++#endif
++
+ static bool do_lxcapi_load_config(struct lxc_container *c, const char *alt_file)
+ {
+ 	int lret;
+@@ -685,6 +761,11 @@ static bool do_lxcapi_load_config(struct lxc_container *c, const char *alt_file)
+ 
+ 	ret = load_config_locked(c, fname);
+ 
++#ifdef HAVE_ISULAD
++	if (ret && file_exists(c->ocihookfile))
++		ret = load_ocihooks_locked(c);
++#endif
++
+ 	if (need_disklock)
+ 		container_disk_unlock(c);
+ 	else
+@@ -884,6 +965,33 @@ static bool wait_on_daemonized_start(struct lxc_handler *handler, int pid)
+ 	return true;
+ }
+ 
++#ifdef HAVE_ISULAD
++/* isulad: use init argv as init cmd */
++static char **use_init_args(char **init_argv, size_t init_args)
++{
++	size_t i;
++	int nargs = 0;
++	char **argv;
++
++	if (!init_argv)
++		return NULL;
++
++	do {
++		argv = malloc(sizeof(char *));
++	} while (!argv);
++
++	argv[0] = NULL;
++	for (i = 0; i < init_args; i++)
++		push_arg(&argv, init_argv[i], &nargs);
++
++	if (nargs == 0) {
++		free(argv);
++		return NULL;
++	}
++	return argv;
++}
++#endif
++
+ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const argv[])
+ {
+ 	int ret;
+@@ -894,6 +1002,11 @@ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const a
+ 		NULL,
+ 	};
+ 	char **init_cmd = NULL;
++#ifdef HAVE_ISULAD
++	int keepfds[] = {-1, -1, -1, -1, -1};
++	ssize_t size_read;
++	char errbuf[BUFSIZ + 1] = {0};
++#endif
+ 
+ 	/* container does exist */
+ 	if (!c)
+@@ -940,6 +1053,30 @@ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const a
+ 			argv = init_cmd = split_init_cmd(conf->init_cmd);
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	if (!argv) {
++		argv = init_cmd = use_init_args(conf->init_argv, conf->init_argc);
++	}
++
++	// do not allow using default rootfs path when isulad
++	if (conf->rootfs.mount == NULL) {
++		ERROR("Empty rootfs path detected");
++		lxc_put_handler(handler);
++		return false;
++	}
++
++	// do not allow using default args when isulad
++	if (!argv) {
++		ERROR("Empty args detected");
++		lxc_put_handler(handler);
++		return false;
++	}
++
++	if (c->image_type_oci) {
++		handler->image_type_oci = true;
++	}
++#endif
++
+ 	/* ... otherwise use default_args. */
+ 	if (!argv) {
+ 		if (useinit) {
+@@ -959,10 +1096,23 @@ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const a
+ 		char title[2048];
+ 		pid_t pid_first, pid_second;
+ 
++#ifdef HAVE_ISULAD
++		//isulad: pipdfd for get error message of child or grandchild process.
++		if (pipe2(conf->errpipe, O_CLOEXEC) != 0) {
++			SYSERROR("Failed to init errpipe");
++			free_init_cmd(init_cmd);
++			lxc_put_handler(handler);
++			return false;
++		}
++#endif
++
+ 		pid_first = fork();
+ 		if (pid_first < 0) {
+ 			free_init_cmd(init_cmd);
+ 			lxc_put_handler(handler);
++#ifdef HAVE_ISULAD
++			lxc_close_error_pipe(conf->errpipe);
++#endif
+ 			return false;
+ 		}
+ 
+@@ -972,11 +1122,25 @@ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const a
+ 			 * the PID file, child will do the free and unlink.
+ 			 */
+ 			c->pidfile = NULL;
++#ifdef HAVE_ISULAD
++			close(conf->errpipe[1]);
++			conf->errpipe[1] = -1;
++#endif
+ 
+ 			/* Wait for container to tell us whether it started
+ 			 * successfully.
+ 			 */
+ 			started = wait_on_daemonized_start(handler, pid_first);
++#ifdef HAVE_ISULAD
++			if (!started) {
++				size_read = read(conf->errpipe[0], errbuf, BUFSIZ);
++				if (size_read > 0) {
++					conf->errmsg = safe_strdup(errbuf);
++				}
++			}
++			close(conf->errpipe[0]);
++			conf->errpipe[0] = -1;
++#endif
+ 
+ 			free_init_cmd(init_cmd);
+ 			lxc_put_handler(handler);
+@@ -1012,6 +1176,9 @@ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const a
+ 		if (pid_second != 0) {
+ 			free_init_cmd(init_cmd);
+ 			lxc_put_handler(handler);
++#ifdef HAVE_ISULAD
++			lxc_close_error_pipe(conf->errpipe);
++#endif
+ 			_exit(EXIT_SUCCESS);
+ 		}
+ 
+@@ -1024,7 +1191,18 @@ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const a
+ 			_exit(EXIT_FAILURE);
+ 		}
+ 
++#ifdef HAVE_ISULAD
++		keepfds[0] = handler->conf->maincmd_fd;
++		keepfds[1] = handler->state_socket_pair[0];
++		keepfds[2] = handler->state_socket_pair[1];
++		keepfds[4] = conf->errpipe[1];
++		close(conf->errpipe[0]);
++		conf->errpipe[0] = -1;
++		ret = lxc_check_inherited(conf, true, keepfds,
++					  sizeof(keepfds) / sizeof(keepfds[0]));
++#else
+ 		ret = inherit_fds(handler, true);
++#endif
+ 		if (ret < 0)
+ 			_exit(EXIT_FAILURE);
+ 
+@@ -1057,6 +1235,9 @@ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const a
+ 		if (w < 0) {
+ 			free_init_cmd(init_cmd);
+ 			lxc_put_handler(handler);
++#ifdef HAVE_ISULAD
++			lxc_close_error_pipe(conf->errpipe);
++#endif
+ 
+ 			SYSERROR("Failed to write monitor pid to \"%s\"", c->pidfile);
+ 
+@@ -1070,6 +1251,9 @@ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const a
+ 		if (ret < 0) {
+ 			free_init_cmd(init_cmd);
+ 			lxc_put_handler(handler);
++#ifdef HAVE_ISULAD
++			lxc_close_error_pipe(conf->errpipe);
++#endif
+ 
+ 			SYSERROR("Failed to write monitor pid to \"%s\"", c->pidfile);
+ 
+@@ -1080,6 +1264,19 @@ static bool do_lxcapi_start(struct lxc_container *c, int useinit, char * const a
+ 		}
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: open exit fifo */
++	if (c->exit_fifo) {
++		conf->exit_fd = lxc_open(c->exit_fifo, O_WRONLY | O_NONBLOCK | O_CLOEXEC, 0);
++		if (conf->exit_fd < 0) {
++			ERROR("Failed to open exit fifo %s: %s.", c->exit_fifo, strerror(errno));
++			lxc_put_handler(handler);
++			ret = 1;
++			goto on_error;
++		}
++	}
++#endif
++
+ 	conf->reboot = REBOOT_NONE;
+ 
+ 	/* Unshare the mount namespace if requested */
+@@ -1111,19 +1308,53 @@ reboot:
+ 		}
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	keepfds[0] = handler->conf->maincmd_fd;
++	keepfds[1] = handler->state_socket_pair[0];
++	keepfds[2] = handler->state_socket_pair[1];
++
++	/* keep exit fifo fd */
++	if (conf->exit_fd >= 0) {
++		keepfds[3] = conf->exit_fd;
++	}
++	/* isulad: keep errpipe fd */
++	if (c->daemonize)
++		keepfds[4] = conf->errpipe[1];
++
++	ret = lxc_check_inherited(conf, c->daemonize, keepfds,
++				  sizeof(keepfds) / sizeof(keepfds[0]));
++	if (ret < 0) {
++		lxc_put_handler(handler);
++		ret = 1;
++		goto on_error;
++	}
++#else
+ 	ret = inherit_fds(handler, c->daemonize);
+ 	if (ret < 0) {
+ 		lxc_put_handler(handler);
+ 		ret = 1;
+ 		goto on_error;
+ 	}
++#endif
+ 
++#ifndef HAVE_ISULAD
+ 	if (useinit)
+ 		ret = lxc_execute(c->name, argv, 1, handler, c->config_path,
+ 				  c->daemonize, &c->error_num);
+ 	else
+ 		ret = lxc_start(argv, handler, c->config_path, c->daemonize,
+ 				&c->error_num);
++#else
++	if (useinit) {
++		ret = lxc_execute(c->name, argv, 1, handler, c->config_path,
++				  c->daemonize, &c->error_num, c->start_timeout);
++	} else {
++		handler->disable_pty = c->disable_pty;
++		handler->open_stdin = c->open_stdin;
++		ret = lxc_start(argv, handler, c->config_path, c->daemonize,
++				&c->error_num, c->start_timeout);
++	}
++#endif
+ 
+ 	if (conf->reboot == REBOOT_REQ) {
+ 		INFO("Container requested reboot");
+@@ -2065,7 +2296,12 @@ WRAP_API_1(bool, lxcapi_reboot2, int)
+ static bool do_lxcapi_shutdown(struct lxc_container *c, int timeout)
+ {
+ 	__do_close int pidfd = -EBADF, state_client_fd = -EBADF;
++#ifdef HAVE_ISULAD
++	// isulad: keep default signal the same as docker
++	int haltsignal = SIGTERM;
++#else
+ 	int haltsignal = SIGPWR;
++#endif
+ 	pid_t pid = -1;
+ 	lxc_state_t states[MAX_STATE] = {0};
+ 	int killret, ret;
+@@ -2084,9 +2320,10 @@ static bool do_lxcapi_shutdown(struct lxc_container *c, int timeout)
+ 	/* Detect whether we should send SIGRTMIN + 3 (e.g. systemd). */
+ 	if (c->lxc_conf && c->lxc_conf->haltsignal)
+ 		haltsignal = c->lxc_conf->haltsignal;
++#ifndef HAVE_ISULAD
+ 	else if (task_blocks_signal(pid, (SIGRTMIN + 3)))
+ 		haltsignal = (SIGRTMIN + 3);
+-
++#endif
+ 
+ 	/*
+ 	 * Add a new state client before sending the shutdown signal so
+@@ -2939,6 +3176,21 @@ static int lxc_unlink_exec_wrapper(void *data)
+ 	return unlink(arg);
+ }
+ 
++#ifdef HAVE_ISULAD
++static void container_sock_dir_delete(const char *name)
++{
++	__do_free char *sock_dir = NULL;
++
++	sock_dir = generate_named_unix_sock_dir(name);
++	if (sock_dir == NULL) {
++		ERROR("Failed to generate exec unix sock dir");
++		return;
++	}
++
++	(void)lxc_rmdir_onedev(sock_dir, NULL);
++}
++#endif
++
+ static bool container_destroy(struct lxc_container *c,
+ 			      struct lxc_storage *storage)
+ {
+@@ -2949,8 +3201,19 @@ static bool container_destroy(struct lxc_container *c,
+ 	bool bret = false;
+ 	int ret = 0;
+ 
++#ifdef HAVE_ISULAD
++	if (!c)
++		return false;
++	// isulad: if container is not defined, we need to remove disk lock file
++	// which is created in lxc_container_new.
++	if (!do_lxcapi_is_defined(c)) {
++		container_disk_removelock(c);
++		return false;
++	}
++#else
+ 	if (!c || !do_lxcapi_is_defined(c))
+ 		return false;
++#endif
+ 
+ 	conf = c->lxc_conf;
+ 	if (container_disk_lock(c))
+@@ -3070,8 +3333,20 @@ static bool container_destroy(struct lxc_container *c,
+ 	if (ret < 0) {
+ 		ERROR("Failed to destroy directory \"%s\" for \"%s\"", path,
+ 		      c->name);
++#ifdef HAVE_ISULAD
++		char msg[BUFSIZ] = { 0 };
++		ret = snprintf(msg, BUFSIZ, "Failed to destroy directory \"%s\": %s", path, errno ? strerror(errno) : "error");
++		if (ret < 0 || ret >= BUFSIZ) {
++			ERROR("Sprintf failed");
++			goto out;
++		}
++		c->error_string = safe_strdup(msg);
++#endif
+ 		goto out;
+ 	}
++#ifdef HAVE_ISULAD
++	container_sock_dir_delete(c->name);
++#endif
+ 	INFO("Destroyed directory \"%s\" for \"%s\"", path, c->name);
+ 
+ on_success:
+@@ -3082,6 +3357,11 @@ out:
+ 		free(path);
+ 
+ 	container_disk_unlock(c);
++#ifdef HAVE_ISULAD
++	if (bret && container_disk_removelock(c)) {
++		bret = false;
++	}
++#endif
+ 	return bret;
+ }
+ 
+@@ -4042,8 +4322,13 @@ static int lxcapi_attach(struct lxc_container *c,
+ 
+ 	current_config = c->lxc_conf;
+ 
++#ifdef HAVE_ISULAD
++	ret = lxc_attach(c, exec_function, exec_payload, options,
++			 attached_process, &c->lxc_conf->errmsg);
++#else
+ 	ret = lxc_attach(c, exec_function, exec_payload, options,
+ 			 attached_process);
++#endif
+ 	current_config = NULL;
+ 	return ret;
+ }
+@@ -4063,7 +4348,11 @@ static int do_lxcapi_attach_run_wait(struct lxc_container *c,
+ 	command.program = (char *)program;
+ 	command.argv = (char **)argv;
+ 
++#ifdef HAVE_ISULAD
++	ret = lxc_attach(c, lxc_attach_run_command, &command, options, &pid, NULL);
++#else
+ 	ret = lxc_attach(c, lxc_attach_run_command, &command, options, &pid);
++#endif
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -5257,6 +5546,560 @@ static int do_lxcapi_seccomp_notify_fd_active(struct lxc_container *c)
+ 
+ WRAP_API(int, lxcapi_seccomp_notify_fd_active)
+ 
++#ifdef HAVE_ISULAD
++/* isulad add set console fifos*/
++static bool do_lxcapi_set_terminal_default_fifos(struct lxc_container *c, const char *in, const char *out, const char *err)
++{
++	struct lxc_conf *conf = NULL;
++
++	if (!c || !c->lxc_conf)
++		return false;
++	if (container_mem_lock(c)) {
++		ERROR("Error getting mem lock");
++		return false;
++	}
++
++	conf = c->lxc_conf;
++	if (in) {
++		if (conf->console.init_fifo[0])
++			free(conf->console.init_fifo[0]);
++		conf->console.init_fifo[0] = safe_strdup(in);
++	}
++	if (out) {
++		if (conf->console.init_fifo[1])
++			free(conf->console.init_fifo[1]);
++		conf->console.init_fifo[1] = safe_strdup(out);
++	}
++	if (err) {
++		if (conf->console.init_fifo[2])
++			free(conf->console.init_fifo[2]);
++		conf->console.init_fifo[2] = safe_strdup(err);
++	}
++
++	container_mem_unlock(c);
++	return true;
++}
++
++WRAP_API_3(bool, lxcapi_set_terminal_default_fifos, const char *, const char *, const char *)
++
++/* isulad add set info file path */
++static bool do_lxcapi_set_container_info_file(struct lxc_container *c, const char *info_file)
++{
++	struct lxc_conf *conf = NULL;
++
++	if (!c || !c->lxc_conf || !info_file)
++		return false;
++	if (container_mem_lock(c)) {
++		ERROR("Error getting mem lock");
++		return false;
++	}
++
++	conf = c->lxc_conf;
++	if (conf->container_info_file)
++		free(conf->container_info_file);
++	conf->container_info_file = safe_strdup(info_file);
++
++	container_mem_unlock(c);
++	return true;
++}
++
++WRAP_API_1(bool, lxcapi_set_container_info_file, const char *)
++
++static bool do_lxcapi_want_disable_pty(struct lxc_container *c, bool state)
++{
++	if (!c || !c->lxc_conf)
++		return false;
++
++	if (container_mem_lock(c))
++		return false;
++
++	c->disable_pty = state;
++
++	container_mem_unlock(c);
++
++	return true;
++}
++
++WRAP_API_1(bool, lxcapi_want_disable_pty, bool)
++
++static bool do_lxcapi_want_open_stdin(struct lxc_container *c, bool state)
++{
++	if (!c || !c->lxc_conf)
++		return false;
++
++	if (container_mem_lock(c))
++		return false;
++
++	c->open_stdin = state;
++
++	container_mem_unlock(c);
++
++	return true;
++}
++
++WRAP_API_1(bool, lxcapi_want_open_stdin, bool)
++
++/* isulad add clean resources */
++static bool do_lxcapi_add_terminal_fifo(struct lxc_container *c, const char *in_fifo, const char *out_fifo, const char *err_fifo)
++{
++	bool ret = true;
++
++	if (!c || !c->lxc_conf)
++		return false;
++	if (container_mem_lock(c)) {
++		ERROR("Error getting mem lock");
++		return false;
++	}
++
++	if (lxc_cmd_set_terminal_fifos(c->name, c->config_path, in_fifo, out_fifo, err_fifo)) {
++		ERROR("Error set console fifos");
++		ret = false;
++	}
++
++	container_mem_unlock(c);
++	return ret;
++}
++
++WRAP_API_3(bool, lxcapi_add_terminal_fifo, const char *, const char *, const char *)
++
++static bool do_lxcapi_set_terminal_winch(struct lxc_container *c, unsigned int height, unsigned int width)
++{
++	bool ret = true;
++
++	if (!c || !c->lxc_conf)
++		return false;
++	if (container_mem_lock(c)) {
++		ERROR("Error getting mem lock");
++		return false;
++	}
++
++	if (lxc_cmd_set_terminal_winch(c->name, c->config_path, height, width)) {
++		ERROR("Error set terminal winch");
++		ret = false;
++	}
++
++	container_mem_unlock(c);
++	return ret;
++}
++
++WRAP_API_2(bool, lxcapi_set_terminal_winch, unsigned int, unsigned int)
++
++static bool do_lxcapi_set_exec_terminal_winch(struct lxc_container *c, const char *suffix, unsigned int height, unsigned int width)
++{
++	bool ret = true;
++
++	if (!c || !c->lxc_conf)
++		return false;
++	if (container_mem_lock(c)) {
++		ERROR("Error getting mem lock");
++		return false;
++	}
++
++	if (lxc_exec_cmd_set_terminal_winch(c->name, c->config_path, suffix, height, width)) {
++		ERROR("Error set terminal winch");
++		ret = false;
++	}
++
++	container_mem_unlock(c);
++	return ret;
++}
++
++WRAP_API_3(bool, lxcapi_set_exec_terminal_winch, const char *, unsigned int, unsigned int)
++
++/* isulad add clean resources */
++static bool do_lxcapi_clean_container_resource(struct lxc_container *c, pid_t pid)
++{
++	int ret;
++
++	if (!c)
++		return false;
++
++	ret = do_lxcapi_clean_resource(c->name, c->config_path, c->lxc_conf, pid);
++	if (ret)
++		ERROR("Failed to clean container %s resource", c->name);
++	return ret == 0;
++
++}
++
++WRAP_API_1(bool, lxcapi_clean_container_resource, pid_t)
++
++/* isulad get coantainer pids */
++static bool do_lxcapi_get_container_pids(struct lxc_container *c, pid_t **pids,size_t *pids_len)
++{
++	int ret;
++
++	if (!c)
++		return false;
++
++	ret = do_lxcapi_get_pids(c->name, c->config_path, c->lxc_conf, pids,pids_len);
++	if (ret)
++		ERROR("Failed to get container %s pids", c->name);
++	return ret == 0;
++
++}
++
++WRAP_API_2(bool, lxcapi_get_container_pids, pid_t **,size_t *)
++
++/* isulad add start timeout */
++static bool do_lxcapi_set_start_timeout(struct lxc_container *c,  unsigned int start_timeout)
++{
++	if (!c || !c->lxc_conf)
++		return false;
++	if (container_mem_lock(c)) {
++		ERROR("Error getting mem lock");
++		return false;
++	}
++	c->start_timeout = start_timeout;
++	container_mem_unlock(c);
++	return true;
++}
++
++WRAP_API_1(bool, lxcapi_set_start_timeout, unsigned int)
++
++/* isulad add set image type */
++static bool do_lxcapi_set_oci_type(struct lxc_container *c,  bool image_type_oci)
++{
++	if (!c || !c->lxc_conf)
++		return false;
++	if (container_mem_lock(c)) {
++		ERROR("Error getting mem lock");
++		return false;
++	}
++	c->image_type_oci = image_type_oci;
++	container_mem_unlock(c);
++	return true;
++}
++
++WRAP_API_1(bool, lxcapi_set_oci_type, bool)
++
++static uint64_t metrics_get_ull(struct lxc_container *c, struct cgroup_ops *cgroup_ops, const char *item)
++{
++    char buf[81] = {0};
++    int len = 0;
++    uint64_t val = 0;
++
++    len = cgroup_ops->get(cgroup_ops, item, buf, sizeof(buf) - 1, c->name, c->config_path);
++    if (len <= 0) {
++        DEBUG("unable to read cgroup item %s", item);
++        return 0;
++    }
++
++    val = strtoull(buf, NULL, 0);
++    return val;
++}
++
++static uint64_t metrics_get_ull_with_max(struct lxc_container *c, struct cgroup_ops *cgroup_ops, const char *item)
++{
++    char buf[81] = {0};
++    int len = 0;
++    uint64_t val = 0;
++
++    len = cgroup_ops->get(cgroup_ops, item, buf, sizeof(buf) - 1, c->name, c->config_path);
++    if (len <= 0) {
++        DEBUG("unable to read cgroup item %s", item);
++        return 0;
++    }
++
++    if (strcmp(buf, "max") == 0) {
++	return ULONG_MAX;
++    }
++
++    val = strtoull(buf, NULL, 0);
++    return val;
++}
++
++static inline bool is_blk_metrics_read(const char *value)
++{
++    return strcmp(value, "Read") == 0;
++}
++
++static inline bool is_blk_metrics_write(const char *value)
++{
++    return strcmp(value, "Write") == 0;
++}
++
++static inline bool is_blk_metrics_total(const char *value)
++{
++    return strcmp(value, "Total") == 0;
++}
++
++static void metrics_get_blk_stats(struct lxc_container *c, struct cgroup_ops *cgroup_ops, const char *item, struct lxc_blkio_metrics *stats)
++{
++    char *buf = NULL;
++    int i = 0;
++    int len = 0;
++    int ret = 0;
++    char **lines = NULL;
++    char **cols = NULL;
++
++    len = cgroup_ops->get(cgroup_ops, item, NULL, 0, c->name, c->config_path);
++    if (len <= 0) {
++        DEBUG("unable to read cgroup item %s", item);
++        return;
++    }
++
++    buf = malloc(len + 1);
++    (void)memset(buf, 0, len + 1);
++    ret = cgroup_ops->get(cgroup_ops, item, buf, len, c->name, c->config_path);
++    if (ret <= 0) {
++        DEBUG("unable to read cgroup item %s", item);
++        goto out;
++    }
++
++    lines = lxc_string_split_and_trim(buf, '\n');
++    if (lines == NULL) {
++        goto out;
++    }
++
++    (void)memset(stats, 0, sizeof(struct lxc_blkio_metrics));
++
++    for (i = 0; lines[i]; i++) {
++        cols = lxc_string_split_and_trim(lines[i], ' ');
++        if (cols == NULL) {
++            goto err_out;
++        }
++        if (lxc_array_len((void **)cols) == 3) {
++            if (is_blk_metrics_read(cols[1])) {
++                stats->read += strtoull(cols[2], NULL, 0);
++            } else if (is_blk_metrics_write(cols[1])) {
++                stats->write += strtoull(cols[2], NULL, 0);
++            }
++        }
++        if (lxc_array_len((void **)cols) == 2 && is_blk_metrics_total(cols[0])) {
++            stats->total = strtoull(cols[1], NULL, 0);
++        }
++
++        lxc_free_array((void **)cols, free);
++    }
++err_out:
++    lxc_free_array((void **)lines, free);
++out:
++    free(buf);
++    return;
++}
++
++static void metrics_get_io_stats_v2(struct lxc_container *c, struct cgroup_ops *cgroup_ops, const char *item, struct lxc_blkio_metrics *stats, func_is_io_stat_read is_io_stat_read, func_is_io_stat_write is_io_stat_write)
++{
++    char *buf = NULL;
++    int i = 0;
++    int j = 0;
++    int len = 0;
++    int ret = 0;
++    char **lines = NULL;
++    char **cols = NULL;
++    char **kv = NULL;
++
++    len = cgroup_ops->get(cgroup_ops, item, NULL, 0, c->name, c->config_path);
++    if (len <= 0) {
++        DEBUG("unable to read cgroup item %s", item);
++        return;
++    }
++
++    buf = malloc(len + 1);
++    (void)memset(buf, 0, len + 1);
++    ret = cgroup_ops->get(cgroup_ops, item, buf, len, c->name, c->config_path);
++    if (ret <= 0) {
++        DEBUG("unable to read cgroup item %s", item);
++        goto out;
++    }
++
++    lines = lxc_string_split_and_trim(buf, '\n');
++    if (lines == NULL) {
++        goto out;
++    }
++
++    (void)memset(stats, 0, sizeof(struct lxc_blkio_metrics));
++    // line example:
++    // 259:0 rbytes=0 wbytes=12288 rios=0 wios=4 dbytes=0 dios=0
++    for (i = 0; lines[i]; i++) {
++        cols = lxc_string_split_and_trim(lines[i], ' ');
++        if (cols == NULL || lxc_array_len((void **)cols) < 2) {
++            goto err_out;
++        }
++        len = lxc_array_len((void **)cols);
++        for (j = 1; j < len; j++) {
++            kv = lxc_string_split(cols[j], '=');
++            if (kv == NULL || lxc_array_len((void **)kv) != 2) {
++                lxc_free_array((void **)kv, free);
++                continue;
++            }
++            if (is_io_stat_read(kv[0])) {
++                stats->read += strtoull(kv[1], NULL, 0);
++            } else if (is_io_stat_write(kv[0])) {
++                stats->write += strtoull(kv[1], NULL, 0);
++            }
++            lxc_free_array((void **)kv, free);
++        }
++        lxc_free_array((void **)cols, free);
++    }
++
++    stats->total = stats->read + stats->write;
++
++err_out:
++    lxc_free_array((void **)lines, free);
++out:
++    free(buf);
++    return;
++}
++
++static uint64_t metrics_match_get_ull(struct lxc_container *c, struct cgroup_ops *cgroup_ops, const char *item, const char *match, int column)
++{
++#define BUFSIZE 4096
++    char buf[BUFSIZE] = {0};
++    int i = 0;
++    int j = 0;
++    int len = 0;
++    uint64_t val = 0;
++    char **lines = NULL;
++    char **cols = NULL;
++    size_t matchlen = 0;
++
++    len = cgroup_ops->get(cgroup_ops, item, buf, sizeof(buf) - 1, c->name, c->config_path);
++    if (len <= 0) {
++        DEBUG("unable to read cgroup item %s", item);
++        goto err_out;
++    }
++
++    lines = lxc_string_split_and_trim(buf, '\n');
++    if (lines == NULL) {
++        goto err_out;
++    }
++
++    matchlen = strlen(match);
++    for (i = 0; lines[i]; i++) {
++        if (strncmp(lines[i], match, matchlen) != 0) {
++            continue;
++        }
++
++        cols = lxc_string_split_and_trim(lines[i], ' ');
++        if (cols == NULL) {
++            goto err1;
++        }
++        for (j = 0; cols[j]; j++) {
++            if (j == column) {
++                val = strtoull(cols[j], NULL, 0);
++                break;
++            }
++        }
++        lxc_free_array((void **)cols, free);
++        break;
++    }
++err1:
++    lxc_free_array((void **)lines, free);
++err_out:
++    return val;
++}
++
++static bool is_io_stat_rbytes(const char *value)
++{
++    return strcmp(value, "rbytes") == 0;
++}
++
++static bool is_io_stat_wbytes(const char *value)
++{
++    return strcmp(value, "wbytes") == 0;
++}
++
++static bool is_io_stat_rios(const char *value)
++{
++    return strcmp(value, "rios") == 0;
++}
++
++static bool is_io_stat_wios(const char *value)
++{
++    return strcmp(value, "wios") == 0;
++}
++
++static bool unified_metrics_get(struct lxc_container *c, struct cgroup_ops *cgroup_ops, struct lxc_container_metrics *metrics)
++{
++	// cpu
++	metrics->cpu_use_nanos = metrics_match_get_ull(c, cgroup_ops, "cpu.stat", "usage_usec", 1) * 1000;
++	metrics->cpu_use_user = metrics_match_get_ull(c, cgroup_ops, "cpu.stat", "user_usec", 1) * 1000;
++	metrics->cpu_use_sys = metrics_match_get_ull(c, cgroup_ops, "cpu.stat", "system_usec", 1) * 1000;
++
++	// io
++	metrics_get_io_stats_v2(c, cgroup_ops, "io.stat", &metrics->io_service_bytes, is_io_stat_rbytes, is_io_stat_wbytes);
++	metrics_get_io_stats_v2(c, cgroup_ops, "io.stat", &metrics->io_serviced, is_io_stat_rios, is_io_stat_wios);
++
++	// memory
++	metrics->mem_used = metrics_get_ull(c, cgroup_ops, "memory.current");
++	metrics->mem_limit = metrics_get_ull_with_max(c, cgroup_ops, "memory.max");
++	metrics->inactive_file_total = metrics_match_get_ull(c, cgroup_ops, "memory.stat", "inactive_file", 1);
++	metrics->cache = metrics_match_get_ull(c, cgroup_ops, "memory.stat", "file", 1);
++	metrics->cache_total = metrics->cache;
++
++	// cgroup v2 does not support kernel memory
++	metrics->kmem_used = 0;
++	metrics->kmem_limit = 0;
++
++	// pids
++	metrics->pids_current = metrics_get_ull(c, cgroup_ops, "pids.current");
++
++	return true;
++}
++
++/* isulad add get container metrics */
++static bool do_lxcapi_get_container_metrics(struct lxc_container *c,  struct lxc_container_metrics *metrics)
++{
++	call_cleaner(cgroup_exit) struct cgroup_ops *cgroup_ops = NULL;
++	const char *state = NULL;
++	if (c == NULL || c->lxc_conf == NULL || metrics == NULL) {
++		return false;
++	}
++
++	state = c->state(c);
++	metrics->state = state;
++
++	if (!is_stopped(c)) {
++		metrics->init = c->init_pid(c);
++	} else {
++		metrics->init = -1;
++	}
++
++	cgroup_ops = cgroup_init(c->lxc_conf);
++	if (cgroup_ops == NULL) {
++		return false;
++	}
++
++	if (cgroup_ops->cgroup_layout == CGROUP_LAYOUT_UNIFIED) {
++		return unified_metrics_get(c, cgroup_ops, metrics);
++	}
++
++	metrics->cpu_use_nanos = metrics_get_ull(c, cgroup_ops, "cpuacct.usage");
++	metrics->pids_current = metrics_get_ull(c, cgroup_ops, "pids.current");
++
++	metrics->rss_bytes = metrics_match_get_ull(c,cgroup_ops, "memory.stat", "rss", 1);
++	metrics->page_faults = metrics_match_get_ull(c,cgroup_ops, "memory.stat", "pgfault", 1);
++	metrics->major_page_faults = metrics_match_get_ull(c,cgroup_ops, "memory.stat", "pgmajfault", 1);
++
++	metrics->cpu_use_user = metrics_match_get_ull(c, cgroup_ops, "cpuacct.stat", "user", 1);
++	metrics->cpu_use_sys = metrics_match_get_ull(c, cgroup_ops, "cpuacct.stat", "system", 1);
++
++	// Try to read CFQ stats available on all CFQ enabled kernels first
++	metrics_get_blk_stats(c, cgroup_ops, "blkio.io_serviced_recursive", &metrics->io_serviced);
++	if (metrics->io_serviced.read == 0 && metrics->io_serviced.write == 0 && metrics->io_serviced.total == 0) {
++		metrics_get_blk_stats(c, cgroup_ops, "blkio.throttle.io_service_bytes", &metrics->io_service_bytes);
++		metrics_get_blk_stats(c, cgroup_ops, "blkio.throttle.io_serviced", &metrics->io_serviced);
++	} else {
++		metrics_get_blk_stats(c, cgroup_ops, "blkio.io_service_bytes_recursive", &metrics->io_service_bytes);
++	}
++
++	metrics->mem_used = metrics_get_ull(c, cgroup_ops, "memory.usage_in_bytes");
++	metrics->mem_limit = metrics_get_ull(c, cgroup_ops, "memory.limit_in_bytes");
++	metrics->kmem_used = metrics_get_ull(c, cgroup_ops, "memory.kmem.usage_in_bytes");
++	metrics->kmem_limit = metrics_get_ull(c, cgroup_ops, "memory.kmem.limit_in_bytes");
++
++	metrics->cache = metrics_match_get_ull(c, cgroup_ops, "memory.stat", "cache", 1);
++	metrics->cache_total = metrics_match_get_ull(c, cgroup_ops, "memory.stat", "total_cache", 1);
++	metrics->inactive_file_total = metrics_match_get_ull(c, cgroup_ops, "memory.stat", "total_inactive_file", 1);
++
++	return true;
++}
++
++WRAP_API_1(bool, lxcapi_get_container_metrics, struct lxc_container_metrics *)
++
++#endif
++
+ struct lxc_container *lxc_container_new(const char *name, const char *configpath)
+ {
+ 	struct lxc_container *c;
+@@ -5310,10 +6153,24 @@ struct lxc_container *lxc_container_new(const char *name, const char *configpath
+ 		goto err;
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	if (!set_oci_hook_config_filename(c)) {
++		fprintf(stderr, "Error allocating oci hooks file pathname\n");
++		goto err;
++	}
++
++	if (load_config && file_exists(c->configfile)) {
++		if (!lxcapi_load_config(c, NULL)) {
++			fprintf(stderr, "Failed to load config for %s\n", name);
++			goto err;
++		}
++	}
++#else
+ 	if (file_exists(c->configfile) && !lxcapi_load_config(c, NULL)) {
+ 		fprintf(stderr, "Failed to load config for %s\n", name);
+ 		goto err;
+ 	}
++#endif
+ 
+ 	rc = ongoing_create(c);
+ 	switch (rc) {
+@@ -5337,6 +6194,9 @@ struct lxc_container *lxc_container_new(const char *name, const char *configpath
+ 
+ 	c->daemonize			= true;
+ 	c->pidfile			= NULL;
++#ifdef HAVE_ISULAD
++	c->image_type_oci = false;
++#endif
+ 
+ 	/* Assign the member functions. */
+ 	c->is_defined			= lxcapi_is_defined;
+@@ -5400,6 +6260,20 @@ struct lxc_container *lxc_container_new(const char *name, const char *configpath
+ 	c->umount			= lxcapi_umount;
+ 	c->seccomp_notify_fd		= lxcapi_seccomp_notify_fd;
+ 	c->seccomp_notify_fd_active	= lxcapi_seccomp_notify_fd_active;
++#ifdef HAVE_ISULAD
++	c->set_container_info_file = lxcapi_set_container_info_file;
++	c->set_terminal_init_fifos = lxcapi_set_terminal_default_fifos;
++	c->add_terminal_fifos = lxcapi_add_terminal_fifo;
++	c->set_terminal_winch = lxcapi_set_terminal_winch;
++	c->set_exec_terminal_winch = lxcapi_set_exec_terminal_winch;
++	c->want_disable_pty = lxcapi_want_disable_pty;
++	c->want_open_stdin = lxcapi_want_open_stdin;
++	c->clean_container_resource = lxcapi_clean_container_resource;
++	c->get_container_pids = lxcapi_get_container_pids;
++	c->set_start_timeout = lxcapi_set_start_timeout;
++	c->set_oci_type = lxcapi_set_oci_type;
++	c->get_container_metrics = lxcapi_get_container_metrics;
++#endif
+ 
+ 	return c;
+ 
+@@ -5408,6 +6282,19 @@ err:
+ 	return NULL;
+ }
+ 
++#ifdef HAVE_ISULAD
++// isulad: new container without load config to save time
++struct lxc_container *lxc_container_without_config_new(const char *name, const char *configpath)
++{
++	return do_lxc_container_new(name, configpath, false);
++}
++
++struct lxc_container *lxc_container_new(const char *name, const char *configpath)
++{
++	return do_lxc_container_new(name, configpath, true);
++}
++#endif
++
+ int lxc_get_wait_states(const char **states)
+ {
+ 	int i;
+@@ -5578,11 +6465,21 @@ int list_active_containers(const char *lxcpath, char ***nret,
+ 				continue;
+ 		}
+ 
++#ifdef HAVE_ISULAD
++		if (ct_name && ct_name_cnt) {
++			if (array_contains(&ct_name, p, ct_name_cnt)) {
++				if (is_hashed)
++					free(p);
++				continue;
++			}
++		}
++#else
+ 		if (array_contains(&ct_name, p, ct_name_cnt)) {
+ 			if (is_hashed)
+ 				free(p);
+ 			continue;
+ 		}
++#endif
+ 
+ 		if (!add_to_array(&ct_name, p, ct_name_cnt)) {
+ 			if (is_hashed)
+diff --git a/src/lxc/lxccontainer.h b/src/lxc/lxccontainer.h
+index 3386bff..06e8f0b 100644
+--- a/src/lxc/lxccontainer.h
++++ b/src/lxc/lxccontainer.h
+@@ -26,6 +26,10 @@ extern "C" {
+ #define LXC_CREATE_MAXFLAGS       (1 << 1) /*!< Number of \c LXC_CREATE* flags */
+ #define LXC_MOUNT_API_V1		   1
+ 
++#ifdef HAVE_ISULAD
++#define LXC_IMAGE_OCI_KEY "lxc.imagetype.oci"
++#endif
++
+ struct bdev_specs;
+ 
+ struct lxc_snapshot;
+@@ -40,6 +44,44 @@ struct lxc_mount {
+ 	int version;
+ };
+ 
++#ifdef HAVE_ISULAD
++struct lxc_blkio_metrics {
++	uint64_t read;
++	uint64_t write;
++	uint64_t total;
++};
++
++struct lxc_container_metrics {
++    /* State of container */
++    const char *state;
++    /* The process ID of the init container */
++    pid_t init;
++    /* Current pids */
++    uint64_t pids_current;
++    /* CPU usage */
++    uint64_t cpu_use_nanos;
++    uint64_t cpu_use_user;
++    uint64_t cpu_use_sys;
++    /* BlkIO usage */
++    struct lxc_blkio_metrics io_service_bytes;
++    struct lxc_blkio_metrics io_serviced;
++    /* Memory usage */
++    uint64_t mem_used;
++    uint64_t mem_limit;
++    uint64_t rss_bytes;
++    uint64_t page_faults;
++    uint64_t major_page_faults;
++    /* Kernel Memory usage */
++    uint64_t kmem_used;
++    uint64_t kmem_limit;
++    /* Cache usage */
++    uint64_t cache;
++    uint64_t cache_total;
++    /* total inactive file */
++    uint64_t inactive_file_total;
++};
++#endif
++
+ /*!
+  * An LXC container.
+  *
+@@ -107,6 +149,38 @@ struct lxc_container {
+ 	/*! Full path to configuration file */
+ 	char *config_path;
+ 
++#ifdef HAVE_ISULAD
++	/*! isulad:
++	 * \private
++	 * exit FIFO File to open used monitor the state of lxc monitor process.
++	 */
++	char *exit_fifo;
++	/*! Whether container wishes to create pty or pipes for console log */
++	bool disable_pty;
++
++	/*! Whether container wishes to keep stdin active */
++	bool open_stdin;
++
++	/*!
++	 * \private
++	 * isulad: support oci hook from json file
++	 * full path of json file
++	 * */
++	char *ocihookfile;
++
++	/*! isulad:
++	 * \private
++	 * start_timeout.
++	 */
++	unsigned int start_timeout;
++
++	/*! isulad:
++	 * \private
++	 *  image_type_oci
++	 */
++	bool image_type_oci;
++#endif
++
+ 	/*!
+ 	 * \brief Determine if \c /var/lib/lxc/$name/config exists.
+ 	 *
+@@ -884,6 +958,115 @@ struct lxc_container {
+ 	 * \return Mount fd of the container's devpts instance.
+ 	 */
+ 	int (*devpts_fd)(struct lxc_container *c);
++
++#ifdef HAVE_ISULAD
++	/*! isulad add
++	 * \brief An API call to set the path of info file
++	 *
++	 * \param c Container.
++	 * \param info_file Value of the path of info file.
++	 *
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*set_container_info_file) (struct lxc_container *c, const char *info_file);
++
++	/*! isulad add
++	 * \brief An API call to change the path of the console default fifos
++	 *
++	 * \param c Container.
++	 * \param path Value of the console path.
++	 *
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*set_terminal_init_fifos)(struct lxc_container *c, const char *in, const char *out, const char *err);
++
++	/*! isulad add
++	 * \brief An API call to add the path of terminal fifos
++	 *
++	 * \param c Container.
++	 * \param path Value of the console path..
++	 *
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*add_terminal_fifos)(struct lxc_container *c, const char *in, const char *out, const char *err);
++
++	bool (*set_terminal_winch)(struct lxc_container *c, unsigned int height, unsigned int width);
++
++	bool (*set_exec_terminal_winch)(struct lxc_container *c, const char *suffix, unsigned int height, unsigned int width);
++
++	/*!
++	 * \brief Change whether the container wants to create pty or pipes
++	 * from the console log.
++	 *
++	 * \param c Container.
++	 * \param state Value for the disable pty bit (0 or 1).
++	 *
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*want_disable_pty)(struct lxc_container *c, bool state);
++
++	/*!
++	 * \brief Change whether the container wants to keep stdin active
++	 * for parent process of container
++	 *
++	 * \param c Container.
++	 * \param state Value for the open_stdin bit (0 or 1).
++	 *
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*want_open_stdin)(struct lxc_container *c, bool state);
++
++	/*! isulad add
++	 * \brief An API call to clean resources of container
++	 *
++	 * \param c Container.
++	 * \param pid Value of container process.
++	 *
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*clean_container_resource) (struct lxc_container *c, pid_t pid);
++
++	/*! isulad add
++	 * \brief An API call to get container pids
++	 *
++	 * \param c Container.
++	 * \param pids Value of container pids.
++	 * \param pids_len Value of container pids len.
++	 * \param pid Value of container pid.
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*get_container_pids)(struct lxc_container *c,pid_t **pids,size_t *pids_len);
++
++	/*! isulad add
++	 * \brief An API call to set start timeout
++	 *
++	 * \param c Container.
++	 * \param start_timeout Value of start timeout.
++	 *
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*set_start_timeout)(struct lxc_container *c, unsigned int start_timeout);
++
++	/*! isulad add
++	 * \brief An API call to set oci type
++	 *
++	 * \param c Container.
++	 * \param image_type_oci image oci type.
++	 *
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*set_oci_type)(struct lxc_container *c, bool image_type_oci);
++	
++	/*! isulad add
++	 * \brief An API call to set start timeout
++	 *
++	 * \param c Container.
++	 * \param start_timeout Value of start timeout.
++	 *
++	 * \return \c true on success, else \c false.
++	 */
++	bool (*get_container_metrics)(struct lxc_container *c, struct lxc_container_metrics *metrics);
++#endif
+ };
+ 
+ /*!
+@@ -1017,6 +1200,20 @@ struct lxc_console_log {
+  */
+ struct lxc_container *lxc_container_new(const char *name, const char *configpath);
+ 
++#ifdef HAVE_ISULAD
++/*!
++ * \brief Create a new container without loading config.
++ *
++ * \param name Name to use for container.
++ * \param configpath Full path to configuration file to use.
++ *
++ * \return Newly-allocated container, or \c NULL on error.
++ *
++ * \note This function can only used for listing container.
++ */
++struct lxc_container *lxc_container_without_config_new(const char *name, const char *configpath);
++#endif
++
+ /*!
+  * \brief Add a reference to the specified container.
+  *
+diff --git a/src/lxc/start.c b/src/lxc/start.c
+index 9f68304..70af128 100644
+--- a/src/lxc/start.c
++++ b/src/lxc/start.c
+@@ -344,7 +344,11 @@ static int setup_signal_fd(sigset_t *oldmask)
+ {
+ 	int ret;
+ 	sigset_t mask;
++#ifdef HAVE_ISULAD
++	const int signals[] = {SIGBUS, SIGILL, SIGSEGV, SIGWINCH, SIGTERM};
++#else
+ 	const int signals[] = {SIGBUS, SIGILL, SIGSEGV, SIGWINCH};
++#endif
+ 
+ 	/* Block everything except serious error signals. */
+ 	ret = sigfillset(&mask);
+@@ -625,6 +629,16 @@ int lxc_poll(const char *name, struct lxc_handler *handler)
+ 
+ 	TRACE("Mainloop is ready");
+ 
++#ifdef HAVE_ISULAD
++	// iSulad: close stdin pipe if we do not want open_stdin with container stdin
++	if (!handler->conf->console.open_stdin) {
++		if (handler->conf->console.pipes[0][1] > 0) {
++			close(handler->conf->console.pipes[0][1]);
++			handler->conf->console.pipes[0][1] = -1;
++		}
++	}
++#endif
++
+ 	ret = lxc_mainloop(&descr, -1);
+ 	if (descr.type == LXC_MAINLOOP_EPOLL)
+ 		close_prot_errno_disarm(descr.epfd);
+@@ -634,7 +648,11 @@ int lxc_poll(const char *name, struct lxc_handler *handler)
+ 	if (console) {
+ 		ret = lxc_terminal_mainloop_add(&descr_console, console);
+ 		if (ret == 0)
++#ifdef HAVE_ISULAD
++			ret = isulad_safe_mainloop(&descr_console, 100);
++#else
+ 			ret = lxc_mainloop(&descr_console, 0);
++#endif
+ 	}
+ 
+ out_mainloop_console:
+@@ -718,6 +736,12 @@ struct lxc_handler *lxc_init_handler(struct lxc_handler *old,
+ 	}
+ 
+ 	handler->name = name;
++
++#ifdef HAVE_ISULAD
++	handler->exit_code = -1; /* isulad: record exit code of container */
++	handler->image_type_oci = false;
++#endif
++
+ 	if (daemonize)
+ 		handler->transient_pid = lxc_raw_getpid();
+ 	else
+@@ -768,6 +792,10 @@ int lxc_init(const char *name, struct lxc_handler *handler)
+ 	int ret;
+ 	const char *loglevel;
+ 	struct lxc_conf *conf = handler->conf;
++#ifdef HAVE_ISULAD
++	conf->console.disable_pty = handler->disable_pty;
++	conf->console.open_stdin = handler->open_stdin;
++#endif
+ 
+ 	handler->monitor_pid = lxc_raw_getpid();
+ 	status_fd = open("/proc/self/status", O_RDONLY | O_CLOEXEC);
+@@ -908,6 +936,186 @@ void lxc_expose_namespace_environment(const struct lxc_handler *handler)
+ 	}
+ }
+ 
++
++#ifdef HAVE_ISULAD
++/* isulad: start timeout thread */
++typedef enum {
++	START_INIT,
++	START_TIMEOUT,
++	START_MAX,
++} start_timeout_t;
++
++static start_timeout_t global_timeout_state = START_INIT;
++static sem_t global_timeout_sem;
++
++struct start_timeout_conf {
++	unsigned int timeout;
++	int errfd;
++};
++
++void trim_line(char *s)
++{
++	size_t len;
++
++	len = strlen(s);
++	while ((len > 1) && (s[len - 1] == '\n'))
++		s[--len] = '\0';
++}
++
++static int _read_procs_file(const char *path, pid_t **pids, size_t *len)
++{
++	FILE *f;
++	char *line = NULL;
++	size_t sz = 0;
++	pid_t *tmp_pids = NULL;
++
++	f = fopen_cloexec(path, "r");
++	if (!f)
++		return -1;
++
++	while (getline(&line, &sz, f) != -1) {
++		pid_t pid;
++		trim_line(line);
++		pid = (pid_t)atoll(line);
++		if (lxc_mem_realloc((void **)&tmp_pids, sizeof(pid_t) * (*len + 1), *pids, sizeof(pid_t) * (*len)) != 0) {
++			free(*pids);
++			*pids = NULL;
++			ERROR("out of memory");
++			free(line);
++			fclose(f);
++			return -1;
++		}
++		*pids = tmp_pids;
++
++		(*pids)[*len] = pid;
++		(*len)++;
++	}
++
++	free(line);
++	fclose(f);
++	return 0;
++}
++
++static int _recursive_read_cgroup_procs(const char *dirpath, pid_t **pids, size_t *len)
++{
++	struct dirent *direntp = NULL;
++	DIR *dir = NULL;
++	int ret, failed = 0;
++	char pathname[PATH_MAX];
++
++	dir = opendir(dirpath);
++	if (dir == NULL) {
++		WARN("Failed to open \"%s\"", dirpath);
++		return 0;
++	}
++
++	while ((direntp = readdir(dir))) {
++		struct stat mystat;
++		int rc;
++
++		if (!strcmp(direntp->d_name, ".") ||
++		                !strcmp(direntp->d_name, ".."))
++			continue;
++
++		rc = snprintf(pathname, PATH_MAX, "%s/%s", dirpath, direntp->d_name);
++		if (rc < 0 || rc >= PATH_MAX) {
++			failed = 1;
++			continue;
++		}
++
++		if (strcmp(direntp->d_name, "cgroup.procs") == 0) {
++			if (_read_procs_file(pathname, pids, len)) {
++				failed = 1;
++
++			}
++			continue;
++		}
++
++		ret = lstat(pathname, &mystat);
++		if (ret) {
++			failed = 1;
++			continue;
++		}
++
++		if (S_ISDIR(mystat.st_mode)) {
++			if (_recursive_read_cgroup_procs(pathname, pids, len) < 0)
++				failed = 1;
++		}
++	}
++
++	ret = closedir(dir);
++	if (ret) {
++		WARN("Failed to close directory \"%s\"", dirpath);
++		failed = 1;
++	}
++
++	return failed ? -1 : 0;
++}
++
++int get_all_pids(struct cgroup_ops *cg_ops, pid_t **pids, size_t *len)
++{
++	const char *devices_path = NULL;
++
++	devices_path = cg_ops->get_cgroup_full_path(cg_ops, "devices");
++	if (!file_exists(devices_path)) {
++		return 0;
++	}
++
++	return _recursive_read_cgroup_procs(devices_path, pids, len);
++}
++
++static int set_cgroup_freezer(struct cgroup_ops *cg_ops, const char *value)
++{
++	char *fullpath;
++	int ret;
++
++	fullpath = must_make_path(cg_ops->get_cgroup_full_path(cg_ops, "freezer"), "freezer.state", NULL);
++	ret = lxc_write_to_file(fullpath, value, strlen(value), false, 0666);
++	free(fullpath);
++	return ret;
++}
++
++/* isulad: kill all process in container cgroup path */
++static void signal_all_processes(struct lxc_handler *handler)
++{
++	int ret;
++	struct cgroup_ops *cg_ops = handler->cgroup_ops;
++	pid_t *pids = NULL;
++	size_t len = 0, i;
++
++	ret = set_cgroup_freezer(cg_ops, "FROZEN");
++	if (ret < 0 && errno != ENOENT) {
++		WARN("cgroup_set frozen failed");
++	}
++
++	ret = get_all_pids(cg_ops, &pids, &len);
++	if (ret < 0) {
++		WARN("failed to get all pids");
++	}
++
++	for (i = 0; i < len; i++) {
++		ret = kill(pids[i], SIGKILL);
++		if (ret < 0 && errno != ESRCH) {
++			WARN("Can not kill process (pid=%d) with SIGKILL for container %s", pids[i], handler->name);
++		}
++	}
++
++	ret = set_cgroup_freezer(cg_ops, "THAWED");
++	if (ret < 0 && errno != ENOENT) {
++		WARN("cgroup_set thawed failed");
++	}
++
++	for (i = 0; i < len; i++) {
++		ret = lxc_wait_for_pid_status(pids[i]);
++		if (ret < 0 && errno != ECHILD) {
++			WARN("Failed to wait pid %d for container %s: %s", pids[i], handler->name, strerror(errno));
++		}
++	}
++
++	free(pids);
++}
++#endif
++
+ void lxc_end(struct lxc_handler *handler)
+ {
+ 	int ret;
+@@ -945,14 +1153,44 @@ void lxc_end(struct lxc_handler *handler)
+ 
+ 	handler->lsm_ops->cleanup(handler->lsm_ops, handler->conf, handler->lxcpath);
+ 
++
++#ifdef HAVE_ISULAD
++	// close maincmd fd before destroy cgroup for isulad
++	if (handler->conf->reboot == REBOOT_NONE) {
++		/* For all new state clients simply close the command socket.
++		 * This will inform all state clients that the container is
++		 * STOPPED and also prevents a race between a open()/close() on
++		 * the command socket causing a new process to get ECONNREFUSED
++		 * because we haven't yet closed the command socket.
++		 */
++		close_prot_errno_disarm(handler->conf->maincmd_fd);
++		TRACE("Closed command socket");
++	}
++	int retry_count = 0;
++	int max_retry = 10;
++retry:
++	if (cgroup_ops != NULL && !cgroup_ops->payload_destroy(cgroup_ops, handler)) {
++	        TRACE("Trying to kill all subprocess");
++	        signal_all_processes(handler);
++	        TRACE("Finished kill all subprocess");
++	        if (retry_count < max_retry) {
++				usleep(100 * 1000); /* 100 millisecond */
++				retry_count++;
++				goto retry;
++		}
++		SYSERROR("Failed to destroy cgroup path for container: \"%s\"", handler->name);
++	}
++#else
+ 	if (cgroup_ops) {
+ 		cgroup_ops->payload_destroy(cgroup_ops, handler);
+ 		cgroup_ops->monitor_destroy(cgroup_ops, handler);
+ 	}
++#endif
+ 
+ 	put_lxc_rootfs(&handler->conf->rootfs, true);
+ 
+ 	if (handler->conf->reboot == REBOOT_NONE) {
++#ifndef HAVE_ISULAD
+ 		/* For all new state clients simply close the command socket.
+ 		 * This will inform all state clients that the container is
+ 		 * STOPPED and also prevents a race between a open()/close() on
+@@ -961,12 +1199,23 @@ void lxc_end(struct lxc_handler *handler)
+ 		 */
+ 		close_prot_errno_disarm(handler->conf->maincmd_fd);
+ 		TRACE("Closed command socket");
++#endif
+ 
+ 		/* This function will try to connect to the legacy lxc-monitord
+ 		 * state server and only exists for backwards compatibility.
+ 		 */
+ 		lxc_monitor_send_state(name, STOPPED, handler->lxcpath);
+ 
++#ifdef HAVE_ISULAD
++		/* isuald: write exit code to exit fifo */
++		if (handler->conf->exit_fd >= 0) {
++			ret = write(handler->conf->exit_fd, &handler->exit_code, sizeof(int));
++			if (ret != sizeof(int)) {
++				SYSERROR("Failed to write to exit code to exit fifo.");
++			}
++		}
++#endif
++
+ 		/* The command socket is closed so no one can acces the command
+ 		 * socket anymore so there's no need to lock it.
+ 		 */
+@@ -1060,6 +1309,25 @@ static int do_start(void *data)
+ 
+ 	lxc_sync_fini_parent(handler);
+ 
++#ifdef HAVE_ISULAD
++	sigset_t mask;
++
++	/*isulad: restore default signal handlers and unblock all signals*/
++	for (int i = 1; i < NSIG; i++)
++		signal(i, SIG_DFL);
++
++	ret = sigfillset(&mask);
++	if (ret < 0) {
++		SYSERROR("Failed to fill signal mask");
++		goto out_warn_father;
++	}
++	ret = sigprocmask(SIG_UNBLOCK, &mask, NULL);
++	if (ret < 0) {
++		SYSERROR("Failed to set signal mask");
++		goto out_warn_father;
++	}
++#endif
++
+ 	if (lxc_abstract_unix_recv_one_fd(data_sock1, &status_fd, NULL, 0) < 0) {
+ 		ERROR("Failed to receive status file descriptor from parent process");
+ 		goto out_warn_father;
+@@ -1153,7 +1421,11 @@ static int do_start(void *data)
+ 	 * means that migration won't work, but at least we won't spew output
+ 	 * where it isn't wanted.
+ 	 */
++#ifdef HAVE_ISULAD
++	if (!handler->disable_pty && handler->daemonize && !handler->conf->autodev) {
++#else
+ 	if (handler->daemonize && !handler->conf->autodev) {
++#endif
+ 		char path[PATH_MAX];
+ 
+ 		ret = strnprintf(path, sizeof(path), "%s/dev/null",
+@@ -1269,6 +1541,9 @@ static int do_start(void *data)
+ 	/* Setup the container, ip, names, utsname, ... */
+ 	ret = lxc_setup(handler);
+ 	if (ret < 0) {
++#ifdef HAVE_ISULAD
++		lxc_write_error_message(handler->conf->errpipe[1], "Failed to setup lxc, please check the config file.");
++#endif
+ 		ERROR("Failed to setup container \"%s\"", handler->name);
+ 		goto out_warn_father;
+ 	}
+@@ -1291,6 +1566,43 @@ static int do_start(void *data)
+ 		DEBUG("Set PR_SET_NO_NEW_PRIVS to block execve() gainable privileges");
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: dup2 pipe[0][0] to container stdin, pipe[1][1] to container stdout, pipe[2][1] to container stderr */
++	if (handler->disable_pty) {
++		if (handler->conf->console.pipes[0][1] >= 0) {
++			close(handler->conf->console.pipes[0][1]);
++			handler->conf->console.pipes[0][1] = -1;
++		}
++
++		if (handler->conf->console.pipes[0][0] >= 0) {
++			ret = dup2(handler->conf->console.pipes[0][0], STDIN_FILENO);
++			if (ret < 0)
++				goto out_warn_father;
++		}
++
++		if (handler->conf->console.pipes[1][0] >= 0) {
++			close(handler->conf->console.pipes[1][0]);
++			handler->conf->console.pipes[1][0] = -1;
++		}
++
++		if (handler->conf->console.pipes[1][1] >= 0) {
++			ret = dup2(handler->conf->console.pipes[1][1], STDOUT_FILENO);
++			if (ret < 0)
++				goto out_warn_father;
++		}
++		if (handler->conf->console.pipes[2][0] >= 0) {
++			close(handler->conf->console.pipes[2][0]);
++			handler->conf->console.pipes[2][0] = -1;
++		}
++
++		if (handler->conf->console.pipes[2][1] >= 0) {
++			ret = dup2(handler->conf->console.pipes[2][1], STDERR_FILENO);
++			if (ret < 0)
++				goto out_warn_father;
++		}
++	}
++#endif
++
+ 	/* If we mounted a temporary proc, then unmount it now. */
+ 	tmp_proc_unmount(handler->conf);
+ 
+@@ -1307,7 +1619,11 @@ static int do_start(void *data)
+ 
+ 	close_prot_errno_disarm(handler->sigfd);
+ 
++#ifdef HAVE_ISULAD
++	if (!handler->disable_pty && handler->conf->console.pty < 0 && handler->daemonize) {
++#else
+ 	if (handler->conf->console.pty < 0 && handler->daemonize) {
++#endif
+ 		if (devnull_fd < 0) {
+ 			devnull_fd = open_devnull();
+ 			if (devnull_fd < 0)
+@@ -1326,6 +1642,16 @@ static int do_start(void *data)
+ 	setsid();
+ 
+ 	if (handler->conf->init_cwd) {
++#ifdef HAVE_ISULAD
++		/* try to craete workdir if not exist */
++		struct stat st;
++		if (stat(handler->conf->init_cwd, &st) < 0 && mkdir_p(handler->conf->init_cwd, 0755) < 0) {
++			SYSERROR("Try to create directory \"%s\" as workdir failed", handler->conf->init_cwd);
++			lxc_write_error_message(handler->conf->errpipe[1], "%s:%d: Failed to create workdir: %s.",
++			                        __FILE__, __LINE__, strerror(errno));
++			goto out_warn_father;
++		}
++#endif
+ 		ret = chdir(handler->conf->init_cwd);
+ 		if (ret < 0) {
+ 			SYSERROR("Could not change directory to \"%s\"",
+@@ -1372,12 +1698,26 @@ static int do_start(void *data)
+ 		}
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	if (prctl(PR_SET_KEEPCAPS, 1) < 0) {
++		SYSERROR("Failed to keep permitted capabilities");
++		goto out_warn_father;
++	}
++#endif
++
+ 	/* The container has been setup. We can now switch to an unprivileged
+ 	 * uid/gid.
+ 	 */
+ 	new_uid = handler->conf->init_uid;
+ 	new_gid = handler->conf->init_gid;
+ 
++#ifdef HAVE_ISULAD
++	// isulad: set env home in container, must before "Avoid unnecessary syscalls."
++	if (lxc_setup_env_home(new_uid) < 0) {
++		goto out_warn_father;
++	}
++#endif
++
+ 	/* Avoid unnecessary syscalls. */
+ 	if (new_uid == nsuid)
+ 		new_uid = LXC_INVALID_UID;
+@@ -1419,6 +1759,19 @@ static int do_start(void *data)
+ 		goto out_warn_father;
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: drop the cap of current process */
++	if (prctl(PR_SET_KEEPCAPS, 0) < 0) {
++		SYSERROR("Failed to clear permitted capabilities");
++		goto out_warn_father;
++	}
++
++	if (lxc_drop_caps(handler->conf)) {
++		SYSERROR("Failed to drop caps");
++		goto out_warn_father;
++	}
++#endif
++
+ 	if (handler->conf->monitor_signal_pdeath != SIGKILL) {
+ 		ret = lxc_set_death_signal(handler->conf->monitor_signal_pdeath,
+ 					   handler->monitor_pid, status_fd);
+@@ -1433,7 +1786,12 @@ static int do_start(void *data)
+ 	 * After this call, we are in error because this ops should not return
+ 	 * as it execs.
+ 	 */
++#ifdef HAVE_ISULAD
++	close_prot_errno_disarm(status_fd);
++	handler->ops->start(handler, handler->data, handler->daemonize ? handler->conf->errpipe[1] : -1);
++#else
+ 	handler->ops->start(handler, handler->data);
++#endif
+ 
+ out_warn_father:
+ 	/*
+@@ -1604,6 +1962,94 @@ static inline void resolve_cgroup_clone_flags(struct lxc_handler *handler)
+ 	handler->ns_unshare_flags	|= CLONE_NEWCGROUP;
+ }
+ 
++#ifdef HAVE_ISULAD
++static int lxc_write_container_info(char *filename, pid_t pid, pid_t p_pid,
++		unsigned long long start_at, unsigned long long p_start_at)
++{
++	FILE *pid_fp = NULL;
++	int ret = 0;
++
++	pid_fp = lxc_fopen(filename, "w");
++	if (pid_fp == NULL) {
++		SYSERROR("Failed to create pidfile '%s'",filename);
++		ret = -1;
++		goto out;
++	}
++
++	if (fprintf(pid_fp, "%d %llu %d %llu\n", pid, start_at, p_pid, p_start_at) < 0) {
++		SYSERROR("Failed to write '%s'", filename);
++		ret = -1;
++		goto out;
++	}
++out:
++	if (pid_fp)
++		fclose(pid_fp);
++	pid_fp = NULL;
++	return ret;
++}
++
++static int lxc_check_container_info(char *filename, pid_t pid, pid_t p_pid,
++		unsigned long long start_at, unsigned long long p_start_at)
++{
++	int ret = 0;
++	int num;
++	char sbuf[1024] = {0}; /* bufs for stat */
++	int saved_pid;		/* process id */
++	int saved_ppid;		/* pid of parent process */
++	unsigned long long saved_start_time;	/* start time of process -- seconds since 1-1-70 */
++	unsigned long long saved_pstart_time;	/* start time of parent process -- seconds since 1-1-70 */
++
++	if ((lxc_file2str(filename, sbuf, sizeof(sbuf))) == -1) {
++		SYSERROR("Failed to read pidfile %s", filename);
++		ret = -1;
++		goto out;
++	}
++
++	num = sscanf(sbuf, "%d %Lu %d %Lu", &saved_pid, &saved_start_time, &saved_ppid, &saved_pstart_time);
++	if (num != 4) {
++		SYSERROR("Call sscanf error");
++		ret = -1;
++		goto out;
++	}
++
++	if (pid != saved_pid || p_pid != saved_ppid
++	                || start_at != saved_start_time || p_start_at != saved_pstart_time) {
++		ERROR("Check container info failed");
++		ret = -1;
++		goto out;
++	}
++
++out:
++	return ret;
++}
++
++/* isuald: save pid/ppid info */
++static int lxc_save_container_info(char *filename, pid_t pid)
++{
++	int ret = 0;
++	pid_t p_pid = 0;
++	unsigned long long start_at = 0;
++	unsigned long long p_start_at = 0;
++
++	start_at = lxc_get_process_startat(pid);
++	p_pid = getpid();
++	p_start_at = lxc_get_process_startat(p_pid);
++
++	ret = lxc_write_container_info(filename, pid, p_pid, start_at, p_start_at);
++	if (ret != 0) {
++		goto out;
++	}
++
++	ret = lxc_check_container_info(filename, pid, p_pid, start_at, p_start_at);
++	if (ret != 0) {
++		goto out;
++	}
++
++out:
++	return ret;
++}
++#endif
++
+ /* lxc_spawn() performs crucial setup tasks and clone()s the new process which
+  * exec()s the requested container binary.
+  * Note that lxc_spawn() runs in the parent namespaces. Any operations performed
+@@ -1741,6 +2187,32 @@ static int lxc_spawn(struct lxc_handler *handler)
+ 		handler->clone_flags &= ~CLONE_PIDFD;
+ 	TRACE("Cloned child process %d", handler->pid);
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: close pipe after clone */
++	if (handler->conf->console.pipes[0][0] >= 0) {
++		close(handler->conf->console.pipes[0][0]);
++		handler->conf->console.pipes[0][0] = -1;
++	}
++
++	if (handler->conf->console.pipes[1][1] >= 0) {
++		close(handler->conf->console.pipes[1][1]);
++		handler->conf->console.pipes[1][1] = -1;
++	}
++
++	if (handler->conf->console.pipes[2][1] >= 0) {
++		close(handler->conf->console.pipes[2][1]);
++		handler->conf->console.pipes[2][1] = -1;
++	}
++
++	/* isulad: save pid/ppid info into file*/
++	if (handler->conf->container_info_file) {
++		if (lxc_save_container_info(handler->conf->container_info_file, handler->pid)) {
++			ERROR("Failed to save cloned container pid");
++			goto out_delete_net;
++		}
++	}
++#endif
++
+ 	ret = core_scheduling(handler);
+ 	if (ret < 0)
+ 		goto out_delete_net;
+@@ -1757,6 +2229,13 @@ static int lxc_spawn(struct lxc_handler *handler)
+ 	if (ret < 0)
+ 		SYSERROR("Failed to set environment variable: LXC_PID=%s", pidstr);
+ 
++#ifdef HAVE_ISULAD
++	if (handler->cgroup_ops->container_cgroup) {
++		if (setenv("LXC_CGROUP_PATH", handler->cgroup_ops->container_cgroup, 1))
++			SYSERROR("Failed to set environment variable: LXC_CGROUP_PATH=%s.", handler->cgroup_ops->container_cgroup);
++	}
++#endif
++
+ 	for (i = 0; i < LXC_NS_MAX; i++)
+ 		if (handler->ns_on_clone_flags & ns_info[i].clone_flag)
+ 			INFO("Cloned %s", ns_info[i].flag_name);
+@@ -1848,7 +2327,11 @@ static int lxc_spawn(struct lxc_handler *handler)
+ 		goto out_delete_net;
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	ret = setup_resource_limits(conf, handler->pid, conf->errpipe[1]);
++#else
+ 	ret = setup_resource_limits(conf, handler->pid);
++#endif
+ 	if (ret < 0) {
+ 		ERROR("Failed to setup resource limits");
+ 		goto out_delete_net;
+@@ -1911,6 +2394,27 @@ static int lxc_spawn(struct lxc_handler *handler)
+ 		goto out_delete_net;
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: Run oci prestart hook at here */
++	ret = run_oci_hooks(name, "oci-prestart", conf, lxcpath);
++	if (ret < 0) {
++		ERROR("Failed to run oci prestart hooks");
++		goto out_delete_net;
++	}
++
++	if (START_TIMEOUT == global_timeout_state) {
++		lxc_write_error_message(conf->errpipe[1], "Starting the container \"%s\" timeout.", name);
++		ERROR("Starting the container \"%s\" timeout.", name);
++		goto out_delete_net;
++	}
++
++       /* Tell the child to continue its initialization. We'll get
++        * LXC_SYNC_POST_OCI_PRESTART_HOOK when it is ready for us to run oci prestart hooks.
++        */
++       if (lxc_sync_barrier_child(handler, LXC_SYNC_POST_OCI_PRESTART_HOOK))
++               goto out_delete_net;
++#endif
++
+ 	if (!lxc_sync_wake_child(handler, START_SYNC_FDS))
+ 		goto out_delete_net;
+ 
+@@ -1969,6 +2473,22 @@ static int lxc_spawn(struct lxc_handler *handler)
+ 	if (ret < 0)
+ 		goto out_abort;
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: Run oci prestart hook at here */
++	ret = run_oci_hooks(name, "oci-poststart", conf, lxcpath);
++	if (ret < 0) {
++		ERROR("Failed to run oci poststart hooks");
++		goto out_abort;
++	}
++
++	if (START_TIMEOUT == global_timeout_state) {
++		lxc_write_error_message(conf->errpipe[1], "Starting the container \"%s\" timeout.", name);
++		ERROR("Starting the container \"%s\" timeout.", name);
++		goto out_abort;
++	}
++
++#endif
++
+ 	ret = lxc_set_state(name, handler, RUNNING);
+ 	if (ret < 0) {
+ 		ERROR("Failed to set state to \"%s\"", lxc_state2str(RUNNING));
+@@ -2014,9 +2534,82 @@ static int lxc_inherit_namespaces(struct lxc_handler *handler)
+ 	return 0;
+ }
+ 
++#ifdef HAVE_ISULAD
++/* isulad: start timeout thread function */
++static void* wait_start_timeout(void *arg)
++{
++	struct start_timeout_conf *conf = (struct start_timeout_conf *)arg;
++
++	sem_post(&global_timeout_sem);
++
++	if (!conf || conf->timeout < 1)
++		goto out;
++
++	sleep(conf->timeout);
++
++	global_timeout_state = START_TIMEOUT;
++
++out:
++	free(conf);
++	return ((void *)0);
++}
++
++/* isulad: create start timeout thread */
++static int create_start_timeout_thread(struct lxc_conf *conf, unsigned int start_timeout)
++{
++	int ret = 0;
++	pthread_t ptid;
++	pthread_attr_t attr;
++	struct start_timeout_conf *timeout_conf = NULL;
++
++	if (sem_init(&global_timeout_sem, 0, 0)) {
++		ERROR("Failed to init start timeout semaphore");/*lint !e613*/
++		ret = -1;
++		return ret;
++	}
++
++	timeout_conf = malloc(sizeof(struct start_timeout_conf));
++	if (timeout_conf == NULL) {
++		ERROR("Failed to malloc start timeout conf");
++		ret = -1;
++		goto out;
++	}
++
++	memset(timeout_conf, 0, sizeof(struct start_timeout_conf));
++	timeout_conf->errfd = conf->errpipe[1];
++	timeout_conf->timeout = start_timeout;
++
++	pthread_attr_init(&attr);
++	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++	ret = pthread_create(&ptid, &attr, wait_start_timeout, timeout_conf);
++	pthread_attr_destroy(&attr);
++	if (ret != 0) {
++		ERROR("Create start wait timeout thread failed");
++		free(timeout_conf);
++		goto out;
++	}
++
++	sem_wait(&global_timeout_sem);
++out:
++	sem_destroy(&global_timeout_sem);
++	return ret;
++}
++
++// isulad: send '128 + signal' if container is killed by signal.
++#define EXIT_SIGNAL_OFFSET 128
++#endif
++
++#ifdef HAVE_ISULAD
++int __lxc_start(struct lxc_handler *handler, struct lxc_operations *ops,
++		void *data, const char *lxcpath, bool daemonize, int *error_num,
++		unsigned int start_timeout)
++{
++	int exit_code;
++#else
+ int __lxc_start(struct lxc_handler *handler, struct lxc_operations *ops,
+ 		void *data, const char *lxcpath, bool daemonize, int *error_num)
+ {
++#endif
+ 	int ret, status;
+ 	const char *name = handler->name;
+ 	struct lxc_conf *conf = handler->conf;
+@@ -2032,6 +2625,17 @@ int __lxc_start(struct lxc_handler *handler, struct lxc_operations *ops,
+ 	handler->daemonize = daemonize;
+ 	cgroup_ops = handler->cgroup_ops;
+ 
++#ifdef HAVE_ISULAD
++	/* isulad: add start timeout limit */
++	if (start_timeout > 0) {
++		ret = create_start_timeout_thread(conf, start_timeout);
++		if (ret) {
++			ERROR("Failed to create start timeout thread for container \"%s\".", name);
++			goto out_abort;
++		}
++	}
++#endif
++
+ 	if (!attach_block_device(handler->conf)) {
+ 		ERROR("Failed to attach block device");
+ 		ret = -1;
+@@ -2116,11 +2720,13 @@ int __lxc_start(struct lxc_handler *handler, struct lxc_operations *ops,
+ 		goto out_delete_network;
+ 	}
+ 
++#ifndef HAVE_ISULAD
+ 	if (!handler->init_died && handler->pid > 0) {
+ 		ERROR("Child process is not killed");
+ 		ret = -1;
+ 		goto out_delete_network;
+ 	}
++#endif
+ 
+ 	status = lxc_wait_for_pid_status(handler->pid);
+ 	if (status < 0)
+@@ -2130,6 +2736,20 @@ int __lxc_start(struct lxc_handler *handler, struct lxc_operations *ops,
+ 	 * reboot. This should mean it was an lxc-execute which simply exited.
+ 	 * In any case, treat it as a 'halt'.
+ 	 */
++#ifdef HAVE_ISULAD
++	// isulad: recored log for container init exit
++	if (WIFSIGNALED(status)) {
++		int signal_nr = WTERMSIG(status);
++		exit_code = EXIT_SIGNAL_OFFSET + signal_nr;
++		ERROR("Container \"%s\" init exited with signal %d", name, signal_nr);
++	} else if (WIFEXITED(status)) {
++		exit_code = WEXITSTATUS(status);
++		ERROR("Container \"%s\" init exited with status %d", name, exit_code);
++	} else {
++		exit_code = -1;
++		ERROR("Container \"%s\" init exited with unknown status", name);
++	}
++#else
+ 	if (WIFSIGNALED(status)) {
+ 		int signal_nr = WTERMSIG(status);
+ 		switch(signal_nr) {
+@@ -2148,16 +2768,25 @@ int __lxc_start(struct lxc_handler *handler, struct lxc_operations *ops,
+ 			break;
+ 		}
+ 	}
++#endif
+ 
+ 	ret = lxc_restore_phys_nics_to_netns(handler);
+ 	if (ret < 0)
+ 		ERROR("Failed to move physical network devices back to parent network namespace");
+ 
++#ifdef HAVE_ISULAD
++	lxc_monitor_send_exit_code(name, exit_code, handler->lxcpath);
++#else
+ 	lxc_monitor_send_exit_code(name, status, handler->lxcpath);
++#endif
+ 	lxc_error_set_and_log(handler->pid, status);
+ 	if (error_num)
+ 		*error_num = handler->exit_status;
+ 
++#ifdef HAVE_ISULAD
++	handler->exit_code = exit_code; /* record exit code */
++#endif
++
+ 	lxc_delete_network(handler);
+ 	detach_block_device(handler->conf);
+ 	lxc_end(handler);
+@@ -2187,7 +2816,11 @@ struct start_args {
+ 	char *const *argv;
+ };
+ 
++#ifdef HAVE_ISULAD
++static int start(struct lxc_handler *handler, void* data, int fd)
++#else
+ static int start(struct lxc_handler *handler, void* data)
++#endif
+ {
+ 	struct start_args *arg = data;
+ 
+@@ -2195,6 +2828,9 @@ static int start(struct lxc_handler *handler, void* data)
+ 
+ 	execvp(arg->argv[0], arg->argv);
+ 	SYSERROR("Failed to exec \"%s\"", arg->argv[0]);
++#ifdef HAVE_ISULAD
++	lxc_write_error_message(fd, "exec: \"%s\": %s.", arg->argv[0], strerror(errno));
++#endif
+ 	return 0;
+ }
+ 
+@@ -2212,14 +2848,22 @@ static struct lxc_operations start_ops = {
+ };
+ 
+ int lxc_start(char *const argv[], struct lxc_handler *handler,
++#ifdef HAVE_ISULAD
++	      const char *lxcpath, bool daemonize, int *error_num, unsigned int start_timeout)
++#else
+ 	      const char *lxcpath, bool daemonize, int *error_num)
++#endif
+ {
+ 	struct start_args start_arg = {
+ 		.argv = argv,
+ 	};
+ 
+ 	TRACE("Doing lxc_start");
++#ifdef HAVE_ISULAD
++	return __lxc_start(handler, &start_ops, &start_arg, lxcpath, daemonize, error_num, start_timeout);
++#else
+ 	return __lxc_start(handler, &start_ops, &start_arg, lxcpath, daemonize, error_num);
++#endif
+ }
+ 
+ static void lxc_destroy_container_on_signal(struct lxc_handler *handler,
+@@ -2291,3 +2935,261 @@ static bool do_destroy_container(struct lxc_handler *handler)
+ 
+ 	return storage_destroy(handler->conf);
+ }
++
++#ifdef HAVE_ISULAD
++/*isulad: set env for clean resources */
++static int clean_resource_set_env(struct lxc_handler *handler)
++{
++	const char *name = handler->name;
++	struct lxc_conf *conf = handler->conf;
++	char bufstr[PATH_MAX + 1];
++	int i = 0;
++	int j = 0;
++	int len = 2; //set "LXC_PID" and "LXC_CGNS_AWARE"
++
++	if (conf == NULL || conf->ocihooks == NULL || conf->ocihooks->poststop_len == 0) {
++		return 0;
++	}
++
++	if (name) {
++		len++;
++	}
++	if (conf->rcfile) {
++		len++;
++	}
++	if (conf->rootfs.mount) {
++		len++;
++	}
++	if (conf->rootfs.path) {
++		len++;
++	}
++	if (conf->console.path) {
++		len++;
++	}
++	if (conf->console.log_path) {
++		len++;
++	}
++	if (handler->cgroup_ops->container_cgroup) {
++		len++;
++	}
++
++	for (; i < conf->ocihooks->poststop_len; i++) {
++		size_t cap = conf->ocihooks->poststop[i]->env_len;
++		size_t newcap = cap + len + 1;
++		if (lxc_grow_array((void ***)&(conf->ocihooks->poststop[i]->env), &cap, newcap, 1) != 0) {
++			return -1;
++		}
++		j = conf->ocihooks->poststop[i]->env_len;
++		/* Start of environment variable setup for hooks. */
++		if (name) {
++			snprintf(bufstr, PATH_MAX + 1, "LXC_NAME=%s", name);
++			conf->ocihooks->poststop[i]->env[j++] = safe_strdup(bufstr);
++		}
++		if (conf->rcfile) {
++			snprintf(bufstr, PATH_MAX + 1, "LXC_CONFIG_FILE=%s", conf->rcfile);
++			conf->ocihooks->poststop[i]->env[j++] = safe_strdup(bufstr);
++		}
++		if (conf->rootfs.mount) {
++			snprintf(bufstr, PATH_MAX + 1, "LXC_ROOTFS_MOUNT=%s", conf->rootfs.mount);
++			conf->ocihooks->poststop[i]->env[j++] = safe_strdup(bufstr);
++		}
++		if (conf->rootfs.path) {
++			snprintf(bufstr, PATH_MAX + 1, "LXC_ROOTFS_PATH=%s", conf->rootfs.path);
++			conf->ocihooks->poststop[i]->env[j++] = safe_strdup(bufstr);
++		}
++		if (conf->console.path) {
++			snprintf(bufstr, PATH_MAX + 1, "LXC_CONSOLE=%s", conf->console.path);
++			conf->ocihooks->poststop[i]->env[j++] = safe_strdup(bufstr);
++		}
++		if (conf->console.log_path) {
++			snprintf(bufstr, PATH_MAX + 1, "LXC_CONSOLE_LOGPATH=%s", conf->console.log_path);
++			conf->ocihooks->poststop[i]->env[j++] = safe_strdup(bufstr);
++		}
++		conf->ocihooks->poststop[i]->env[j++] = safe_strdup("LXC_CGNS_AWARE=1");
++
++		snprintf(bufstr, PATH_MAX + 1, "LXC_PID=%d", handler->pid);
++		conf->ocihooks->poststop[i]->env[j++] = safe_strdup(bufstr);
++		if (handler->cgroup_ops->container_cgroup) {
++			snprintf(bufstr, PATH_MAX + 1, "LXC_CGROUP_PATH=%s", handler->cgroup_ops->container_cgroup);
++			conf->ocihooks->poststop[i]->env[j++] = safe_strdup(bufstr);
++		}
++		conf->ocihooks->poststop[i]->env_len = j;
++		/* End of environment variable setup for hooks. */
++	}
++	return 0;
++}
++
++/*isulad: init handler for clean */
++static struct lxc_handler *lxc_init_clean_handler(char *name, char *lxcpath, struct lxc_conf *conf, pid_t pid)
++{
++	int i;
++	struct lxc_handler *handler;
++
++	handler = malloc(sizeof(*handler));
++	if (handler == NULL)
++		return NULL;
++
++	memset(handler, 0, sizeof(*handler));
++
++	/* Note that am_guest_unpriv() checks the effective uid. We
++	 * probably don't care if we are real root only if we are running
++	 * as root so this should be fine.
++	 */
++	handler->am_root = !am_guest_unpriv();
++	handler->data_sock[0] = handler->data_sock[1] = -1;
++	handler->conf = conf;
++	handler->lxcpath = lxcpath;
++	handler->pinfd = -1;
++	handler->sigfd = -EBADF;
++	handler->pidfd = -EBADF;
++	handler->init_died = false;
++	handler->monitor_status_fd = -EBADF;
++	handler->pid = pid;
++	handler->state_socket_pair[0] = handler->state_socket_pair[1] = -1;
++	if (handler->conf->reboot == REBOOT_NONE)
++		lxc_list_init(&handler->conf->state_clients);
++
++	for (i = 0; i < LXC_NS_MAX; i++)
++		handler->nsfd[i] = -1;
++
++	handler->name = name;
++	handler->exit_code = -1; /* isulad: record exit code of container */
++
++	handler->cgroup_ops = cgroup_init(conf);
++	if (!handler->cgroup_ops) {
++		ERROR("Failed to initialize cgroup driver");
++		goto on_error;
++	}
++
++	INFO("Container \"%s\" 's clean handler is initialized.", name);
++
++	return handler;
++
++on_error:
++	lxc_put_handler(handler);
++
++	return NULL;
++}
++
++/*isulad: init handler for clean */
++static struct lxc_handler *lxc_init_pids_handler(char *name, char *lxcpath, struct lxc_conf *conf)
++{
++	int i;
++	struct lxc_handler *handler;
++
++	handler = malloc(sizeof(*handler));
++	if (handler == NULL)
++		return NULL;
++
++	memset(handler, 0, sizeof(*handler));
++
++	/* Note that am_guest_unpriv() checks the effective uid. We
++	 * probably don't care if we are real root only if we are running
++	 * as root so this should be fine.
++	 */
++	handler->am_root = !am_guest_unpriv();
++	handler->data_sock[0] = handler->data_sock[1] = -1;
++	handler->conf = conf;
++	handler->lxcpath = lxcpath;
++	handler->pinfd = -1;
++	handler->sigfd = -EBADF;
++	handler->init_died = false;
++	handler->state_socket_pair[0] = handler->state_socket_pair[1] = -1;
++	handler->monitor_status_fd = -EBADF;
++	handler->pidfd = -EBADF;
++	if (handler->conf->reboot == REBOOT_NONE)
++		lxc_list_init(&handler->conf->state_clients);
++
++	for (i = 0; i < LXC_NS_MAX; i++)
++		handler->nsfd[i] = -1;
++
++	handler->name = name;
++	handler->exit_code = -1; /* isulad: record exit code of container */
++
++	handler->cgroup_ops = cgroup_init(conf);
++	if (!handler->cgroup_ops) {
++		ERROR("Failed to initialize cgroup driver");
++		goto on_error;
++	}
++
++	INFO("Container \"%s\" 's clean handler is initialized.", name);
++
++	return handler;
++
++on_error:
++	lxc_put_handler(handler);
++
++	return NULL;
++}
++
++/*isulad: do_lxcapi_clean_resource */
++int do_lxcapi_clean_resource(char *name, char *lxcpath, struct lxc_conf *conf, pid_t pid)
++{
++	int ret = 0;
++	struct lxc_handler *handler = NULL;
++	int retry_count = 0;
++	int max_retry = 10;
++
++	handler = lxc_init_clean_handler(name, lxcpath, conf, pid);
++	if (!handler) {
++		ERROR("Failed to init container %s clean handler", name);
++		ret = -1;
++		goto out;
++	}
++
++	if (clean_resource_set_env(handler) != 0) {
++		ERROR("Failed to set env for poststop hooks");
++		ret = -1;
++		goto out;
++	}
++
++	if (run_oci_hooks(handler->name, "oci-poststop", handler->conf, handler->lxcpath)) {
++		ERROR("Failed to run lxc.hook.post-stop for container \"%s\".", handler->name);
++		ret = -1;
++	}
++
++retry:
++	if (!handler->cgroup_ops->payload_destroy(handler->cgroup_ops, handler)) {
++		TRACE("Trying to kill all subprocess");
++		signal_all_processes(handler);
++		TRACE("Finished kill all subprocess");
++		if (retry_count < max_retry) {
++			usleep(100 * 1000); /* 100 millisecond */
++			retry_count++;
++			goto retry;
++		}
++		SYSERROR("Failed to destroy cgroup path for container: \"%s\"", handler->name);
++		ret = -1;
++	}
++
++out:
++	lxc_put_handler(handler);
++	return ret;
++}
++
++/*isulad: do_lxcapi_get_pids */
++int do_lxcapi_get_pids(char *name, char *lxcpath, struct lxc_conf *conf, pid_t **pids,size_t *pids_len)
++{
++	int ret = 0;
++	struct lxc_handler *handler = NULL;
++	struct cgroup_ops *cg_ops = NULL;
++
++	handler = lxc_init_pids_handler(name, lxcpath, conf);
++	if (!handler) {
++		ERROR("Failed to init container %s clean handler", name);
++		ret = -1;
++		goto out;
++	}
++
++	cg_ops = handler->cgroup_ops;
++	ret = get_all_pids(cg_ops, pids, pids_len);
++	if (ret < 0) {
++		WARN("failed to get all pids");
++	}
++
++out:
++	lxc_put_handler(handler);
++	return ret;
++}
++
++#endif
+diff --git a/src/lxc/start.h b/src/lxc/start.h
+index bbd1a83..d03e5d5 100644
+--- a/src/lxc/start.h
++++ b/src/lxc/start.h
+@@ -153,7 +153,11 @@ struct execute_args {
+ };
+ 
+ struct lxc_operations {
++#ifdef HAVE_ISULAD
++	int (*start)(struct lxc_handler *, void *, int);
++#else
+ 	int (*start)(struct lxc_handler *, void *);
++#endif
+ 	int (*post_start)(struct lxc_handler *, void *);
+ };
+ 
+@@ -184,12 +188,26 @@ static inline int inherit_fds(struct lxc_handler *handler, bool closeall)
+ 				   ARRAY_SIZE(handler->keep_fds));
+ }
+ 
++#ifdef HAVE_ISULAD
++__hidden extern int __lxc_start(struct lxc_handler *handler,
++		struct lxc_operations* ops, void *data, const char *lxcpath,
++		bool daemonize, int *error_num, unsigned int start_timeout);
++#else
+ __hidden extern int __lxc_start(struct lxc_handler *, struct lxc_operations *, void *, const char *,
+ 				bool, int *);
++#endif
+ 
+ __hidden extern int resolve_clone_flags(struct lxc_handler *handler);
+ __hidden extern void lxc_expose_namespace_environment(const struct lxc_handler *handler);
+ 
++#ifdef HAVE_ISULAD
++/*isulad: do_lxcapi_clean_resource */
++extern int do_lxcapi_clean_resource(char *name, char *lxcpath, struct lxc_conf *conf, pid_t pid);
++
++/*isulad: do_lxcapi_get_pids */
++extern int do_lxcapi_get_pids(char *name, char *lxcpath, struct lxc_conf *conf, pid_t **pids,size_t *pids_len);
++#endif
++
+ static inline bool container_uses_namespace(const struct lxc_handler *handler,
+ 					    unsigned int ns_flag)
+ {
+-- 
+2.25.1
+
