@@ -1,4 +1,5 @@
-%global _release 2
+%global _release 3
+%global enable_isulad 0
 
 Name:           lxc
 Version:        5.0.2
@@ -76,7 +77,11 @@ This package contains documentation for lxc for creating containers.
 %ifarch riscv64
 export LDFLAGS="%{build_ldflags} -latomic -pthread"
 %endif
+%if 0%{?enable_isulad:1}
 meson setup -Disulad=true -Dtests=true -Dprefix=/usr build
+%else
+meson setup -Disulad=false -Dtests=true -Dprefix=/usr build
+%endif
 meson compile -C build
 
 %install
@@ -177,6 +182,9 @@ meson test -C build
 %{_datadir}/%{name}/config/*
 %dir %{_datadir}/%{name}/__pycache__
 %{_datadir}/%{name}/__pycache__/*
+%if 0%{!?enable_isulad:1}
+%{_datadir}/%{name}/hooks
+%endif
 
 
 %files help
@@ -193,6 +201,12 @@ meson test -C build
 %endif
 
 %changelog
+* Fri Aug 04 2023 zhangxiaoyu<zhangxiaoyu58@huawei.com> - 5.0.2-3
+- Type:enhancement
+- ID:NA
+- SUG:NA
+- DESC: disable isulad option
+
 * Tue Aug 01 2023 zhangxiaoyu<zhangxiaoyu58@huawei.com> - 5.0.2-2
 - Type:enhancement
 - ID:NA

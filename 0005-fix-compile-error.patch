@@ -1,4 +1,4 @@
-From 1b72c39b668d736f29f5b3e6eac84c4967dbdd82 Mon Sep 17 00:00:00 2001
+From edc766541e03d457ce61cda5f4e8e201a6d2a738 Mon Sep 17 00:00:00 2001
 From: zhangxiaoyu <zhangxiaoyu58@huawei.com>
 Date: Tue, 1 Aug 2023 09:36:57 +0800
 Subject: [PATCH] fix compile error
@@ -29,7 +29,7 @@ Signed-off-by: zhangxiaoyu <zhangxiaoyu58@huawei.com>
  src/lxc/lxccontainer.c          |    4 +
  src/lxc/mainloop.c              |    2 +-
  src/lxc/mainloop.h              |    2 +-
- src/lxc/seccomp.c               |   26 +-
+ src/lxc/seccomp.c               |   52 +
  src/lxc/start.c                 |   56 +-
  src/lxc/sync.c                  |    6 +
  src/lxc/sync.h                  |   13 +-
@@ -43,7 +43,7 @@ Signed-off-by: zhangxiaoyu <zhangxiaoyu58@huawei.com>
  src/tests/rootfs_options.c      |    4 +
  src/tests/sys_mixed.c           |    4 +
  src/tests/sysctls.c             |    4 +
- 38 files changed, 2661 insertions(+), 1096 deletions(-)
+ 38 files changed, 2700 insertions(+), 1083 deletions(-)
 
 diff --git a/meson.build b/meson.build
 index fda8045..05bcbb2 100644
@@ -4846,116 +4846,155 @@ index e8ce082..f485a1f 100644
  
  #endif
 diff --git a/src/lxc/seccomp.c b/src/lxc/seccomp.c
-index f0fa297..ecba248 100644
+index f0fa297..d952beb 100644
 --- a/src/lxc/seccomp.c
 +++ b/src/lxc/seccomp.c
-@@ -699,21 +699,21 @@ static int parse_config_v2(FILE *f, char *line, size_t *line_bufsz, struct lxc_c
+@@ -699,21 +699,33 @@ static int parse_config_v2(FILE *f, char *line, size_t *line_bufsz, struct lxc_c
  		ctx.architectures[0] = SCMP_ARCH_X86;
  		ctx.contexts[0] = get_new_ctx(lxc_seccomp_arch_i386,
  					      default_policy_action,
--					      &ctx.needs_merge[0]);
++#ifdef HAVE_ISULAD
 +					      &ctx.architectures[0]);
++#else
+ 					      &ctx.needs_merge[0]);
++#endif
  		if (!ctx.contexts[0])
  			goto bad;
  
  		ctx.architectures[1] = SCMP_ARCH_X32;
  		ctx.contexts[1] = get_new_ctx(lxc_seccomp_arch_x32,
  					      default_policy_action,
--					      &ctx.needs_merge[1]);
++#ifdef HAVE_ISULAD
 +					      &ctx.architectures[1]);
++#else
+ 					      &ctx.needs_merge[1]);
++#endif
  		if (!ctx.contexts[1])
  			goto bad;
  
  		ctx.architectures[2] = SCMP_ARCH_X86_64;
  		ctx.contexts[2] = get_new_ctx(lxc_seccomp_arch_amd64,
  					      default_policy_action,
--					      &ctx.needs_merge[2]);
++#ifdef HAVE_ISULAD
 +					      &ctx.architectures[2]);
++#else
+ 					      &ctx.needs_merge[2]);
++#endif
  		if (!ctx.contexts[2])
  			goto bad;
  #ifdef SCMP_ARCH_PPC
-@@ -723,14 +723,14 @@ static int parse_config_v2(FILE *f, char *line, size_t *line_bufsz, struct lxc_c
+@@ -723,14 +735,22 @@ static int parse_config_v2(FILE *f, char *line, size_t *line_bufsz, struct lxc_c
  		ctx.architectures[0] = SCMP_ARCH_PPC;
  		ctx.contexts[0] = get_new_ctx(lxc_seccomp_arch_ppc,
  					      default_policy_action,
--					      &ctx.needs_merge[0]);
++#ifdef HAVE_ISULAD
 +					      &ctx.architectures[0]);
++#else
+ 					      &ctx.needs_merge[0]);
++#endif
  		if (!ctx.contexts[0])
  			goto bad;
  
  		ctx.architectures[2] = SCMP_ARCH_PPC64;
  		ctx.contexts[2] = get_new_ctx(lxc_seccomp_arch_ppc64,
  					      default_policy_action,
--					      &ctx.needs_merge[2]);
++#ifdef HAVE_ISULAD
 +					      &ctx.architectures[2]);
++#else
+ 					      &ctx.needs_merge[2]);
++#endif
  		if (!ctx.contexts[2])
  			goto bad;
  #endif
-@@ -741,7 +741,7 @@ static int parse_config_v2(FILE *f, char *line, size_t *line_bufsz, struct lxc_c
+@@ -741,7 +761,11 @@ static int parse_config_v2(FILE *f, char *line, size_t *line_bufsz, struct lxc_c
  		ctx.architectures[0] = SCMP_ARCH_ARM;
  		ctx.contexts[0] = get_new_ctx(lxc_seccomp_arch_arm,
  					      default_policy_action,
--					      &ctx.needs_merge[0]);
++#ifdef HAVE_ISULAD
 +					      &ctx.architectures[0]);
++#else
+ 					      &ctx.needs_merge[0]);
++#endif
  		if (!ctx.contexts[0])
  			goto bad;
  
-@@ -749,7 +749,7 @@ static int parse_config_v2(FILE *f, char *line, size_t *line_bufsz, struct lxc_c
+@@ -749,7 +773,11 @@ static int parse_config_v2(FILE *f, char *line, size_t *line_bufsz, struct lxc_c
  		ctx.architectures[2] = SCMP_ARCH_AARCH64;
  		ctx.contexts[2] = get_new_ctx(lxc_seccomp_arch_arm64,
  					      default_policy_action,
--					      &ctx.needs_merge[2]);
++#ifdef HAVE_ISULAD
 +					      &ctx.architectures[2]);
++#else
+ 					      &ctx.needs_merge[2]);
++#endif
  		if (!ctx.contexts[2])
  			goto bad;
  #endif
-@@ -761,21 +761,21 @@ static int parse_config_v2(FILE *f, char *line, size_t *line_bufsz, struct lxc_c
+@@ -761,21 +789,33 @@ static int parse_config_v2(FILE *f, char *line, size_t *line_bufsz, struct lxc_c
  		ctx.architectures[0] = SCMP_ARCH_MIPS;
  		ctx.contexts[0] = get_new_ctx(lxc_seccomp_arch_mips,
  					      default_policy_action,
--					      &ctx.needs_merge[0]);
++#ifdef HAVE_ISULAD
 +					      &ctx.architectures[0]);
++#else
+ 					      &ctx.needs_merge[0]);
++#endif
  		if (!ctx.contexts[0])
  			goto bad;
  
  		ctx.architectures[1] = SCMP_ARCH_MIPS64N32;
  		ctx.contexts[1] = get_new_ctx(lxc_seccomp_arch_mips64n32,
  					      default_policy_action,
--					      &ctx.needs_merge[1]);
++#ifdef HAVE_ISULAD
 +					      &ctx.architectures[1]);
++#else
+ 					      &ctx.needs_merge[1]);
++#endif
  		if (!ctx.contexts[1])
  			goto bad;
  
  		ctx.architectures[2] = SCMP_ARCH_MIPS64;
  		ctx.contexts[2] = get_new_ctx(lxc_seccomp_arch_mips64,
  					      default_policy_action,
--					      &ctx.needs_merge[2]);
++#ifdef HAVE_ISULAD
 +					      &ctx.architectures[2]);
++#else
+ 					      &ctx.needs_merge[2]);
++#endif
  		if (!ctx.contexts[2])
  			goto bad;
  	} else if (native_arch == lxc_seccomp_arch_mipsel64) {
-@@ -784,21 +784,21 @@ static int parse_config_v2(FILE *f, char *line, size_t *line_bufsz, struct lxc_c
+@@ -784,21 +824,33 @@ static int parse_config_v2(FILE *f, char *line, size_t *line_bufsz, struct lxc_c
  		ctx.architectures[0] = SCMP_ARCH_MIPSEL;
  		ctx.contexts[0] = get_new_ctx(lxc_seccomp_arch_mipsel,
  					      default_policy_action,
--					      &ctx.needs_merge[0]);
++#ifdef HAVE_ISULAD
 +					      &ctx.architectures[0]);
++#else
+ 					      &ctx.needs_merge[0]);
++#endif
  		if (!ctx.contexts[0])
  			goto bad;
  
  		ctx.architectures[1] = SCMP_ARCH_MIPSEL64N32;
  		ctx.contexts[1] = get_new_ctx(lxc_seccomp_arch_mipsel64n32,
  					      default_policy_action,
--					      &ctx.needs_merge[1]);
++#ifdef HAVE_ISULAD
 +					      &ctx.architectures[1]);
++#else
+ 					      &ctx.needs_merge[1]);
++#endif
  		if (!ctx.contexts[1])
  			goto bad;
  
  		ctx.architectures[2] = SCMP_ARCH_MIPSEL64;
  		ctx.contexts[2] = get_new_ctx(lxc_seccomp_arch_mipsel64,
  					      default_policy_action,
--					      &ctx.needs_merge[2]);
++#ifdef HAVE_ISULAD
 +					      &ctx.architectures[2]);
++#else
+ 					      &ctx.needs_merge[2]);
++#endif
  		if (!ctx.contexts[2])
  			goto bad;
  #endif
