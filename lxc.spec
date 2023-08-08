@@ -41,7 +41,7 @@ overhead of full virtualization.
 The %{name}-libs package contains libraries for running %{name} applications.
 
 
-%{!?_pkgdocdir: %global _pkgdocdir %{_docdir}/lxc-4.0.3}
+%{!?_pkgdocdir: %global _pkgdocdir %{_docdir}/lxc-5.0.2}
 
 %description
 Containers are insulated areas inside a system, which have their own namespace
@@ -77,7 +77,7 @@ This package contains documentation for lxc for creating containers.
 %ifarch riscv64
 export LDFLAGS="%{build_ldflags} -latomic -pthread"
 %endif
-%if 0%{?enable_isulad:1}
+%if 0%{?enable_isulad}
 meson setup -Disulad=true -Dtests=true -Dprefix=/usr build
 %else
 meson setup -Disulad=false -Dtests=true -Dprefix=/usr build
@@ -182,7 +182,7 @@ meson test -C build
 %{_datadir}/%{name}/config/*
 %dir %{_datadir}/%{name}/__pycache__
 %{_datadir}/%{name}/__pycache__/*
-%if 0%{!?enable_isulad:1}
+%if !0%{?enable_isulad}
 %{_datadir}/%{name}/hooks
 %endif
 
