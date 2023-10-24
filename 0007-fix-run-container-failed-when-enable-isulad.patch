@@ -1,0 +1,1060 @@
+From d743d299c37b71d0990d0a68ad492a0ec76a7886 Mon Sep 17 00:00:00 2001
+From: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+Date: Wed, 18 Oct 2023 11:01:49 +0800
+Subject: [PATCH] fix run container failed when enable isulad
+
+Signed-off-by: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+---
+ src/lxc/attach.c         |  11 +-
+ src/lxc/cgroups/cgfsng.c | 581 +++++++++++++++++++++++++++++++++++++++
+ src/lxc/cgroups/cgroup.h |   4 +
+ src/lxc/conf.c           |  17 +-
+ src/lxc/confile.c        |  34 ++-
+ src/lxc/meson.build      |   4 +-
+ src/lxc/start.c          |  11 +-
+ 7 files changed, 628 insertions(+), 34 deletions(-)
+
+diff --git a/src/lxc/attach.c b/src/lxc/attach.c
+index 066eb5c..ae12da3 100644
+--- a/src/lxc/attach.c
++++ b/src/lxc/attach.c
+@@ -1454,18 +1454,17 @@ __noreturn static void do_attach(struct attach_payload *ap)
+ 				goto on_error;
+ 			}
+ 		} else {
+-#else
+-		ret = lxc_terminal_prepare_login(ap->terminal_pts_fd);
+-#endif
+-#ifdef HAVE_ISULAD
+-		}
+ #endif
++		ret = lxc_terminal_prepare_login(ap->terminal_pts_fd);
+ 		if (ret < 0) {
+ 			SYSERROR("Failed to prepare terminal file descriptor %d", ap->terminal_pts_fd);
+ 			goto on_error;
+ 		}
+ 
+ 		TRACE("Prepared terminal file descriptor %d", ap->terminal_pts_fd);
++#ifdef HAVE_ISULAD
++		}
++#endif
+ 	}
+ 
+ 	/* Avoid unnecessary syscalls. */
+@@ -2264,7 +2263,7 @@ int lxc_attach(struct lxc_container *container, lxc_attach_exec_t exec_function,
+ 
+ 	if (options->attach_flags & LXC_ATTACH_TERMINAL) {
+ #ifdef HAVE_ISULAD
+-			ret = isulad_safe_mainloop(&descr, -1);
++		ret = isulad_safe_mainloop(&descr, -1);
+ #else
+ 		ret = lxc_mainloop(&descr, -1);
+ #endif
+diff --git a/src/lxc/cgroups/cgfsng.c b/src/lxc/cgroups/cgfsng.c
+index 4e4ae0c..0aaafa8 100644
+--- a/src/lxc/cgroups/cgfsng.c
++++ b/src/lxc/cgroups/cgfsng.c
+@@ -528,32 +528,64 @@ static int cgroup_tree_remove_wrapper(void *data)
+ 	return cgroup_tree_remove(arg->hierarchies, arg->path_prune);
+ }
+ 
++#ifdef HAVE_ISULAD
++__cgfsng_ops static bool cgfsng_payload_destroy(struct cgroup_ops *ops,
++						struct lxc_handler *handler)
++#else
+ __cgfsng_ops static void cgfsng_payload_destroy(struct cgroup_ops *ops,
+ 						struct lxc_handler *handler)
++#endif
+ {
+ 	int ret;
+ 
+ 	if (!ops) {
+ 		ERROR("Called with uninitialized cgroup operations");
++#ifdef HAVE_ISULAD
++		return false;
++#else
+ 		return;
++#endif
++	}
++
++#ifdef HAVE_ISULAD
++	if (ops->no_controller) {
++		DEBUG("no controller found, ignore isulad_cgfsng_payload_destroy");
++		return true;
+ 	}
++#endif
+ 
+ 	if (!ops->hierarchies)
++#ifdef HAVE_ISULAD
++		return true;
++#else
+ 		return;
++#endif
+ 
+ 	if (!handler) {
+ 		ERROR("Called with uninitialized handler");
++#ifdef HAVE_ISULAD
++		return false;
++#else
+ 		return;
++#endif
+ 	}
+ 
+ 	if (!handler->conf) {
+ 		ERROR("Called with uninitialized conf");
++#ifdef HAVE_ISULAD
++		return false;
++#else
+ 		return;
++#endif
+ 	}
+ 
+ 	if (!ops->container_limit_cgroup) {
+ 		WARN("Uninitialized limit cgroup");
++#ifdef HAVE_ISULAD
++		return true;
++#else
+ 		return;
++#endif
+ 	}
+ 
+ 	ret = bpf_program_cgroup_detach(handler->cgroup_ops->cgroup2_devices);
+@@ -579,6 +611,9 @@ __cgfsng_ops static void cgfsng_payload_destroy(struct cgroup_ops *ops,
+ 	}
+ 	if (ret < 0)
+ 		SYSWARN("Failed to destroy cgroups");
++#ifdef HAVE_ISULAD
++	return ret >= 0;
++#endif
+ }
+ 
+ #define __ISOL_CPUS "/sys/devices/system/cpu/isolated"
+@@ -854,6 +889,10 @@ static void cgroup_tree_prune_leaf(struct hierarchy *h, const char *path_prune,
+ __cgfsng_ops static void cgfsng_monitor_destroy(struct cgroup_ops *ops,
+ 						struct lxc_handler *handler)
+ {
++#ifdef HAVE_ISULAD
++	// ignore destroy monitor cgroup
++	return;
++#endif
+ 	int len;
+ 	char pidstr[INTTYPE_TO_STRLEN(pid_t)];
+ 	const struct lxc_conf *conf;
+@@ -1311,6 +1350,10 @@ static char *cgroup_relpath(char *cg)
+ 
+ __cgfsng_ops static bool cgfsng_monitor_create(struct cgroup_ops *ops, struct lxc_handler *handler)
+ {
++#ifdef HAVE_ISULAD
++	// skip create monitor cgroup
++	return true;
++#endif
+ 	__do_free char *monitor_cgroup = NULL;
+ 	int idx = 0;
+ 	int i;
+@@ -1411,6 +1454,17 @@ __cgfsng_ops static bool cgfsng_payload_create(struct cgroup_ops *ops, struct lx
+ 	if (!ops->hierarchies)
+ 		return true;
+ 
++#ifdef HAVE_ISULAD
++	if (ops->no_controller) {
++		DEBUG("no controller found, isgnore isulad_cgfsng_payload_create");
++		return true;
++	}
++	if (ops->container_cgroup) {
++		free(ops->container_cgroup);
++		ops->container_cgroup = NULL;
++	}
++#endif
++
+ 	if (ops->container_cgroup || ops->container_limit_cgroup)
+ 		return ret_set_errno(false, EEXIST);
+ 
+@@ -1504,6 +1558,10 @@ __cgfsng_ops static bool cgfsng_payload_create(struct cgroup_ops *ops, struct lx
+ __cgfsng_ops static bool cgfsng_monitor_enter(struct cgroup_ops *ops,
+ 					      struct lxc_handler *handler)
+ {
++#ifdef HAVE_ISULAD
++	// ignore enter monitor cgroup
++	return true;
++#endif
+ 	int monitor_len, transient_len = 0;
+ 	char monitor[INTTYPE_TO_STRLEN(pid_t)],
+ 	    transient[INTTYPE_TO_STRLEN(pid_t)];
+@@ -1577,6 +1635,13 @@ __cgfsng_ops static bool cgfsng_payload_enter(struct cgroup_ops *ops,
+ 	if (!ops)
+ 		return ret_set_errno(false, ENOENT);
+ 
++#ifdef HAVE_ISULAD
++	if (ops->no_controller) {
++		DEBUG("no controller found, isgnore isulad_cgfsng_payload_enter");
++		return true;
++	}
++#endif
++
+ 	if (!ops->hierarchies)
+ 		return true;
+ 
+@@ -1728,6 +1793,13 @@ __cgfsng_ops static void cgfsng_finalize(struct cgroup_ops *ops)
+ 	if (!ops)
+ 		return;
+ 
++#ifdef HAVE_ISULAD
++	if (ops->no_controller) {
++		DEBUG("no controller found, isgnore isulad_cgfsng_payload_finalize");
++		return;
++	}
++#endif
++
+ 	if (!ops->hierarchies)
+ 		return;
+ 
+@@ -1900,7 +1972,11 @@ static int __cgroupfs_mount(int cgroup_automount_type, struct hierarchy *h,
+ 			return log_error_errno(-EINVAL, EINVAL, "Unsupported mount properties specified");
+ 
+ 		target = must_make_path(rootfs_mnt, DEFAULT_CGROUP_MOUNTPOINT, hierarchy_mnt, NULL);
++#ifdef HAVE_ISULAD
++		ret = safe_mount(NULL, target, fstype, old_flags, controllers, rootfs_mnt, NULL);
++#else
+ 		ret = safe_mount(NULL, target, fstype, old_flags, controllers, rootfs_mnt);
++#endif
+ 	}
+ 	if (ret < 0)
+ 		return log_error_errno(ret, errno, "Failed to mount %s filesystem onto %d(%s)",
+@@ -1950,6 +2026,9 @@ __cgfsng_ops static bool cgfsng_mount(struct cgroup_ops *ops,
+ 	struct lxc_rootfs *rootfs = &conf->rootfs;
+ 	const char *rootfs_mnt = get_rootfs_mnt(rootfs);
+ 	int ret;
++#ifdef HAVE_ISULAD
++	__do_free_string_list char **merged = NULL;
++#endif
+ 
+ 	if (!ops)
+ 		return ret_set_errno(false, ENOENT);
+@@ -2116,9 +2195,15 @@ __cgfsng_ops static bool cgfsng_mount(struct cgroup_ops *ops,
+ 				MOUNT_ATTR_NOEXEC | MOUNT_ATTR_RELATIME);
+ 	} else {
+ 		cgroup_root = must_make_path(rootfs_mnt, DEFAULT_CGROUP_MOUNTPOINT, NULL);
++#ifdef HAVE_ISULAD
++		ret = safe_mount(NULL, cgroup_root, "tmpfs",
++				 MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME,
++				 "size=10240k,mode=755", rootfs_mnt, NULL);
++#else
+ 		ret = safe_mount(NULL, cgroup_root, "tmpfs",
+ 				 MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME,
+ 				 "size=10240k,mode=755", rootfs_mnt);
++#endif
+ 	}
+ 	if (ret < 0)
+ 		return log_error_errno(false, errno, "Failed to mount tmpfs on %s",
+@@ -2134,6 +2219,16 @@ __cgfsng_ops static bool cgfsng_mount(struct cgroup_ops *ops,
+ 		__do_free char *hierarchy_mnt = NULL, *path2 = NULL;
+ 		struct hierarchy *h = ops->hierarchies[i];
+ 
++#ifdef HAVE_ISULAD
++		// isulad: symlink subcgroup
++		if (strchr(h->at_mnt, ',') != NULL) {
++			int pret;
++			pret = lxc_append_string(&merged, h->at_mnt);
++			if (pret < 0)
++				return false;
++		}
++#endif
++
+ 		ret = mkdirat(dfd_mnt_tmpfs, h->at_mnt, 0000);
+ 		if (ret < 0)
+ 			return syserror_ret(false, "Failed to create cgroup at_mnt %d(%s)", dfd_mnt_tmpfs, h->at_mnt);
+@@ -2165,8 +2260,14 @@ __cgfsng_ops static bool cgfsng_mount(struct cgroup_ops *ops,
+ 			cgroup_root = must_make_path(rootfs_mnt, DEFAULT_CGROUP_MOUNTPOINT, NULL);
+ 
+ 		hierarchy_mnt = must_make_path(cgroup_root, h->at_mnt, NULL);
++#ifdef HAVE_ISULAD
++		// isulad: ignore ops->container_cgroup so we will not see directory lxc after /sys/fs/cgroup/xxx in container,
++		// isulad: ignore h->container_base_path so we will not see subgroup of /sys/fs/cgroup/xxx/subgroup in container
++		path2 = must_make_path(h->at_mnt, NULL);
++#else
+ 		path2 = must_make_path(hierarchy_mnt, h->at_base,
+ 				       ops->container_cgroup, NULL);
++#endif
+ 		ret = mkdir_p(path2, 0755);
+ 		if (ret < 0 && (errno != EEXIST))
+ 			return false;
+@@ -2178,6 +2279,64 @@ __cgfsng_ops static bool cgfsng_mount(struct cgroup_ops *ops,
+ 			return false;
+ 	}
+ 
++
++#ifdef HAVE_ISULAD
++	// isulad: symlink subcgroup
++	// create symlink if no merged cgroup link
++	// like cpu -> cpu,cpuacct
++	if (merged) {
++		char **mc = NULL;
++		for (mc = merged; *mc; mc++) {
++			char *token = NULL;
++			__do_free char *copy = must_copy_string(*mc);
++			lxc_iterate_parts(token, copy, ",") {
++				int mret;
++				__do_free char *link = must_make_path(cgroup_root, token, NULL);
++				mret = symlink(*mc, link);
++				if (mret < 0 && errno != EEXIST) {
++					SYSERROR("Failed to create link %s for target %s", link, *mc);
++					return false;
++				}
++			}
++		}
++	}
++
++	// isulad: remount /sys/fs/cgroup to readonly
++	if (cg_flags == LXC_AUTO_CGROUP_FULL_RO || cg_flags == LXC_AUTO_CGROUP_RO) {
++		ret = mount(cgroup_root, cgroup_root, "bind",
++		            MS_NOSUID|MS_NODEV|MS_NOEXEC|MS_RELATIME|MS_RDONLY|MS_BIND|MS_REMOUNT, NULL);
++		if (ret < 0) {
++			SYSERROR("Failed to remount /sys/fs/cgroup.");
++			return false;
++		}
++	}
++
++	// isulad: remount /sys/fs/cgroup/systemd to readwrite for system container
++	if (handler->conf->systemd != NULL && strcmp(handler->conf->systemd, "true") == 0) {
++		__do_free char *systemdpath = NULL;
++		__do_free char *unifiedpath = NULL;
++		unifiedpath = must_make_path(get_rootfs_mnt(rootfs), "/sys/fs/cgroup/unified", NULL);
++		if (dir_exists(unifiedpath))
++		{
++			ret = umount2(unifiedpath, MNT_DETACH);
++			if (ret < 0)
++			{
++				SYSERROR("Failed to umount /sys/fs/cgroup/unified.");
++				return false;
++			}
++		}
++
++		systemdpath = must_make_path(get_rootfs_mnt(rootfs), "/sys/fs/cgroup/systemd", NULL);
++		ret = mount(systemdpath, systemdpath, "bind",
++					MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME | MS_BIND | MS_REMOUNT, NULL);
++		if (ret < 0)
++		{
++			SYSERROR("Failed to remount /sys/fs/cgroup/systemd.");
++			return false;
++		}
++	}
++#endif
++
+ 	return true;
+ }
+ 
+@@ -2724,6 +2883,13 @@ __cgfsng_ops static bool cgfsng_attach(struct cgroup_ops *ops,
+ 	if (!ops)
+ 		return ret_set_errno(false, ENOENT);
+ 
++#ifdef HAVE_ISULAD
++	if (ops->no_controller) {
++		DEBUG("no controller found, isgnore isulad_cgfsng_attach");
++		return true;
++	}
++#endif
++
+ 	if (!ops->hierarchies)
+ 		return true;
+ 
+@@ -3064,6 +3230,209 @@ static int convert_devpath(const char *invalue, char *dest)
+ 	return 0;
+ }
+ 
++#ifdef HAVE_ISULAD
++#define BATCH_SIZE 50
++static void batch_realloc(char **mem, size_t oldlen, size_t newlen)
++{
++	int newbatches = (newlen / BATCH_SIZE) + 1;
++	int oldbatches = (oldlen / BATCH_SIZE) + 1;
++
++	if (!*mem || newbatches > oldbatches)
++		*mem = must_realloc(*mem, newbatches * BATCH_SIZE);
++}
++
++static void append_line(char **dest, size_t oldlen, char *new, size_t newlen)
++{
++	size_t full = oldlen + newlen;
++
++	batch_realloc(dest, oldlen, full + 1);
++
++	memcpy(*dest + oldlen, new, newlen + 1);
++}
++
++/* Slurp in a whole file */
++static char *read_file(const char *fnam)
++{
++	__do_free char *buf = NULL, *line = NULL;
++	__do_fclose FILE *f = NULL;
++	size_t len = 0, fulllen = 0;
++	int linelen;
++
++	f = fopen(fnam, "re");
++	if (!f)
++		return NULL;
++
++	while ((linelen = getline(&line, &len, f)) != -1) {
++		append_line(&buf, fulllen, line, linelen);
++		fulllen += linelen;
++	}
++
++	return move_ptr(buf);
++}
++
++static bool isulad_copy_parent_file(char *path, char *file)
++{
++	int ret;
++	int len = 0;
++	char *value = NULL;
++	char *current = NULL;
++	char *fpath = NULL;
++	char *lastslash = NULL;
++	char oldv;
++
++	fpath = must_make_path(path, file, NULL);
++	current = read_file(fpath);
++
++	if (current == NULL) {
++		SYSERROR("Failed to read file \"%s\"", fpath);
++		free(fpath);
++		return false;
++	}
++
++	if (strcmp(current, "\n") != 0) {
++		free(fpath);
++		free(current);
++		return true;
++	}
++
++	free(fpath);
++	free(current);
++
++	lastslash = strrchr(path, '/');
++	if (lastslash == NULL) {
++		ERROR("Failed to detect \"/\" in \"%s\"", path);
++		return false;
++	}
++	oldv = *lastslash;
++	*lastslash = '\0';
++	fpath = must_make_path(path, file, NULL);
++	*lastslash = oldv;
++	len = lxc_read_from_file(fpath, NULL, 0);
++	if (len <= 0)
++		goto on_error;
++
++	value = must_realloc(NULL, len + 1);
++	ret = lxc_read_from_file(fpath, value, len);
++	if (ret != len)
++		goto on_error;
++	free(fpath);
++
++	fpath = must_make_path(path, file, NULL);
++	ret = lxc_write_to_file(fpath, value, len, false, 0666);
++	if (ret < 0)
++		SYSERROR("Failed to write \"%s\" to file \"%s\"", value, fpath);
++	free(fpath);
++	free(value);
++	return ret >= 0;
++
++on_error:
++	SYSERROR("Failed to read file \"%s\"", fpath);
++	free(fpath);
++	free(value);
++	return false;
++}
++
++static bool build_sub_cpuset_cgroup_dir(char *cgpath)
++{
++	int ret;
++
++	ret = mkdir_p(cgpath, 0755);
++	if (ret < 0) {
++		if (errno != EEXIST) {
++			SYSERROR("Failed to create directory \"%s\"", cgpath);
++			return false;
++		}
++	}
++
++	/* copy parent's settings */
++	if (!isulad_copy_parent_file(cgpath, "cpuset.cpus")) {
++		SYSERROR("Failed to copy \"cpuset.cpus\" settings");
++		return false;
++	}
++
++	/* copy parent's settings */
++	if (!isulad_copy_parent_file(cgpath, "cpuset.mems")) {
++		SYSERROR("Failed to copy \"cpuset.mems\" settings");
++		return false;
++	}
++
++	return true;
++}
++
++static bool isulad_cg_legacy_handle_cpuset_hierarchy(struct hierarchy *h, char *cgname)
++{
++	char *cgpath, *slash;
++	bool sub_mk_success = false;
++
++	if (is_unified_hierarchy(h))
++		return true;
++
++	if (!string_in_list(h->controllers, "cpuset"))
++		return true;
++
++	cgname += strspn(cgname, "/");
++
++	slash = strchr(cgname, '/');
++
++	if (slash != NULL) {
++		while (slash) {
++			*slash = '\0';
++			cgpath = must_make_path(h->at_mnt, h->at_base, cgname, NULL);
++			sub_mk_success = build_sub_cpuset_cgroup_dir(cgpath);
++			free(cgpath);
++			*slash = '/';
++			if (!sub_mk_success) {
++				return false;
++			}
++			slash = strchr(slash + 1, '/');
++		}
++	}
++
++	cgpath = must_make_path(h->at_mnt, h->at_base, cgname, NULL);
++	sub_mk_success = build_sub_cpuset_cgroup_dir(cgpath);
++	free(cgpath);
++	if (!sub_mk_success) {
++		return false;
++	}
++
++	return true;
++}
++
++static int isulad_mkdir_eexist_on_last(const char *dir, mode_t mode)
++{
++	const char *tmp = dir;
++	const char *orig = dir;
++
++	do {
++		int ret;
++		size_t cur_len;
++		char *makeme;
++
++		dir = tmp + strspn(tmp, "/");
++		tmp = dir + strcspn(dir, "/");
++
++		errno = ENOMEM;
++		cur_len = dir - orig;
++		makeme = strndup(orig, cur_len);
++		if (!makeme)
++			return -1;
++
++		ret = mkdir(makeme, mode);
++		if (ret < 0) {
++			if (errno != EEXIST) {
++				SYSERROR("Failed to create directory \"%s\"", makeme);
++				free(makeme);
++				return -1;
++			}
++		}
++		free(makeme);
++
++	} while (tmp != dir);
++
++	return 0;
++}
++#endif
++
+ /* Called from setup_limits - here we have the container's cgroup_data because
+  * we created the cgroups.
+  */
+@@ -3075,6 +3444,13 @@ static int cg_legacy_set_data(struct cgroup_ops *ops, const char *filename,
+ 	/* "b|c <2^64-1>:<2^64-1> r|w|m" = 47 chars max */
+ 	char converted_value[50];
+ 	struct hierarchy *h;
++#ifdef HAVE_ISULAD
++	int nret = 0;
++	int retry_count = 0;
++	int max_retry = 10;
++	char *fullpath;
++	char *container_cgroup = ops->container_cgroup;
++#endif
+ 
+ 	controller = strdup(filename);
+ 	if (!controller)
+@@ -3097,6 +3473,27 @@ static int cg_legacy_set_data(struct cgroup_ops *ops, const char *filename,
+ 	if (!h)
+ 		return log_error_errno(-ENOENT, ENOENT, "Failed to setup limits for the \"%s\" controller. The controller seems to be unused by \"cgfsng\" cgroup driver or not enabled on the cgroup hierarchy", controller);
+ 
++#ifdef HAVE_ISULAD
++	fullpath = must_make_path(h->path_con, filename, NULL);
++retry:
++	nret = lxc_write_to_file(fullpath, value, strlen(value), false, 0666);
++	if (nret != 0) {
++		if (retry_count < max_retry) {
++			SYSERROR("setting cgroup config for ready process caused \"failed to write %s to %s\".", value, fullpath);
++			(void)isulad_cg_legacy_handle_cpuset_hierarchy(h, container_cgroup);
++			(void)isulad_mkdir_eexist_on_last(h->path_con, 0755);
++			usleep(100 * 1000); /* 100 millisecond */
++			retry_count++;
++			goto retry;
++		}
++		lxc_write_error_message(ops->errfd,
++		                        "%s:%d: setting cgroup config for ready process caused failed to write %s to %s: %s",
++		                        __FILE__, __LINE__, value, fullpath, strerror(errno));
++	}
++	free(fullpath);
++	return nret;
++#endif
++
+ 	if (is_cpuset) {
+ 		int ret = lxc_write_openat(h->path_con, filename, value, strlen(value));
+ 		if (ret)
+@@ -3131,12 +3528,76 @@ static void sort_cgroup_settings(struct lxc_conf *conf)
+ 
+ }
+ 
++#ifdef HAVE_ISULAD
++/* Called from setup_limits - here we have the container's cgroup_data because
++ * we created the cgroups.
++ */
++static int isulad_cg_legacy_get_data(struct cgroup_ops *ops, const char *filename,
++                              char *value, size_t len)
++{
++	char *fullpath = NULL;
++	char *p = NULL;
++	struct hierarchy *h = NULL;
++	int ret = 0;
++	char *controller = NULL;
++
++	len = strlen(filename);
++	if (SIZE_MAX - 1 < len) {
++		errno = EINVAL;
++		return -1;
++	}
++	controller = calloc(1, len + 1);
++	if (controller == NULL) {
++		errno = ENOMEM;
++		return -1;
++	}
++	(void)strlcpy(controller, filename, len + 1);
++
++	p = strchr(controller, '.');
++	if (p)
++		*p = '\0';
++
++
++	h = get_hierarchy(ops, controller);
++	if (!h) {
++		ERROR("Failed to setup limits for the \"%s\" controller. "
++		      "The controller seems to be unused by \"cgfsng\" cgroup "
++		      "driver or not enabled on the cgroup hierarchy",
++		      controller);
++		errno = ENOENT;
++		free(controller);
++		return -ENOENT;
++	}
++
++	fullpath = must_make_path(h->path_con, filename, NULL);
++	ret = lxc_read_from_file(fullpath, value, len);
++	free(fullpath);
++	free(controller);
++	return ret;
++}
++
++static char *trim(char *s)
++{
++	size_t len;
++
++	len = strlen(s);
++	while ((len > 1) && (s[len - 1] == '\n'))
++		s[--len] = '\0';
++
++	return s;
++}
++#endif
++
+ __cgfsng_ops static bool cgfsng_setup_limits_legacy(struct cgroup_ops *ops,
+ 						    struct lxc_conf *conf,
+ 						    bool do_devices)
+ {
+ 	struct list_head *cgroup_settings;
+ 	struct lxc_cgroup *cgroup;
++#ifdef HAVE_ISULAD
++	char value[21 + 1] = { 0 };
++	long long int readvalue, setvalue;
++#endif
+ 
+ 	if (!ops)
+ 		return ret_set_errno(false, ENOENT);
+@@ -3157,6 +3618,27 @@ __cgfsng_ops static bool cgfsng_setup_limits_legacy(struct cgroup_ops *ops,
+ 	sort_cgroup_settings(conf);
+ 	list_for_each_entry(cgroup, cgroup_settings, head) {
+ 		if (do_devices == strnequal("devices", cgroup->subsystem, 7)) {
++#ifdef HAVE_ISULAD
++			const char *cgvalue = cgroup->value;
++			if (strcmp("files.limit", cgroup->subsystem) == 0) {
++				if (lxc_safe_long_long(cgvalue, &setvalue) != 0) {
++					SYSERROR("Invalid integer value %s", cgvalue);
++					return false;
++				}
++				if (setvalue <= 0) {
++					cgvalue = "max";
++				}
++			}
++			if (cg_legacy_set_data(ops, cgroup->subsystem, cgvalue, strnequal("cpuset", cgroup->subsystem, 6))) {
++				if (do_devices && (errno == EACCES || errno == EPERM)) {
++					SYSWARN("Failed to set \"%s\" to \"%s\"", cgroup->subsystem, cgvalue);
++					continue;
++				}
++				SYSERROR("Failed to set \"%s\" to \"%s\"", cgroup->subsystem, cgvalue);
++				return false;
++			}
++			DEBUG("Set controller \"%s\" set to \"%s\"", cgroup->subsystem, cgvalue);
++#else
+ 			if (cg_legacy_set_data(ops, cgroup->subsystem, cgroup->value, strnequal("cpuset", cgroup->subsystem, 6))) {
+ 				if (do_devices && (errno == EACCES || errno == EPERM)) {
+ 					SYSWARN("Failed to set \"%s\" to \"%s\"", cgroup->subsystem, cgroup->value);
+@@ -3166,7 +3648,40 @@ __cgfsng_ops static bool cgfsng_setup_limits_legacy(struct cgroup_ops *ops,
+ 				return false;
+ 			}
+ 			DEBUG("Set controller \"%s\" set to \"%s\"", cgroup->subsystem, cgroup->value);
++#endif
+ 		}
++
++#ifdef HAVE_ISULAD
++		// isulad: check cpu shares
++		if (strcmp(cgroup->subsystem, "cpu.shares") == 0) {
++			if (isulad_cg_legacy_get_data(ops, cgroup->subsystem, value, sizeof(value) - 1) < 0) {
++				SYSERROR("Error get %s", cgroup->subsystem);
++				return false;
++			}
++			trim(value);
++			if (lxc_safe_long_long(cgroup->value, &setvalue) != 0) {
++				SYSERROR("Invalid value %s", cgroup->value);
++				return false;
++			}
++			if (lxc_safe_long_long(value, &readvalue) != 0) {
++				SYSERROR("Invalid value %s", value);
++				return false;
++			}
++			if (setvalue > readvalue) {
++				ERROR("The maximum allowed cpu-shares is %s", value);
++				lxc_write_error_message(ops->errfd,
++				                        "%s:%d: setting cgroup config for ready process caused \"The maximum allowed cpu-shares is %s\".",
++				                        __FILE__, __LINE__, value);
++				return false;
++			} else if (setvalue < readvalue) {
++				ERROR("The minimum allowed cpu-shares is %s", value);
++				lxc_write_error_message(ops->errfd,
++				                        "%s:%d: setting cgroup config for ready process caused \"The minimum allowed cpu-shares is %s\".",
++				                        __FILE__, __LINE__, value);
++				return false;
++			}
++		}
++#endif
+ 	}
+ 
+ 	INFO("Limits for the legacy cgroup hierarchies have been setup");
+@@ -3359,6 +3874,10 @@ static bool __cgfsng_delegate_controllers(struct cgroup_ops *ops, const char *cg
+ 
+ __cgfsng_ops static bool cgfsng_monitor_delegate_controllers(struct cgroup_ops *ops)
+ {
++#ifdef HAVE_ISULAD
++	// ignore monitor cgroup delegate controllers
++	return true;
++#endif
+ 	if (!ops)
+ 		return ret_set_errno(false, ENOENT);
+ 
+@@ -3370,6 +3889,13 @@ __cgfsng_ops static bool cgfsng_payload_delegate_controllers(struct cgroup_ops *
+ 	if (!ops)
+ 		return ret_set_errno(false, ENOENT);
+ 
++#ifdef HAVE_ISULAD
++	if (ops->no_controller) {
++		DEBUG("no controller found, isgnore isulad_cgfsng_payload_delegate_controllers");
++		return true;
++	}
++#endif
++
+ 	return __cgfsng_delegate_controllers(ops, ops->container_cgroup);
+ }
+ 
+@@ -3635,7 +4161,9 @@ static int __initialize_cgroups(struct cgroup_ops *ops, bool relative,
+ 			if (!controller_list) {
+ 				TRACE("No controllers are enabled for delegation in the unified hierarchy");
+ #ifdef HAVE_ISULAD
++			if (fhas_fs_type(ops->dfd_mnt, CGROUP2_SUPER_MAGIC)) {
+ 				ops->no_controller = true;
++			}
+ #endif
+ 				controller_list = list_new();
+ 				if (!controller_list)
+@@ -3839,9 +4367,18 @@ static int initialize_cgroups(struct cgroup_ops *ops, struct lxc_conf *conf)
+ 	return 0;
+ }
+ 
++#ifdef HAVE_ISULAD
++__cgfsng_ops static int cgfsng_data_init(struct cgroup_ops *ops, struct lxc_conf *conf)
++#else
+ __cgfsng_ops static int cgfsng_data_init(struct cgroup_ops *ops)
++#endif
+ {
+ 	const char *cgroup_pattern;
++#ifdef HAVE_ISULAD
++	const char *cgroup_tree;
++	__do_free char *container_cgroup = NULL, *__cgroup_tree = NULL;
++	size_t len;
++#endif
+ 
+ 	if (!ops)
+ 		return ret_set_errno(-1, ENOENT);
+@@ -3854,9 +4391,48 @@ __cgfsng_ops static int cgfsng_data_init(struct cgroup_ops *ops)
+ 			return ret_errno(ENOMEM);
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	if (conf->cgroup_meta.dir) {
++		cgroup_tree = conf->cgroup_meta.dir;
++		container_cgroup = must_concat(&len, cgroup_tree, "/", conf->name, NULL);
++	} else if (ops->cgroup_pattern) {
++		__cgroup_tree = lxc_string_replace("%n", conf->name, ops->cgroup_pattern);
++		if (!__cgroup_tree)
++			return ret_set_errno(-1, ENOMEM);
++
++		cgroup_tree = __cgroup_tree;
++		container_cgroup = must_concat(&len, cgroup_tree, NULL);
++	} else {
++		cgroup_tree = NULL;
++		container_cgroup = must_concat(&len, conf->name, NULL);
++	}
++	if (!container_cgroup)
++		return ret_set_errno(-1, ENOMEM);
++
++	ops->container_cgroup = move_ptr(container_cgroup);
++#endif
++
+ 	return 0;
+ }
+ 
++#ifdef HAVE_ISULAD
++__cgfsng_ops static const char *isulad_cgfsng_get_cgroup_full_path(struct cgroup_ops *ops,
++						  const char *controller)
++{
++	struct hierarchy *h;
++
++	h = get_hierarchy(ops, controller);
++	if (!h)
++		return log_warn_errno(NULL, ENOENT, "Failed to find hierarchy for controller \"%s\"",
++				      controller ? controller : "(null)");
++
++	if (!h->path_con)
++		h->path_con = must_make_path(h->at_mnt, h->at_base, ops->container_cgroup, NULL);
++
++	return h->path_con;
++}
++#endif
++
+ struct cgroup_ops *cgroup_ops_init(struct lxc_conf *conf)
+ {
+ 	__cleanup_cgroup_ops struct cgroup_ops *cgfsng_ops = NULL;
+@@ -3888,7 +4464,12 @@ struct cgroup_ops *cgroup_ops_init(struct lxc_conf *conf)
+ 	cgfsng_ops->unfreeze				= cgfsng_unfreeze;
+ 	cgfsng_ops->setup_limits_legacy			= cgfsng_setup_limits_legacy;
+ 	cgfsng_ops->setup_limits			= cgfsng_setup_limits;
++#ifdef HAVE_ISULAD
++	cgfsng_ops->driver 				= "isulad_cgfsng";
++	cgfsng_ops->get_cgroup_full_path = isulad_cgfsng_get_cgroup_full_path;
++#else
+ 	cgfsng_ops->driver				= "cgfsng";
++#endif
+ 	cgfsng_ops->version				= "1.0.0";
+ 	cgfsng_ops->attach				= cgfsng_attach;
+ 	cgfsng_ops->chown				= cgfsng_chown;
+diff --git a/src/lxc/cgroups/cgroup.h b/src/lxc/cgroups/cgroup.h
+index d9159f4..0a4ce64 100644
+--- a/src/lxc/cgroups/cgroup.h
++++ b/src/lxc/cgroups/cgroup.h
+@@ -18,7 +18,11 @@
+ 
+ #define DEFAULT_CGROUP_MOUNTPOINT_RELATIVE "sys/fs/cgroup"
+ #define DEFAULT_CGROUP_MOUNTPOINT "/sys/fs/cgroup"
++#ifdef HAVE_ISULAD
++#define DEFAULT_PAYLOAD_CGROUP_PREFIX ""
++#else
+ #define DEFAULT_PAYLOAD_CGROUP_PREFIX "lxc.payload."
++#endif
+ #define DEFAULT_MONITOR_CGROUP_PREFIX "lxc.monitor."
+ #define DEFAULT_PAYLOAD_CGROUP "payload"
+ #define DEFAULT_MONITOR_CGROUP "monitor"
+diff --git a/src/lxc/conf.c b/src/lxc/conf.c
+index 34cf90a..ff5cefc 100644
+--- a/src/lxc/conf.c
++++ b/src/lxc/conf.c
+@@ -4814,13 +4814,12 @@ int lxc_setup(struct lxc_handler *handler)
+ 		return log_error(-1, "Failed to verify start hooks");
+ 
+ #ifdef HAVE_ISULAD
+-	if (setup_proc)
+-#endif
+-	ret = lxc_create_tmp_proc_mount(lxc_conf);
+-	if (ret < 0)
+-		return log_error(-1, "Failed to mount transient procfs instance for LSMs");
++	if (setup_proc) {
++		ret = lxc_create_tmp_proc_mount(lxc_conf);
++		if (ret < 0)
++			return log_error(-1, "Failed to mount transient procfs instance for LSMs");
++	}
+ 
+-#ifdef HAVE_ISULAD
+ 	if (setup_rootfs_mountopts(&lxc_conf->rootfs)) {
+ 			return log_error(-1, "failed to set rootfs for '%s'", name);
+ 	}
+@@ -4831,6 +4830,10 @@ int lxc_setup(struct lxc_handler *handler)
+ 		}
+ 	}
+ #else
++	ret = lxc_create_tmp_proc_mount(lxc_conf);
++	if (ret < 0)
++		return log_error(-1, "Failed to mount transient procfs instance for LSMs");
++
+ 	ret = lxc_setup_devpts_child(handler);
+ 	if (ret < 0)
+ 		return log_error(-1, "Failed to prepare new devpts instance");
+@@ -4855,7 +4858,7 @@ int lxc_setup(struct lxc_handler *handler)
+ 
+ #ifdef HAVE_ISULAD
+ 	/* Ask father to run oci prestart hooks and wait for him to finish. */
+-	if (lxc_sync_barrier_parent(handler, START_SYNC_OCI_PRESTART_HOOK)) {
++	if (!lxc_sync_barrier_parent(handler, START_SYNC_OCI_PRESTART_HOOK)) {
+ 		return log_error(-1, "Failed to sync parent to start host hook");
+ 	}
+ #endif
+diff --git a/src/lxc/confile.c b/src/lxc/confile.c
+index 0d0d66c..ae1a264 100644
+--- a/src/lxc/confile.c
++++ b/src/lxc/confile.c
+@@ -287,16 +287,18 @@ static struct lxc_config_t config_jump_table[] = {
+ 	{ "lxc.sysctl",                     false, set_config_sysctl,                     get_config_sysctl,                     clr_config_sysctl,                     },
+ 	{ "lxc.proc",                       false, set_config_proc,                       get_config_proc,                       clr_config_proc,                       },
+ #ifdef HAVE_ISULAD
+-	{ "lxc.isulad.init.args",          	true,	set_config_init_args,                   get_config_init_args,                   clr_config_init_args,                 },
+-	{ "lxc.isulad.populate.device",    	true,	set_config_populate_device,             get_config_populate_device,             clr_config_populate_device,           },
+-	{ "lxc.isulad.umask",              	true,	set_config_umask,                       get_config_umask,                       clr_config_umask,                     },
+-	{ "lxc.isulad.rootfs.maskedpaths", 	true,	set_config_rootfs_masked_paths,         get_config_rootfs_masked_paths,         clr_config_rootfs_masked_paths,       },
+-	{ "lxc.isulad.rootfs.ropaths",     	true,	set_config_rootfs_ro_paths,             get_config_rootfs_ro_paths,             clr_config_rootfs_ro_paths,           },
+-	{ "lxc.isulad.systemd",            	true,	set_config_systemd,                     get_config_systemd,                     clr_config_systemd,                   },
+-	{ "lxc.console.logdriver",         	true,	set_config_console_log_driver,          get_config_console_log_driver,          clr_config_console_log_driver,        },
+-	{ "lxc.console.syslog_tag",        	true,	set_config_console_syslog_tag,          get_config_console_syslog_tag,          clr_config_console_syslog_tag,        },
+-	{ "lxc.console.syslog_facility",   	true,	set_config_console_syslog_facility,     get_config_console_syslog_facility,     clr_config_console_syslog_facility,   },
+-	{ "lxc.selinux.mount_context",     	true,	set_config_selinux_mount_context,       get_config_selinux_mount_context,       clr_config_selinux_mount_context,     },
++	{ "lxc.isulad.init.args",          	true,	set_config_init_args,                   get_config_init_args,                   clr_config_init_args,       		},
++	{ "lxc.isulad.populate.device",    	true,	set_config_populate_device,             get_config_populate_device,             clr_config_populate_device,  		},
++	{ "lxc.isulad.umask",              	true,	set_config_umask,                       get_config_umask,                       clr_config_umask,           		},
++	{ "lxc.isulad.rootfs.maskedpaths", 	true,	set_config_rootfs_masked_paths,         get_config_rootfs_masked_paths,         clr_config_rootfs_masked_paths, 	},
++	{ "lxc.isulad.rootfs.ropaths",     	true,	set_config_rootfs_ro_paths,             get_config_rootfs_ro_paths,             clr_config_rootfs_ro_paths,   		},
++	{ "lxc.isulad.systemd",            	true,	set_config_systemd,                     get_config_systemd,                     clr_config_systemd,           		},
++	{ "lxc.console.logdriver",         	true,	set_config_console_log_driver,          get_config_console_log_driver,          clr_config_console_log_driver, 		},
++	{ "lxc.console.syslog_tag",        	true,	set_config_console_syslog_tag,          get_config_console_syslog_tag,          clr_config_console_syslog_tag,   	},
++	{ "lxc.console.syslog_facility",   	true,	set_config_console_syslog_facility,     get_config_console_syslog_facility,     clr_config_console_syslog_facility,	},
++	{ "lxc.selinux.mount_context",     	true,	set_config_selinux_mount_context,       get_config_selinux_mount_context,       clr_config_selinux_mount_context,	},
++	// same to lxc.init.groups
++	{ "lxc.isulad.init.groups",         true,  	set_config_init_groups,          		get_config_init_groups,          		clr_config_init_groups,      		},
+ #endif
+ };
+ 
+@@ -1343,7 +1345,11 @@ static int set_config_init_groups(const char *key, const char *value,
+ 	if (!value_dup)
+ 		return -ENOMEM;
+ 
++#ifdef HAVE_ISULAD
++	lxc_iterate_parts(token, value_dup, " \t")
++#else
+ 	lxc_iterate_parts(token, value_dup, ",")
++#endif
+ 		num_groups++;
+ 
+ 	if (num_groups == INT_MAX)
+@@ -1368,7 +1374,11 @@ static int set_config_init_groups(const char *key, const char *value,
+ 	/* Restore duplicated value so we can call lxc_iterate_parts() again. */
+ 	strcpy(value_dup, value);
+ 
++#ifdef HAVE_ISULAD
++	lxc_iterate_parts(token, value_dup, " \t") {
++#else
+ 	lxc_iterate_parts(token, value_dup, ",") {
++#endif
+ 		int ret;
+ 
+ 		gid_t group;
+@@ -2000,13 +2010,13 @@ static int set_config_cgroup_dir(const char *key, const char *value,
+ 
+ 	if (lxc_config_value_empty(value))
+ 		return clr_config_cgroup_dir(key, lxc_conf, NULL);
+-
++#ifndef HAVE_ISULAD
+ 	if (abspath(value))
+ 		return syserror_set(-EINVAL, "%s paths may not be absolute", key);
+ 
+ 	if (dotdot(value))
+ 		return syserror_set(-EINVAL, "%s paths may not walk upwards via \"../\"", key);
+-
++#endif
+ 	return set_config_path_item(&lxc_conf->cgroup_meta.dir, value);
+ }
+ 
+diff --git a/src/lxc/meson.build b/src/lxc/meson.build
+index 3166401..6c4ba6a 100644
+--- a/src/lxc/meson.build
++++ b/src/lxc/meson.build
+@@ -25,6 +25,7 @@ liblxcfs_version_file = configure_file(
+ )
+ 
+ liblxc_sources = files(
++    'cgroups/cgfsng.c',
+     'cgroups/cgroup.c',
+     'cgroups/cgroup.h',
+     'cgroups/cgroup2_devices.c',
+@@ -140,7 +141,6 @@ liblxc_sources = files(
+ 
+ if want_isulad
+     liblxc_sources += files(
+-        'cgroups/isulad_cgfsng.c',
+         'exec_commands.c',
+         'exec_commands.h',
+         'isulad_utils.c',
+@@ -159,8 +159,6 @@ if want_isulad
+         'json/oci_runtime_spec.h',
+         'json/read-file.c',
+         'json/read-file.h')
+-else
+-    liblxc_sources += files('cgroups/cgfsng.c')
+ endif
+ 
+ if want_apparmor and libapparmor.found()
+diff --git a/src/lxc/start.c b/src/lxc/start.c
+index ff9a3fa..a7bc2e6 100644
+--- a/src/lxc/start.c
++++ b/src/lxc/start.c
+@@ -2384,13 +2384,12 @@ static int lxc_spawn(struct lxc_handler *handler)
+ 		goto out_delete_net;
+ 	}
+ 
+-       /* Tell the child to continue its initialization. We'll get
+-        * START_SYNC_POST_OCI_PRESTART_HOOK when it is ready for us to run oci prestart hooks.
+-        */
+-       if (lxc_sync_wake_child(handler, START_SYNC_POST_OCI_PRESTART_HOOK))
+-               goto out_delete_net;
++	/* Tell the child to continue its initialization. We'll get
++	 * START_SYNC_POST_OCI_PRESTART_HOOK when it is ready for us to run oci prestart hooks.
++	 */
++	if (!lxc_sync_wake_child(handler, START_SYNC_POST_OCI_PRESTART_HOOK))
++		goto out_delete_net;
+ #endif
+-
+ 	if (!lxc_sync_wait_child(handler, START_SYNC_CGROUP_LIMITS))
+ 		goto out_delete_net;
+ 
+-- 
+2.25.1
+

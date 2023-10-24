@@ -1,5 +1,5 @@
-%global _release 3
-%global enable_isulad 0
+%global _release 4
+%global enable_isulad 1
 
 Name:           lxc
 Version:        5.0.2
@@ -14,6 +14,8 @@ Patch0002:	0002-iSulad-adapt-security-conf-attach-cgroup-and-start.patch
 Patch0003:	0003-iSulad-adapt-conf-network-storage-and-termianl.patch
 Patch0004:	0004-iSulad-adapt-confile-lxccontainer-and-start.patch
 Patch0005:	0005-fix-compile-error.patch
+Patch0006:	0006-remove-isulad_cgfsng.patch
+Patch0007:	0007-fix-run-container-failed-when-enable-isulad.patch
 
 BuildRequires:  systemd-units git libtool graphviz docbook2X doxygen chrpath
 BuildRequires:  pkgconfig(libseccomp)
@@ -201,6 +203,12 @@ meson test -C build
 %endif
 
 %changelog
+* Wed Oct 18 2023 zhangxiaoyu<zhangxiaoyu58@huawei.com> - 5.0.2-4
+- Type: bugfix
+- ID:NA
+- SUG:NA
+- DESC: fix run container failed when enable isulad
+
 * Fri Aug 04 2023 zhangxiaoyu<zhangxiaoyu58@huawei.com> - 5.0.2-3
 - Type:enhancement
 - ID:NA
