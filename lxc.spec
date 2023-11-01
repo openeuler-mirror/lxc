@@ -1,4 +1,4 @@
-%global _release 4
+%global _release 5
 %global enable_isulad 1
 
 Name:           lxc
@@ -16,6 +16,7 @@ Patch0004:	0004-iSulad-adapt-confile-lxccontainer-and-start.patch
 Patch0005:	0005-fix-compile-error.patch
 Patch0006:	0006-remove-isulad_cgfsng.patch
 Patch0007:	0007-fix-run-container-failed-when-enable-isulad.patch
+Patch0008:	0008-bugfix-for-system-container-and-stream.patch
 
 BuildRequires:  systemd-units git libtool graphviz docbook2X doxygen chrpath
 BuildRequires:  pkgconfig(libseccomp)
@@ -203,6 +204,12 @@ meson test -C build
 %endif
 
 %changelog
+* Wed Nov 01 2023 zhangxiaoyu<zhangxiaoyu58@huawei.com> - 5.0.2-5
+- Type: bugfix
+- ID:NA
+- SUG:NA
+- DESC: bugfix for system container and stream
+
 * Wed Oct 18 2023 zhangxiaoyu<zhangxiaoyu58@huawei.com> - 5.0.2-4
 - Type: bugfix
 - ID:NA
