@@ -1,4 +1,4 @@
-%global _release 5
+%global _release 6
 %global enable_isulad 1
 
 Name:           lxc
@@ -17,6 +17,7 @@ Patch0005:	0005-fix-compile-error.patch
 Patch0006:	0006-remove-isulad_cgfsng.patch
 Patch0007:	0007-fix-run-container-failed-when-enable-isulad.patch
 Patch0008:	0008-bugfix-for-system-container-and-stream.patch
+Patch0009:	0009-bugfix-about-cgroup-mount-propagation-and-capabiliti.patch
 
 BuildRequires:  systemd-units git libtool graphviz docbook2X doxygen chrpath
 BuildRequires:  pkgconfig(libseccomp)
@@ -204,6 +205,12 @@ meson test -C build
 %endif
 
 %changelog
+* Thu Dec 07 2023 zhangxiaoyu<zhangxiaoyu58@huawei.com> - 5.0.2-6
+- Type: bugfix
+- ID:NA
+- SUG:NA
+- DESC: bugfix about cgroup, mount propagation and capabilities
+
 * Wed Nov 01 2023 zhangxiaoyu<zhangxiaoyu58@huawei.com> - 5.0.2-5
 - Type: bugfix
 - ID:NA
