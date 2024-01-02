@@ -1,0 +1,219 @@
+From c0324e29b4494560ed68af50f7be814838e2bfc3 Mon Sep 17 00:00:00 2001
+From: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+Date: Fri, 29 Dec 2023 16:26:13 +0800
+Subject: [PATCH] add storage block code for embedded image
+
+Signed-off-by: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+---
+ src/lxc/meson.build       |  2 +
+ src/lxc/storage/block.c   | 86 +++++++++++++++++++++++++++++++++++++++
+ src/lxc/storage/block.h   | 41 +++++++++++++++++++
+ src/lxc/storage/storage.c | 24 +++++++++++
+ 4 files changed, 153 insertions(+)
+ create mode 100644 src/lxc/storage/block.c
+ create mode 100644 src/lxc/storage/block.h
+
+diff --git a/src/lxc/meson.build b/src/lxc/meson.build
+index 6c4ba6a..bffed73 100644
+--- a/src/lxc/meson.build
++++ b/src/lxc/meson.build
+@@ -145,6 +145,8 @@ if want_isulad
+         'exec_commands.h',
+         'isulad_utils.c',
+         'isulad_utils.h',
++        'storage/block.c',
++        'storage/block.h',
+         'path.c',
+         'path.h',
+         'json/defs.c',
+diff --git a/src/lxc/storage/block.c b/src/lxc/storage/block.c
+new file mode 100644
+index 0000000..eb75e70
+--- /dev/null
++++ b/src/lxc/storage/block.c
+@@ -0,0 +1,86 @@
++/*
++ * lxc: linux Container library
++ *
++ * (C) Copyright IBM Corp. 2007, 2008
++ *
++ * Authors:
++ * Daniel Lezcano <daniel.lezcano at free.fr>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE 1
++#endif
++#include <stdint.h>
++#include <string.h>
++
++#include "config.h"
++#include "log.h"
++#include "storage.h"
++#include "storage_utils.h"
++#include "utils.h"
++
++lxc_log_define(blk, lxc);
++
++int blk_destroy(struct lxc_storage *orig)
++{
++	return 0;
++}
++
++bool blk_detect(const char *path)
++{
++	struct stat statbuf;
++	int ret;
++
++	if (!strncmp(path, "blk:", 4))
++		return true;
++
++	ret = stat(path, &statbuf);
++	if (ret == -1 && errno == EPERM) {
++		SYSERROR("blk_detect: failed to look at \"%s\"", path);
++		return false;
++	}
++
++	if (ret == 0 && S_ISBLK(statbuf.st_mode))
++		return true;
++
++	return false;
++}
++
++int blk_mount(struct lxc_storage *bdev)
++{
++	const char *src;
++	if (strcmp(bdev->type, "blk"))
++		return -22;
++
++	if (!bdev->src || !bdev->dest)
++		return -22;
++
++	src = lxc_storage_get_path(bdev->src, bdev->type);
++
++	return mount_unknown_fs(src, bdev->dest, bdev->mntopts);
++}
++
++int blk_umount(struct lxc_storage *bdev)
++{
++	if (strcmp(bdev->type, "blk"))
++		return -22;
++
++	if (!bdev->src || !bdev->dest)
++		return -22;
++
++	return umount(bdev->dest);
++}
+diff --git a/src/lxc/storage/block.h b/src/lxc/storage/block.h
+new file mode 100644
+index 0000000..2fa7565
+--- /dev/null
++++ b/src/lxc/storage/block.h
+@@ -0,0 +1,41 @@
++/*
++ * lxc: linux Container library
++ *
++ * (C) Copyright IBM Corp. 2007, 2008
++ *
++ * Authors:
++ * Daniel Lezcano <daniel.lezcano at free.fr>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef __LXC_BLK_H
++#define __LXC_BLK_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++struct lxc_storage;
++
++struct bdev_specs;
++
++struct lxc_conf;
++
++extern int blk_destroy(struct lxc_storage *orig);
++extern bool blk_detect(const char *path);
++extern int blk_mount(struct lxc_storage *bdev);
++extern int blk_umount(struct lxc_storage *bdev);
++
++#endif /* __LXC_BLK_H */
+diff --git a/src/lxc/storage/storage.c b/src/lxc/storage/storage.c
+index 39756d0..2aa26f9 100644
+--- a/src/lxc/storage/storage.c
++++ b/src/lxc/storage/storage.c
+@@ -39,6 +39,10 @@
+ #include "storage_utils.h"
+ #include "utils.h"
+ #include "zfs.h"
++#ifdef HAVE_ISULAD
++#include "block.h"
++#endif
++
+ 
+ #if !HAVE_STRLCPY
+ #include "strlcpy.h"
+@@ -162,6 +166,22 @@ static const struct lxc_storage_ops zfs_ops = {
+     .can_backup = true,
+ };
+ 
++#ifdef HAVE_ISULAD
++/* block */
++static const struct lxc_storage_ops blk_ops = {
++    .detect = &blk_detect,
++    .mount = &blk_mount,
++    .umount = &blk_umount,
++    .clone_paths = NULL,
++    .destroy = &blk_destroy,
++    .create = NULL,
++    .copy = NULL,
++    .snapshot = NULL,
++    .can_snapshot = false,
++    .can_backup = true,
++};
++#endif
++
+ struct lxc_storage_type {
+ 	const char *name;
+ 	const struct lxc_storage_ops *ops;
+@@ -177,6 +197,10 @@ static const struct lxc_storage_type bdevs[] = {
+ 	{ .name = "overlayfs", .ops = &ovl_ops,   },
+ 	{ .name = "loop",      .ops = &loop_ops,  },
+ 	{ .name = "nbd",       .ops = &nbd_ops,   },
++#ifdef HAVE_ISULAD
++	//isulad: block device
++	{ .name = "blk",       .ops = &blk_ops,   },
++#endif
+ };
+ 
+ static const size_t numbdevs = sizeof(bdevs) / sizeof(struct lxc_storage_type);
+-- 
+2.25.1
+
