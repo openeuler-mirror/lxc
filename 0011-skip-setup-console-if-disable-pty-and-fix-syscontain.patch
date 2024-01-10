@@ -1,0 +1,177 @@
+From 0d4216ef2cae2cc10b755b0403bfff0f377bdf17 Mon Sep 17 00:00:00 2001
+From: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+Date: Thu, 4 Jan 2024 09:35:41 +0800
+Subject: [PATCH] skip setup console if disable pty and fix syscontainer-hooks
+ write devices rule useless
+
+Signed-off-by: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+---
+ src/lxc/conf.c  | 16 +++++++++-----
+ src/lxc/start.c | 59 ++++++++++++++++++++++++++++---------------------
+ src/lxc/sync.h  | 10 ++++-----
+ 3 files changed, 48 insertions(+), 37 deletions(-)
+
+diff --git a/src/lxc/conf.c b/src/lxc/conf.c
+index 84b8baf..c73ba04 100644
+--- a/src/lxc/conf.c
++++ b/src/lxc/conf.c
+@@ -2318,6 +2318,12 @@ static int lxc_setup_console(const struct lxc_handler *handler,
+ 	if (!wants_console(console))
+ 		return log_trace(0, "Skipping console setup");
+ 
++#ifdef HAVE_ISULAD
++	if (handler->disable_pty) {
++		return 0;
++	}
++#endif
++
+ 	if (console->pty < 0)  {
+ 		/*
+ 		 * Allocate a console from the container's devpts instance. We
+@@ -4583,7 +4589,11 @@ static int lxc_recv_console_from_child(struct lxc_handler *handler)
+ 		return 0;
+ 
+ 	/* We've already allocated a console from the host's devpts instance. */
++#ifdef HAVE_ISULAD
++	if (console->disable_pty || console->pty >= 0)
++#else
+ 	if (console->pty >= 0)
++#endif
+ 		return 0;
+ 
+ 	ret = __lxc_abstract_unix_recv_two_fds(handler->data_sock[1],
+@@ -4870,12 +4880,6 @@ int lxc_setup(struct lxc_handler *handler)
+ 	if (ret < 0)
+ 		return log_error(-1, "Failed to setup \"/dev\" symlinks");
+ 
+-#ifdef HAVE_ISULAD
+-	/* Ask father to run oci prestart hooks and wait for him to finish. */
+-	if (!lxc_sync_barrier_parent(handler, START_SYNC_OCI_PRESTART_HOOK)) {
+-		return log_error(-1, "Failed to sync parent to start host hook");
+-	}
+-#endif
+ 	ret = lxc_setup_rootfs_switch_root(&lxc_conf->rootfs);
+ 	if (ret < 0)
+ 		return log_error(-1, "Failed to pivot root into rootfs");
+diff --git a/src/lxc/start.c b/src/lxc/start.c
+index 1c8e258..0a5cb26 100644
+--- a/src/lxc/start.c
++++ b/src/lxc/start.c
+@@ -1608,10 +1608,11 @@ static int do_start(void *data)
+ 
+ 	close_prot_errno_disarm(devnull_fd);
+ 
+-#ifndef HAVE_ISULAD
++#ifdef HAVE_ISULAD
++	if (handler->disable_pty)
+ 	// setsid in lxc_setup() -> lxc_setup_console()
+-	setsid();
+ #endif
++	setsid();
+ 
+ 	if (handler->conf->init_cwd) {
+ #ifdef HAVE_ISULAD
+@@ -1642,6 +1643,11 @@ static int do_start(void *data)
+ 	}
+ 
+ #ifdef HAVE_ISULAD
++	/* Ask father to run oci prestart hooks and wait for him to finish. */
++	if (!lxc_sync_barrier_parent(handler, START_SYNC_OCI_PRESTART_HOOK)) {
++		return log_error(-1, "Failed to sync parent to start host hook");
++	}
++
+ 	/* close pipes after sync fds */
+ 	/* isulad: dup2 pipe[0][0] to container stdin, pipe[1][1] to container stdout, pipe[2][1] to container stderr */
+ 	if (handler->disable_pty) {
+@@ -2377,29 +2383,6 @@ static int lxc_spawn(struct lxc_handler *handler)
+ 		goto out_delete_net;
+ 	}
+ 
+-#ifdef HAVE_ISULAD
+-	if (!lxc_sync_wait_child(handler, START_SYNC_OCI_PRESTART_HOOK))
+-		goto out_delete_net;
+-
+-	/* isulad: Run oci prestart hook at here */
+-	ret = run_oci_hooks(name, "oci-prestart", conf, lxcpath);
+-	if (ret < 0) {
+-		ERROR("Failed to run oci prestart hooks");
+-		goto out_delete_net;
+-	}
+-
+-	if (START_TIMEOUT == global_timeout_state) {
+-		lxc_write_error_message(conf->errpipe[1], "Starting the container \"%s\" timeout.", name);
+-		ERROR("Starting the container \"%s\" timeout.", name);
+-		goto out_delete_net;
+-	}
+-
+-	/* Tell the child to continue its initialization. We'll get
+-	 * START_SYNC_POST_OCI_PRESTART_HOOK when it is ready for us to run oci prestart hooks.
+-	 */
+-	if (!lxc_sync_wake_child(handler, START_SYNC_POST_OCI_PRESTART_HOOK))
+-		goto out_delete_net;
+-#endif
+ 	if (!lxc_sync_wait_child(handler, START_SYNC_CGROUP_LIMITS))
+ 		goto out_delete_net;
+ 
+@@ -2433,6 +2416,32 @@ static int lxc_spawn(struct lxc_handler *handler)
+ 	if (!lxc_sync_wake_child(handler, START_SYNC_FDS))
+ 		goto out_delete_net;
+ 
++#ifdef HAVE_ISULAD
++	// OCI prestart hook should run after setup_limits_legacy.
++	// Otherwise 'syscontainer-hooks' write devices rule will be useless.
++	if (!lxc_sync_wait_child(handler, START_SYNC_OCI_PRESTART_HOOK))
++		goto out_delete_net;
++
++	/* isulad: Run oci prestart hook at here */
++	ret = run_oci_hooks(name, "oci-prestart", conf, lxcpath);
++	if (ret < 0) {
++		ERROR("Failed to run oci prestart hooks");
++		goto out_delete_net;
++	}
++
++	if (START_TIMEOUT == global_timeout_state) {
++		lxc_write_error_message(conf->errpipe[1], "Starting the container \"%s\" timeout.", name);
++		ERROR("Starting the container \"%s\" timeout.", name);
++		goto out_delete_net;
++	}
++
++	/* Tell the child to continue its initialization. We'll get
++	 * START_SYNC_POST_OCI_PRESTART_HOOK when it is ready for us to run oci prestart hooks.
++	 */
++	if (!lxc_sync_wake_child(handler, START_SYNC_POST_OCI_PRESTART_HOOK))
++		goto out_delete_net;
++#endif
++
+ 	if (handler->ns_unshare_flags & CLONE_NEWCGROUP) {
+ 		/* Now we're ready to preserve the cgroup namespace */
+ 		ret = lxc_try_preserve_namespace(handler, LXC_NS_CGROUP, "cgroup");
+diff --git a/src/lxc/sync.h b/src/lxc/sync.h
+index 6802d32..b6080dd 100644
+--- a/src/lxc/sync.h
++++ b/src/lxc/sync.h
+@@ -20,17 +20,15 @@ enum /* start */ {
+ 	START_SYNC_CONFIGURE		=  1,
+ 	START_SYNC_POST_CONFIGURE	=  2,
+ 	START_SYNC_IDMAPPED_MOUNTS	=  3,
++	START_SYNC_CGROUP_LIMITS	=  4,
++	START_SYNC_FDS			=  5,
+ #ifdef HAVE_ISULAD
+-	START_SYNC_OCI_PRESTART_HOOK = 4,
+-	START_SYNC_POST_OCI_PRESTART_HOOK = 5,
+-	START_SYNC_CGROUP_LIMITS	=  6,
+-	START_SYNC_FDS			=  7,
++	START_SYNC_OCI_PRESTART_HOOK = 6,
++	START_SYNC_POST_OCI_PRESTART_HOOK = 7,
+ 	START_SYNC_READY_START		=  8,
+ 	START_SYNC_RESTART		=  9,
+ 	START_SYNC_POST_RESTART		=  10,
+ #else
+-	START_SYNC_CGROUP_LIMITS	=  4,
+-	START_SYNC_FDS			=  5,
+ 	START_SYNC_READY_START		=  6,
+ 	START_SYNC_RESTART		=  7,
+ 	START_SYNC_POST_RESTART		=  8,
+-- 
+2.25.1
+

@@ -1,4 +1,4 @@
-%global _release 7
+%global _release 8
 %global enable_isulad 1
 
 Name:           lxc
@@ -19,6 +19,7 @@ Patch0007:	0007-fix-run-container-failed-when-enable-isulad.patch
 Patch0008:	0008-bugfix-for-system-container-and-stream.patch
 Patch0009:	0009-bugfix-about-cgroup-mount-propagation-and-capabiliti.patch
 Patch0010:	0010-add-storage-block-code-for-embedded-image.patch
+Patch0011:	0011-skip-setup-console-if-disable-pty-and-fix-syscontain.patch
 
 BuildRequires:  systemd-units git libtool graphviz docbook2X doxygen chrpath
 BuildRequires:  pkgconfig(libseccomp)
@@ -206,6 +207,12 @@ meson test -C build
 %endif
 
 %changelog
+* Thu Jan 04 2024 zhangxiaoyu<zhangxiaoyu58@huawei.com> - 5.0.2-8
+- Type: bugfix
+- ID:NA
+- SUG:NA
+- DESC: skip setup console if disable pty and fix syscontainer-hooks write devices rule useless
+
 * Fri Dec 29 2023 zhangxiaoyu<zhangxiaoyu58@huawei.com> - 5.0.2-7
 - Type: bugfix
 - ID:NA
