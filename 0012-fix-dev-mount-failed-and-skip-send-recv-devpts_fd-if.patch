@@ -1,0 +1,56 @@
+From 47513b0bd34217bb2032285ea03ae7e4508ba24d Mon Sep 17 00:00:00 2001
+From: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+Date: Fri, 12 Jan 2024 16:40:32 +0800
+Subject: [PATCH] fix dev mount failed and skip send/recv devpts_fd if
+ disable_pty
+
+Signed-off-by: zhangxiaoyu <zhangxiaoyu58@huawei.com>
+---
+ src/lxc/conf.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/lxc/conf.c b/src/lxc/conf.c
+index c73ba04..b61615d 100644
+--- a/src/lxc/conf.c
++++ b/src/lxc/conf.c
+@@ -1829,6 +1829,12 @@ static int lxc_recv_devpts_from_child(struct lxc_handler *handler)
+ {
+ 	int ret;
+ 
++#ifdef HAVE_ISULAD
++	if (handler->disable_pty) {
++		return 0;
++	}
++#endif
++
+ 	if (handler->conf->pty_max <= 0)
+ 		return 0;
+ 
+@@ -2066,6 +2072,12 @@ static int lxc_send_devpts_to_parent(struct lxc_handler *handler)
+ {
+ 	int ret;
+ 
++#ifdef HAVE_ISULAD
++	if (handler->disable_pty) {
++		return 0;
++	}
++#endif
++
+ 	if (handler->conf->pty_max <= 0)
+ 		return log_debug(0, "No devpts file descriptor will be sent since no pts devices are requested");
+ 
+@@ -4852,6 +4864,11 @@ int lxc_setup(struct lxc_handler *handler)
+ 		if (ret < 0) {
+ 			return log_error(-1, "Failed to setup new devpts instance for '%s'", name);
+ 		}
++	} else {
++		lxc_conf->devpts_fd = open_at(lxc_conf->rootfs.dfd_dev, "pts", PROTECT_OPATH_DIRECTORY, PROTECT_LOOKUP_BENEATH_XDEV, 0);
++		if (lxc_conf->devpts_fd < 0) {
++			return log_error(-1, "Failed to allocate console from container's devpts instance");
++		}
+ 	}
+ #else
+ 	ret = lxc_create_tmp_proc_mount(lxc_conf);
+-- 
+2.25.1
+

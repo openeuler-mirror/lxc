@@ -1,4 +1,4 @@
-%global _release 8
+%global _release 9
 %global enable_isulad 1
 
 Name:           lxc
@@ -20,6 +20,7 @@ Patch0008:	0008-bugfix-for-system-container-and-stream.patch
 Patch0009:	0009-bugfix-about-cgroup-mount-propagation-and-capabiliti.patch
 Patch0010:	0010-add-storage-block-code-for-embedded-image.patch
 Patch0011:	0011-skip-setup-console-if-disable-pty-and-fix-syscontain.patch
+Patch0012:	0012-fix-dev-mount-failed-and-skip-send-recv-devpts_fd-if.patch
 
 BuildRequires:  systemd-units git libtool graphviz docbook2X doxygen chrpath
 BuildRequires:  pkgconfig(libseccomp)
@@ -207,6 +208,12 @@ meson test -C build
 %endif
 
 %changelog
+* Fri Jan 12 2024 zhangxiaoyu<zhangxiaoyu58@huawei.com> - 5.0.2-9
+- Type: bugfix
+- ID:NA
+- SUG:NA
+- DESC: fix dev mount failed and skip send/recv devpts_fd if disable_pty
+
 * Thu Jan 04 2024 zhangxiaoyu<zhangxiaoyu58@huawei.com> - 5.0.2-8
 - Type: bugfix
 - ID:NA
