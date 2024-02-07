@@ -1,0 +1,486 @@
+From a17fa0f10ec2f0f0a19d080c2ffe258192fc6cc1 Mon Sep 17 00:00:00 2001
+From: jikai <jikai11@huawei.com>
+Date: Mon, 5 Feb 2024 18:29:15 +0800
+Subject: [PATCH] ensure cpuset cgroup built while writing cgroup.procs
+
+Signed-off-by: jikai <jikai11@huawei.com>
+---
+ src/lxc/cgroups/cgfsng.c | 433 +++++++++++++++++++++------------------
+ 1 file changed, 232 insertions(+), 201 deletions(-)
+
+diff --git a/src/lxc/cgroups/cgfsng.c b/src/lxc/cgroups/cgfsng.c
+index 5fd12ff..984e969 100644
+--- a/src/lxc/cgroups/cgfsng.c
++++ b/src/lxc/cgroups/cgfsng.c
+@@ -535,6 +535,207 @@ static int cgroup_tree_remove_wrapper(void *data)
+ 	return cgroup_tree_remove(arg->hierarchies, arg->path_prune);
+ }
+ 
++#ifdef HAVE_ISULAD
++#define BATCH_SIZE 50
++static void batch_realloc(char **mem, size_t oldlen, size_t newlen)
++{
++	int newbatches = (newlen / BATCH_SIZE) + 1;
++	int oldbatches = (oldlen / BATCH_SIZE) + 1;
++
++	if (!*mem || newbatches > oldbatches)
++		*mem = must_realloc(*mem, newbatches * BATCH_SIZE);
++}
++
++static void append_line(char **dest, size_t oldlen, char *new, size_t newlen)
++{
++	size_t full = oldlen + newlen;
++
++	batch_realloc(dest, oldlen, full + 1);
++
++	memcpy(*dest + oldlen, new, newlen + 1);
++}
++
++/* Slurp in a whole file */
++static char *read_file(const char *fnam)
++{
++	__do_free char *buf = NULL, *line = NULL;
++	__do_fclose FILE *f = NULL;
++	size_t len = 0, fulllen = 0;
++	int linelen;
++
++	f = fopen(fnam, "re");
++	if (!f)
++		return NULL;
++
++	while ((linelen = getline(&line, &len, f)) != -1) {
++		append_line(&buf, fulllen, line, linelen);
++		fulllen += linelen;
++	}
++
++	return move_ptr(buf);
++}
++
++static bool isulad_copy_parent_file(char *path, char *file)
++{
++	int ret;
++	int len = 0;
++	char *value = NULL;
++	char *current = NULL;
++	char *fpath = NULL;
++	char *lastslash = NULL;
++	char oldv;
++
++	fpath = must_make_path(path, file, NULL);
++	current = read_file(fpath);
++
++	if (current == NULL) {
++		SYSERROR("Failed to read file \"%s\"", fpath);
++		free(fpath);
++		return false;
++	}
++
++	if (strcmp(current, "\n") != 0) {
++		free(fpath);
++		free(current);
++		return true;
++	}
++
++	free(fpath);
++	free(current);
++
++	lastslash = strrchr(path, '/');
++	if (lastslash == NULL) {
++		ERROR("Failed to detect \"/\" in \"%s\"", path);
++		return false;
++	}
++	oldv = *lastslash;
++	*lastslash = '\0';
++	fpath = must_make_path(path, file, NULL);
++	*lastslash = oldv;
++	len = lxc_read_from_file(fpath, NULL, 0);
++	if (len <= 0)
++		goto on_error;
++
++	value = must_realloc(NULL, len + 1);
++	ret = lxc_read_from_file(fpath, value, len);
++	if (ret != len)
++		goto on_error;
++	free(fpath);
++
++	fpath = must_make_path(path, file, NULL);
++	ret = lxc_write_to_file(fpath, value, len, false, 0666);
++	if (ret < 0)
++		SYSERROR("Failed to write \"%s\" to file \"%s\"", value, fpath);
++	free(fpath);
++	free(value);
++	return ret >= 0;
++
++on_error:
++	SYSERROR("Failed to read file \"%s\"", fpath);
++	free(fpath);
++	free(value);
++	return false;
++}
++
++static bool build_sub_cpuset_cgroup_dir(char *cgpath)
++{
++	int ret;
++
++	ret = mkdir_p(cgpath, 0755);
++	if (ret < 0) {
++		if (errno != EEXIST) {
++			SYSERROR("Failed to create directory \"%s\"", cgpath);
++			return false;
++		}
++	}
++
++	/* copy parent's settings */
++	if (!isulad_copy_parent_file(cgpath, "cpuset.cpus")) {
++		SYSERROR("Failed to copy \"cpuset.cpus\" settings");
++		return false;
++	}
++
++	/* copy parent's settings */
++	if (!isulad_copy_parent_file(cgpath, "cpuset.mems")) {
++		SYSERROR("Failed to copy \"cpuset.mems\" settings");
++		return false;
++	}
++
++	return true;
++}
++
++static bool isulad_cg_legacy_handle_cpuset_hierarchy(struct hierarchy *h, char *cgname)
++{
++	char *cgpath, *slash;
++	bool sub_mk_success = false;
++
++	if (is_unified_hierarchy(h))
++		return true;
++
++	if (!string_in_list(h->controllers, "cpuset"))
++		return true;
++
++	slash = strchr(cgname, '/');
++
++	if (slash != NULL) {
++		while (slash) {
++			*slash = '\0';
++			cgpath = make_cgroup_path(h, h->at_base, cgname, NULL);
++			sub_mk_success = build_sub_cpuset_cgroup_dir(cgpath);
++			free(cgpath);
++			*slash = '/';
++			if (!sub_mk_success) {
++				return false;
++			}
++			slash = strchr(slash + 1, '/');
++		}
++	}
++
++	cgpath = make_cgroup_path(h, h->at_base, cgname, NULL);
++	sub_mk_success = build_sub_cpuset_cgroup_dir(cgpath);
++	free(cgpath);
++	if (!sub_mk_success) {
++		return false;
++	}
++
++	return true;
++}
++
++static int isulad_mkdir_eexist_on_last(const char *dir, mode_t mode)
++{
++	const char *tmp = dir;
++	const char *orig = dir;
++
++	do {
++		int ret;
++		size_t cur_len;
++		char *makeme;
++
++		dir = tmp + strspn(tmp, "/");
++		tmp = dir + strcspn(dir, "/");
++
++		errno = ENOMEM;
++		cur_len = dir - orig;
++		makeme = strndup(orig, cur_len);
++		if (!makeme)
++			return -1;
++
++		ret = mkdir(makeme, mode);
++		if (ret < 0) {
++			if (errno != EEXIST) {
++				SYSERROR("Failed to create directory \"%s\"", makeme);
++				free(makeme);
++				return -1;
++			}
++		}
++		free(makeme);
++
++	} while (tmp != dir);
++
++	return 0;
++}
++#endif
++
+ #ifdef HAVE_ISULAD
+ __cgfsng_ops static bool cgfsng_payload_destroy(struct cgroup_ops *ops,
+ 						struct lxc_handler *handler)
+@@ -806,6 +1007,18 @@ static bool cgroup_tree_create(struct cgroup_ops *ops, struct lxc_conf *conf,
+ 	 */
+ 	cpuset_v1 = !is_unified_hierarchy(h) && string_in_list(h->controllers, "cpuset");
+ 
++#ifdef HAVE_ISULAD
++	/* ensure that cpuset cgroup was set in the whole cgroup path, though lxc does
++	 * cpuset1_initialize(set cgroup.clone_children to 1 and cpuset.cpus and cpuset.mems)
++	 * but it only does so for the first layer of the cgroup path.
++	 * Since K8S could create the path already, so we need to ensure the cpuset cgroup was set
++	 */
++	if (cpuset_v1 && !isulad_cg_legacy_handle_cpuset_hierarchy(h, ops->container_cgroup)) {
++		ERROR("Failed to handle legacy cpuset controller");
++		return false;
++	}
++#endif
++
+ 	if (payload && cgroup_leaf) {
+ 		/* With isolation both parts need to not already exist. */
+ 		fd_limit = __cgroup_tree_create(h->dfd_base, cgroup_limit_dir, 0755, cpuset_v1, false);
+@@ -1662,14 +1875,33 @@ __cgfsng_ops static bool cgfsng_payload_enter(struct cgroup_ops *ops,
+ 	for (int i = 0; ops->hierarchies[i]; i++) {
+ 		struct hierarchy *h = ops->hierarchies[i];
+ 		int ret;
++#ifdef HAVE_ISULAD
++		int retry_count = 0;
++		int max_retry = 10;
++#endif
+ 
+ 		if (is_unified_hierarchy(h) &&
+ 		    (handler->clone_flags & CLONE_INTO_CGROUP))
+ 			continue;
+ 
++#ifdef HAVE_ISULAD
++retry:
++		ret = lxc_writeat(h->dfd_con, "cgroup.procs", pidstr, len);
++		if (ret != 0) {
++			if (retry_count < max_retry) {
++				SYSERROR("Failed to enter cgroup \"%s/cgroup.procs\" with retry count:%d", h->path_con, retry_count);
++				(void)isulad_cg_legacy_handle_cpuset_hierarchy(h, ops->container_cgroup);
++				(void)isulad_mkdir_eexist_on_last(h->path_con, 0755);
++				usleep(100 * 1000);
++				retry_count++;
++				goto retry;
++			}
++		}
++#else
+ 		ret = lxc_writeat(h->dfd_con, "cgroup.procs", pidstr, len);
+ 		if (ret != 0)
+ 			return log_error_errno(false, errno, "Failed to enter cgroup \"%s\"", h->path_con);
++#endif
+ 
+ 		TRACE("Moved container into %s cgroup via %d", h->path_con, h->dfd_con);
+ 	}
+@@ -3234,207 +3466,6 @@ static int convert_devpath(const char *invalue, char *dest)
+ 	return 0;
+ }
+ 
+-#ifdef HAVE_ISULAD
+-#define BATCH_SIZE 50
+-static void batch_realloc(char **mem, size_t oldlen, size_t newlen)
+-{
+-	int newbatches = (newlen / BATCH_SIZE) + 1;
+-	int oldbatches = (oldlen / BATCH_SIZE) + 1;
+-
+-	if (!*mem || newbatches > oldbatches)
+-		*mem = must_realloc(*mem, newbatches * BATCH_SIZE);
+-}
+-
+-static void append_line(char **dest, size_t oldlen, char *new, size_t newlen)
+-{
+-	size_t full = oldlen + newlen;
+-
+-	batch_realloc(dest, oldlen, full + 1);
+-
+-	memcpy(*dest + oldlen, new, newlen + 1);
+-}
+-
+-/* Slurp in a whole file */
+-static char *read_file(const char *fnam)
+-{
+-	__do_free char *buf = NULL, *line = NULL;
+-	__do_fclose FILE *f = NULL;
+-	size_t len = 0, fulllen = 0;
+-	int linelen;
+-
+-	f = fopen(fnam, "re");
+-	if (!f)
+-		return NULL;
+-
+-	while ((linelen = getline(&line, &len, f)) != -1) {
+-		append_line(&buf, fulllen, line, linelen);
+-		fulllen += linelen;
+-	}
+-
+-	return move_ptr(buf);
+-}
+-
+-static bool isulad_copy_parent_file(char *path, char *file)
+-{
+-	int ret;
+-	int len = 0;
+-	char *value = NULL;
+-	char *current = NULL;
+-	char *fpath = NULL;
+-	char *lastslash = NULL;
+-	char oldv;
+-
+-	fpath = must_make_path(path, file, NULL);
+-	current = read_file(fpath);
+-
+-	if (current == NULL) {
+-		SYSERROR("Failed to read file \"%s\"", fpath);
+-		free(fpath);
+-		return false;
+-	}
+-
+-	if (strcmp(current, "\n") != 0) {
+-		free(fpath);
+-		free(current);
+-		return true;
+-	}
+-
+-	free(fpath);
+-	free(current);
+-
+-	lastslash = strrchr(path, '/');
+-	if (lastslash == NULL) {
+-		ERROR("Failed to detect \"/\" in \"%s\"", path);
+-		return false;
+-	}
+-	oldv = *lastslash;
+-	*lastslash = '\0';
+-	fpath = must_make_path(path, file, NULL);
+-	*lastslash = oldv;
+-	len = lxc_read_from_file(fpath, NULL, 0);
+-	if (len <= 0)
+-		goto on_error;
+-
+-	value = must_realloc(NULL, len + 1);
+-	ret = lxc_read_from_file(fpath, value, len);
+-	if (ret != len)
+-		goto on_error;
+-	free(fpath);
+-
+-	fpath = must_make_path(path, file, NULL);
+-	ret = lxc_write_to_file(fpath, value, len, false, 0666);
+-	if (ret < 0)
+-		SYSERROR("Failed to write \"%s\" to file \"%s\"", value, fpath);
+-	free(fpath);
+-	free(value);
+-	return ret >= 0;
+-
+-on_error:
+-	SYSERROR("Failed to read file \"%s\"", fpath);
+-	free(fpath);
+-	free(value);
+-	return false;
+-}
+-
+-static bool build_sub_cpuset_cgroup_dir(char *cgpath)
+-{
+-	int ret;
+-
+-	ret = mkdir_p(cgpath, 0755);
+-	if (ret < 0) {
+-		if (errno != EEXIST) {
+-			SYSERROR("Failed to create directory \"%s\"", cgpath);
+-			return false;
+-		}
+-	}
+-
+-	/* copy parent's settings */
+-	if (!isulad_copy_parent_file(cgpath, "cpuset.cpus")) {
+-		SYSERROR("Failed to copy \"cpuset.cpus\" settings");
+-		return false;
+-	}
+-
+-	/* copy parent's settings */
+-	if (!isulad_copy_parent_file(cgpath, "cpuset.mems")) {
+-		SYSERROR("Failed to copy \"cpuset.mems\" settings");
+-		return false;
+-	}
+-
+-	return true;
+-}
+-
+-static bool isulad_cg_legacy_handle_cpuset_hierarchy(struct hierarchy *h, char *cgname)
+-{
+-	char *cgpath, *slash;
+-	bool sub_mk_success = false;
+-
+-	if (is_unified_hierarchy(h))
+-		return true;
+-
+-	if (!string_in_list(h->controllers, "cpuset"))
+-		return true;
+-
+-	slash = strchr(cgname, '/');
+-
+-	if (slash != NULL) {
+-		while (slash) {
+-			*slash = '\0';
+-			cgpath = must_make_path(h->at_mnt, h->at_base, cgname, NULL);
+-			sub_mk_success = build_sub_cpuset_cgroup_dir(cgpath);
+-			free(cgpath);
+-			*slash = '/';
+-			if (!sub_mk_success) {
+-				return false;
+-			}
+-			slash = strchr(slash + 1, '/');
+-		}
+-	}
+-
+-	cgpath = must_make_path(h->at_mnt, h->at_base, cgname, NULL);
+-	sub_mk_success = build_sub_cpuset_cgroup_dir(cgpath);
+-	free(cgpath);
+-	if (!sub_mk_success) {
+-		return false;
+-	}
+-
+-	return true;
+-}
+-
+-static int isulad_mkdir_eexist_on_last(const char *dir, mode_t mode)
+-{
+-	const char *tmp = dir;
+-	const char *orig = dir;
+-
+-	do {
+-		int ret;
+-		size_t cur_len;
+-		char *makeme;
+-
+-		dir = tmp + strspn(tmp, "/");
+-		tmp = dir + strcspn(dir, "/");
+-
+-		errno = ENOMEM;
+-		cur_len = dir - orig;
+-		makeme = strndup(orig, cur_len);
+-		if (!makeme)
+-			return -1;
+-
+-		ret = mkdir(makeme, mode);
+-		if (ret < 0) {
+-			if (errno != EEXIST) {
+-				SYSERROR("Failed to create directory \"%s\"", makeme);
+-				free(makeme);
+-				return -1;
+-			}
+-		}
+-		free(makeme);
+-
+-	} while (tmp != dir);
+-
+-	return 0;
+-}
+-#endif
+-
+ /* Called from setup_limits - here we have the container's cgroup_data because
+  * we created the cgroups.
+  */
+-- 
+2.33.0
+
