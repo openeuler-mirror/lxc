@@ -1,4 +1,4 @@
-%global _release 10
+%global _release 11
 %global enable_isulad 1
 
 Name:           lxc
@@ -22,6 +22,7 @@ Patch0010:	0010-add-storage-block-code-for-embedded-image.patch
 Patch0011:	0011-skip-setup-console-if-disable-pty-and-fix-syscontain.patch
 Patch0012:	0012-fix-dev-mount-failed-and-skip-send-recv-devpts_fd-if.patch
 Patch0013:	0013-ensure-cpuset-cgroup-built-while-writing-cgroup.proc.patch
+Patch0014:	0014-fix-cpuset-cgroup-error.patch
 
 BuildRequires:  systemd-units git libtool graphviz docbook2X doxygen chrpath
 BuildRequires:  pkgconfig(libseccomp)
@@ -209,6 +210,12 @@ meson test -C build
 %endif
 
 %changelog
+* Wed Feb 07 2024 jikai<jikai11@huawei.com> - 5.0.2-11
+- Type: bugfix
+- ID:NA
+- SUG:NA
+- DESC: fix cpuset cgroup set error
+
 * Mon Feb 05 2024 jikai<jikai11@huawei.com> - 5.0.2-10
 - Type: bugfix
 - ID:NA
