@@ -1,0 +1,60 @@
+From 1d885dd392eb84816050b6ecffcfcccdfb8e812c Mon Sep 17 00:00:00 2001
+From: jikai <jikai11@huawei.com>
+Date: Thu, 22 Feb 2024 17:22:12 +0800
+Subject: [PATCH] append mntopt to mntdata if not found in mount_opt
+
+Signed-off-by: jikai <jikai11@huawei.com>
+---
+ src/lxc/conf.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/lxc/conf.c b/src/lxc/conf.c
+index c73ba04..595e605 100644
+--- a/src/lxc/conf.c
++++ b/src/lxc/conf.c
+@@ -2469,7 +2469,11 @@ int parse_mntopts_legacy(const char *mntopts, unsigned long *mntflags, char **mn
+ 	return 0;
+ }
+ 
++#ifdef HAVE_ISULAD
++static int parse_vfs_attr(struct lxc_mount_options *opts, char *opt, size_t size, char **end, char *mntopts_new)
++#else
+ static int parse_vfs_attr(struct lxc_mount_options *opts, char *opt, size_t size)
++#endif
+ {
+ 	/*
+ 	 * If opt is found in mount_opt, set or clear flags.
+@@ -2525,6 +2529,18 @@ static int parse_vfs_attr(struct lxc_mount_options *opts, char *opt, size_t size
+ 		return 0;
+ 	}
+ 
++#ifdef HAVE_ISULAD
++	/* Add opt to opts->data if not found in mount_opt and propagation_opt.
++	 * Since in safe_mount, if 'z' option was set and selinux was enabled
++	 * isulad should relabel the mount point as share using opts->data.
++	 */
++	if (!*end) {
++		*end = stpcpy(mntopts_new, opt);
++	} else {
++		*end = stpcpy(*end, ",");
++		*end = stpcpy(*end, opt);
++	}
++#endif
+ 	return 0;
+ }
+ 
+@@ -2564,7 +2580,11 @@ int parse_mount_attrs(struct lxc_mount_options *opts, const char *mntopts)
+ 		}
+ 
+ 		/* This is a generic vfs option. */
++#ifdef HAVE_ISULAD
++		ret = parse_vfs_attr(opts, mntopt_cur, size, &end, mntopts_new);
++#else
+ 		ret = parse_vfs_attr(opts, mntopt_cur, size);
++#endif
+ 		if (ret < 0)
+ 			return syserror("Failed to parse mount attributes: \"%s\"", mntopt_cur);
+ 	}
+-- 
+2.33.0
+
